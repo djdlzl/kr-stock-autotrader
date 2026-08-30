@@ -4,10 +4,10 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from .auth import csrf_origin_ok, current_user, hash_password, issue_session, verify_password
-from .config import COOKIE_SECURE, LIVE_TRADING
+from .config import COOKIE_SECURE, LIVE_TRADING, SIGNUP_ENABLED
 from .db import connect
 from .domain import Quote, parse_kst
 from .service import audit, evaluate_tick
@@ -120,8 +120,16 @@ def set_session(response: Response, uid: int) -> None:
 
 
 @app.post("/api/signup")
-def signup(data: AuthIn, request: Request, response: Response):
+async def signup(request: Request, response: Response):
+    # Do not parse, validate, or query for signup attempts unless development
+    # has explicitly enabled the route before import.
+    if not SIGNUP_ENABLED:
+        raise HTTPException(404, "찾을 수 없습니다")
     csrf_origin_ok(request)
+    try:
+        data = AuthIn.model_validate(await request.json())
+    except (ValidationError, ValueError):
+        raise HTTPException(422, "입력 내용을 확인하세요")
     db = connect()
     try:
         row = db.execute(

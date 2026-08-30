@@ -12,5 +12,7 @@ if SESSION_SECRET == "dev-only-change-me" or len(SESSION_SECRET.encode()) < MIN_
     )
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "28800"))
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+# Production is single-user by default. Tests/dev must explicitly opt in.
+SIGNUP_ENABLED = os.getenv("SIGNUP_ENABLED", "false").lower() == "true"
 KR_HOLIDAYS = frozenset(x.strip() for x in os.getenv("KR_HOLIDAYS", "").split(",") if x.strip())
 LIVE_TRADING = False

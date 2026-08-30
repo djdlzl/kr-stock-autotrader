@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import tempfile
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -101,6 +102,45 @@ def test_missing_or_public_default_secret_fails_closed_in_fresh_process():
         capture_output=True, text=True,
     )
     assert good.returncode == 0, good.stderr
+
+
+def test_signup_is_disabled_by_default_before_payload_validation_in_fresh_runtime():
+    root = Path(__file__).resolve().parents[1]
+    probe = subprocess.run(
+        [sys.executable, "-c", '''
+from fastapi.testclient import TestClient
+from app import app
+client = TestClient(app)
+html = client.get("/").text
+assert "회원가입" not in html and "signup" not in html
+for body in ({"email": "not-an-email", "password": "x"}, {"email": "new@example.com", "password": "long-password"}):
+    response = client.post("/api/signup", json=body)
+    assert response.status_code == 404, response.text
+print("signup-disabled-runtime-ok")
+'''],
+        cwd=root,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(root),
+            "SESSION_SECRET": "strong-test-secret-with-32-or-more-bytes!",
+            "DATABASE_PATH": tempfile.mktemp(suffix=".db"),
+            "SIGNUP_ENABLED": "false",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == "signup-disabled-runtime-ok"
+
+
+def test_blue_primary_replaces_orange_primary_in_public_and_authenticated_shells():
+    client = TestClient(app)
+    assert client.post("/api/signup", json={"email": "blue-theme@test.com", "password": "long-password"}).status_code == 200
+    for html in (TestClient(app).get("/").text, client.get("/app").text):
+        for required in ("--primary:#3b82f6", "--primary-low:#eaf2ff", "#174ea6", "rgba(59,130,246,.38)"):
+            assert required in html
+        for forbidden in ("#ff6f0f", "#fff0e5", "#a94300", "#9a4300", "rgba(255,111,15,.38)", "rgba(255,111,15,.36)"):
+            assert forbidden not in html
 
 
 def signed_token(payload: dict) -> str:
