@@ -6,7 +6,7 @@ import math
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, field_validator, model_validator
 
 from .domain import parse_kst
 
@@ -51,7 +51,14 @@ class Window(BaseModel):
 class TakeProfit(BaseModel):
     model_config = ConfigDict(extra='forbid')
     price: float = Field(gt=0)
-    qty: int = Field(gt=0)
+    qty: StrictInt = Field(gt=0)
+
+    @field_validator('price', mode='before')
+    @classmethod
+    def numeric_price(cls, value: object) -> object:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError('must be a numeric scalar')
+        return value
 
     @field_validator('price')
     @classmethod
@@ -94,7 +101,7 @@ class DecisionCard(BaseModel):
     price_cap: float = Field(gt=0)
     window: Window
     max_amount: float = Field(gt=0)
-    max_qty: int = Field(gt=0)
+    max_qty: StrictInt = Field(gt=0)
     stop_loss: float = Field(gt=0)
     take_profit: list[TakeProfit] = Field(min_length=1)
     evidence_invalidation: dict | str
@@ -119,6 +126,13 @@ class DecisionCard(BaseModel):
     @classmethod
     def urls(cls, value: list[str]) -> list[str]:
         return [_url(item) for item in value]
+
+    @field_validator('price_cap', 'max_amount', 'stop_loss', 'confidence', mode='before')
+    @classmethod
+    def numeric_scalars(cls, value: object) -> object:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError('must be a numeric scalar')
+        return value
 
     @field_validator('price_cap', 'max_amount', 'stop_loss', 'confidence')
     @classmethod

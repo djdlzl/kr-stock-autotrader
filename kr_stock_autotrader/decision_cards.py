@@ -46,19 +46,24 @@ def invalidate_lineage(db,evidence_id=None,card_id=None,reason="mutation"):
           WHERE card_id=? AND status IN ('approved','execution_wait','partial_or_filled','exit_wait')""",(cid,))
 def mutate_evidence(db, ident, patch=None, invalidate=False):
     ts=now()
-    if invalidate: db.execute("UPDATE material_evidence SET status='invalidated',invalidated_at=?,updated_at=?,version=version+1 WHERE id=?",(ts,ts,ident))
-    elif patch:
-        if set(patch) == {"status"}:
-            if patch["status"] not in {"new", "card_generated", "decision_pending", "error", "invalidated"}: raise HTTPException(422,"invalid evidence status")
-            db.execute("UPDATE material_evidence SET status=?,updated_at=? WHERE id=?", (patch["status"],ts,ident))
-            audit(db,"internal","status","material_evidence",ident,patch["status"])
-            db.commit(); return evidence_detail(db,ident)
-        changed=False
-        for k,v in patch.items():
-            if k in {"title","summary","snapshot","newness","known_at","announcement_at"}:
-                db.execute(f"UPDATE material_evidence SET {k}=?,updated_at=?,version=version+1 WHERE id=?", (canon(v) if k=="snapshot" else v,ts,ident)); changed=True
-        if not changed: raise HTTPException(422,"no mutable evidence fields")
-    invalidate_lineage(db,evidence_id=ident,reason="evidence_mutated"); audit(db,"internal","invalidate" if invalidate else "update","material_evidence",ident);db.commit();return evidence_detail(db,ident)
+    status = "invalidated" if invalidate else (patch or {}).get("status")
+    if status is not None and status not in {"new", "card_generated", "decision_pending", "error", "invalidated"}:
+        raise HTTPException(422,"invalid evidence status")
+    changed = False
+    if status == "invalidated":
+        db.execute("UPDATE material_evidence SET status='invalidated',invalidated_at=?,updated_at=?,version=version+1 WHERE id=?",(ts,ts,ident))
+    elif status is not None:
+        db.execute("UPDATE material_evidence SET status=?,updated_at=? WHERE id=?", (status,ts,ident))
+    for k,v in (patch or {}).items():
+        if k in {"title","summary","snapshot","newness","known_at","announcement_at"}:
+            db.execute(f"UPDATE material_evidence SET {k}=?,updated_at=?,version=version+1 WHERE id=?", (canon(v) if k=="snapshot" else v,ts,ident)); changed=True
+        elif k != "status":
+            raise HTTPException(422,"no mutable evidence fields")
+    if not invalidate and status is None and not changed: raise HTTPException(422,"no mutable evidence fields")
+    revokes_entry = status == "invalidated" or changed
+    if revokes_entry: invalidate_lineage(db,evidence_id=ident,reason="evidence_invalidated" if status == "invalidated" else "evidence_mutated")
+    audit(db,"internal","invalidate" if revokes_entry else "status","material_evidence",ident,status or "update")
+    db.commit();return evidence_detail(db,ident)
 
 def _num(inputs, key, reasons, positive=False):
     value=inputs.get(key)
@@ -72,6 +77,7 @@ def run_filter(inputs, as_of, known_at):
     try:
         market_known_at=parse_kst(inputs.get("market_data_known_at"))
         if market_known_at>asdt: reasons.append("market data known_at future of as_of")
+        if market_known_at>kdt: reasons.append("market data known_at future of filter known_at")
     except (ValueError, TypeError):
         reasons.append("missing/invalid market_data_known_at")
     numbers={k:_num(inputs,k,reasons,positive=k in {"current_volume","baseline_volume","trading_value","market_cap"}) for k in ("stock_return_pct","benchmark_return_pct","sector_return_pct","current_volume","baseline_volume","trading_value","market_cap","recent_rise_pct","gap_pct","pre_announcement_return_pct")}
@@ -87,7 +93,7 @@ def run_filter(inputs, as_of, known_at):
     if not all(inputs.get(k) for k in ("source","announcement_at","economic_terms")): reasons.append("source/announcement/economic terms missing")
     volume_ratio=None if numbers["current_volume"] is None or numbers["baseline_volume"] is None else numbers["current_volume"]/numbers["baseline_volume"]
     computed={"stock_vs_benchmark_pct":None if numbers["stock_return_pct"] is None or numbers["benchmark_return_pct"] is None else numbers["stock_return_pct"]-numbers["benchmark_return_pct"],"stock_vs_sector_pct":None if numbers["stock_return_pct"] is None or numbers["sector_return_pct"] is None else numbers["stock_return_pct"]-numbers["sector_return_pct"],"volume_ratio":volume_ratio}
-    return {"verdict":"FAIL" if reasons else "PASS","reasons":reasons,"computed":computed,"units":{"stock_vs_benchmark_pct":"percent; stock_return_pct - benchmark_return_pct; positive means stock outperformed benchmark","stock_vs_sector_pct":"percent; stock_return_pct - sector_return_pct; positive means stock outperformed sector","volume_ratio":"ratio; current_volume / baseline_volume; baseline_volume > 0","as_of":"KST ISO-8601; all input known_at must be <= as_of"}}
+    return {"verdict":"FAIL" if reasons else "PASS","reasons":reasons,"computed":computed,"units":{"stock_vs_benchmark_pct":"percent; stock_return_pct - benchmark_return_pct; positive means stock outperformed benchmark","stock_vs_sector_pct":"percent; stock_return_pct - sector_return_pct; positive means stock outperformed sector","volume_ratio":"ratio; current_volume / baseline_volume; baseline_volume > 0","as_of":"KST ISO-8601; evidence.known_at <= market_data_known_at <= filter.known_at <= filter.as_of"}}
 def save_filter(db,evidence_id,inputs,as_of,known_at):
     evidence=row(db,"material_evidence",evidence_id)
     try:
@@ -97,7 +103,9 @@ def save_filter(db,evidence_id,inputs,as_of,known_at):
     if not evidence_known <= filter_known <= filter_as_of:
         raise HTTPException(422, "evidence.known_at <= filter.known_at <= filter.as_of required")
     out=run_filter(inputs,as_of,known_at)
-    if out["verdict"] == "FAIL" and any("market data known_at" in reason for reason in out["reasons"]):
+    if out["verdict"] == "FAIL" and "market data known_at future of filter known_at" in out["reasons"]:
+        raise HTTPException(422, "market_data_known_at must be at or before filter.known_at")
+    if out["verdict"] == "FAIL" and "market data known_at future of as_of" in out["reasons"]:
         raise HTTPException(422, "market_data_known_at must be at or before as_of")
     try:r=db.execute("INSERT INTO deterministic_filter_results(evidence_id,raw_inputs,computed_outputs,as_of,known_at,evidence_version,verdict,reasons,created_at) VALUES(?,?,?,?,?,?,?,?,?) RETURNING id",(evidence_id,canon(inputs),canon(out),as_of,known_at,evidence["version"],out["verdict"],canon(out["reasons"]),now())).fetchone()
     except sqlite3.IntegrityError: raise HTTPException(409,"duplicate filter key")

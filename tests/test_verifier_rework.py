@@ -70,6 +70,15 @@ def test_filter_lineage_rejects_lookahead_market_data_and_stale_filter(db):
     assert save_card(db, card(item["id"], fresh["id"]))["id"]
 
 
+def test_filter_rejects_market_data_newer_than_filter_known_at(db):
+    item = evidence(db)
+    with pytest.raises(HTTPException, match="market_data_known_at must be at or before filter.known_at"):
+        save_filter(
+            db, item["id"], raw(market_data_known_at="2026-08-31T09:30:00+09:00"),
+            "2026-08-31T10:00:00+09:00", "2026-08-31T09:00:00+09:00",
+        )
+
+
 def test_schema_rejects_malformed_cards_and_keeps_pass_nonbuy_valid(db):
     item = evidence(db)
     filt = save_filter(db, item["id"], raw(), AS_OF, "2026-08-31T09:00:00+09:00")
@@ -80,6 +89,37 @@ def test_schema_rejects_malformed_cards_and_keeps_pass_nonbuy_valid(db):
     ):
         with pytest.raises(HTTPException): save_card(db, card(item["id"], filt["id"], **override))
     assert save_card(db, card(item["id"], filt["id"], verdict="관찰"))["schema_version"] == 1
+
+
+def test_schema_rejects_boolean_trading_scalars_but_accepts_numbers(db):
+    item = evidence(db)
+    filt = save_filter(db, item["id"], raw(), AS_OF, "2026-08-31T09:00:00+09:00")
+    for override in (
+        {"max_qty": True}, {"take_profit": [{"price": 110, "qty": True}]},
+        {"price_cap": True}, {"max_amount": True}, {"stop_loss": True},
+        {"take_profit": [{"price": True, "qty": 1}]}, {"confidence": True},
+    ):
+        with pytest.raises(HTTPException):
+            save_card(db, card(item["id"], filt["id"], **override))
+    saved = save_card(db, card(item["id"], filt["id"], price_cap=100, max_amount=250.5,
+                                max_qty=3, stop_loss=80.5,
+                                take_profit=[{"price": 110, "qty": 1}], confidence=0.5))
+    assert saved["schema_version"] == 1
+
+
+def test_internal_status_invalidated_revokes_partial_entry_and_preserves_exit(monkeypatch, db):
+    monkeypatch.setenv("INTERNAL_API_KEY", "test-key")
+    created, plan = make_plan(db)
+    assert evaluate_order_plan(db, plan, tick("buy-before-status-patch", fill_qty=1))["fills"] == [{"side": "buy", "qty": 1, "price": 90}]
+    old_version = db.execute("SELECT version FROM material_evidence WHERE id=?", (created["evidence_id"],)).fetchone()["version"]
+    from app import app
+    client = TestClient(app)
+    response = client.patch(f"/api/internal/evidence/{created['evidence_id']}", json={"status": "invalidated"}, headers={"X-Internal-API-Key": "test-key"})
+    assert response.status_code == 200
+    assert response.json()["version"] == old_version + 1
+    assert db.execute("SELECT status FROM order_plans WHERE id=?", (plan,)).fetchone()["status"] == "review_required"
+    assert evaluate_order_plan(db, plan, tick("fresh-buy-after-status-patch", fill_qty=1))["fills"] == []
+    assert evaluate_order_plan(db, plan, tick("stop-after-status-patch", price=79))["fills"] == [{"side": "sell", "qty": 1, "price": 79}]
 
 
 def test_authenticated_approval_detail_edit_and_reapproval_api_journey(monkeypatch, tmp_path):
