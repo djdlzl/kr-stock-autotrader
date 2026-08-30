@@ -255,9 +255,9 @@ async def internal_evidence_create(request: Request, _: None = Depends(require_i
     finally: db.close()
 
 @app.get('/api/internal/evidence')
-def internal_evidence_list(symbol: str | None = None, status: str | None = None, _: None = Depends(require_internal_api_key)):
+def internal_evidence_list(symbol: str | None = None, status: str | None = None, date: str | None = None, _: None = Depends(require_internal_api_key)):
     db = connect()
-    try: return list_evidence(db, symbol, status)
+    try: return list_evidence(db, symbol, status, date)
     finally: db.close()
 
 @app.get('/api/internal/evidence/{evidence_id}')
@@ -316,21 +316,32 @@ async def internal_order_evaluate(plan_id: int, request: Request, _: None = Depe
 async def scheduler_start(run_key: str, request: Request, _: None = Depends(require_internal_api_key)):
     data=await request.json(); db=connect()
     try:
-        db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?, 'started',?,?) ON CONFLICT(run_key) DO UPDATE SET status='started',started_at=excluded.started_at,detail=excluded.detail",(run_key,data['kind'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(data)))
-        db.commit(); return {'run_key':run_key,'status':'started'}
+        existing=db.execute("SELECT kind,status FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
+        if existing:
+            if existing['kind'] != data['kind']: raise HTTPException(409,'run_key kind conflict')
+            return {'run_key':run_key,'kind':existing['kind'],'status':existing['status'],'idempotent':True}
+        db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?, 'started',?,?)",(run_key,data['kind'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(data)))
+        db.commit(); return {'run_key':run_key,'kind':data['kind'],'status':'started','idempotent':False}
     finally: db.close()
 
 @app.post('/api/internal/scheduler-runs/{run_key}/finish')
 async def scheduler_finish(run_key: str, request: Request, _: None = Depends(require_internal_api_key)):
     data=await request.json(); db=connect()
     try:
-        db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=?",(data['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(data),run_key)); db.commit(); return {'run_key':run_key,'status':data['status']}
+        if not db.execute("SELECT 1 FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone(): raise HTTPException(404,'scheduler run not found')
+        db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=?",(data['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(data),run_key)); db.commit(); return {'run_key':run_key,'status':data['status'],'count':data.get('count',0),'detail':data.get('detail',{})}
     finally: db.close()
 
 @app.get('/api/internal/cards')
 def internal_cards(_: None = Depends(require_internal_api_key)):
     db=connect()
     try:return list_cards(db)
+    finally:db.close()
+
+@app.get('/api/internal/cards/{card_id}')
+def internal_card_detail(card_id: int, _: None = Depends(require_internal_api_key)):
+    db=connect()
+    try:return card_detail(db,card_id)
     finally:db.close()
 
 @app.get('/api/cards')
@@ -352,6 +363,20 @@ async def user_card_decision(card_id: int, request: Request):
     db=connect()
     try:return user_decision(db,card_id,uid,data['decision'],data.get('note',''))
     finally:db.close()
+
+@app.post('/api/order-plans/{plan_id}/edit')
+async def user_order_plan_edit(plan_id: int, request: Request):
+    """Any edit is authenticated and revokes the immutable approved snapshot."""
+    csrf_origin_ok(request); uid=current_user(request); await request.json()
+    db=connect()
+    try:
+        plan=db.execute('SELECT * FROM order_plans WHERE id=? AND user_id=?',(plan_id,uid)).fetchone()
+        if not plan: raise HTTPException(404,'order plan not found')
+        if plan['status'] != 'approved': raise HTTPException(409,'only an approved plan can be edited for reapproval')
+        db.execute("UPDATE order_plans SET status='invalidated' WHERE id=?",(plan_id,))
+        audit(db,plan_id,'edit_invalidates',key=f'edit-invalidates:{plan_id}');db.commit()
+        return {'id':plan_id,'status':'invalidated','reapproval_required':True}
+    finally: db.close()
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
