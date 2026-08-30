@@ -18,4 +18,4 @@ Method: TDD + EDD — focused invariant tests plus FastAPI/SQLite HTTP-boundary 
 - No LLM call is made by the server: `cards/generate` returns the versioned prompt/input contract and `cards/results` stores externally generated structured output.
 - `LIVE_TRADING` remains hard-coded false; there is no live broker adapter.
 
-Candidate SHA: pending commit.
+Candidate SHA: `095a043` (`feat: add immutable paper decision-card backend`).
