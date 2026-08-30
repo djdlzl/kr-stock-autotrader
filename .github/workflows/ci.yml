@@ -3,6 +3,8 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      SESSION_SECRET: ci-test-session-secret-that-is-at-least-thirty-two-bytes
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

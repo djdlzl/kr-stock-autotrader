@@ -4,10 +4,11 @@ from .config import DATABASE_PATH
 
 
 def connect() -> sqlite3.Connection:
-    db = sqlite3.connect(DATABASE_PATH)
+    db = sqlite3.connect(DATABASE_PATH, timeout=5)
     db.row_factory = sqlite3.Row
     db.executescript("""
     PRAGMA foreign_keys=ON;
+    PRAGMA busy_timeout=5000;
     CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS plans (
       id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), symbol TEXT NOT NULL, name TEXT NOT NULL,

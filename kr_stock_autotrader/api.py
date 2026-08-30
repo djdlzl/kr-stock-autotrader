@@ -128,15 +128,30 @@ def list_plans(request: Request):
 
 @app.post("/api/plans/{plan_id}/cancel")
 def cancel(plan_id: int, request: Request):
-    csrf_origin_ok(request); uid=current_user(request); db=connect(); row=db.execute("SELECT * FROM plans WHERE id=? AND user_id=?",(plan_id,uid)).fetchone()
-    if not row: raise HTTPException(404,"계획을 찾을 수 없습니다")
-    if row["status"] == "closed":
-        raise HTTPException(409, {"message": "종료된 계획은 취소할 수 없습니다", "current_status": "closed"})
-    if row["status"] == "cancelled":
-        return {"status": "cancelled", "idempotent": True}
-    db.execute("UPDATE plans SET status='cancelled' WHERE id=? AND user_id=?",(plan_id,uid))
-    audit(db,plan_id,"cancelled"); db.commit()
-    return {"status": "cancelled", "idempotent": False}
+    csrf_origin_ok(request); uid=current_user(request); db=connect()
+    try:
+        transition = db.execute(
+            "UPDATE plans SET status='cancelled' WHERE id=? AND user_id=? "
+            "AND status NOT IN ('closed','cancelled')",
+            (plan_id, uid),
+        )
+        if transition.rowcount == 1:
+            # A plan-scoped deterministic key makes a duplicate cancellation audit impossible.
+            audit(db, plan_id, "cancelled", key=f"cancel:{plan_id}")
+            db.commit()
+            return {"status": "cancelled", "idempotent": False}
+
+        # Release the no-op write transaction before the authoritative user-scoped reread.
+        db.rollback()
+        row = db.execute("SELECT status FROM plans WHERE id=? AND user_id=?", (plan_id, uid)).fetchone()
+        if not row: raise HTTPException(404,"계획을 찾을 수 없습니다")
+        if row["status"] == "closed":
+            raise HTTPException(409, {"message": "종료된 계획은 취소할 수 없습니다", "current_status": "closed"})
+        if row["status"] == "cancelled":
+            return {"status": "cancelled", "idempotent": True}
+        raise HTTPException(409, {"message": "계획을 취소할 수 없습니다", "current_status": row["status"]})
+    finally:
+        db.close()
 
 
 @app.post("/api/ticks")

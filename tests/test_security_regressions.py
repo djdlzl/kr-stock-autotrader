@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -139,6 +141,33 @@ def test_closed_cancel_is_truthful_and_cancel_is_idempotent(monkeypatch):
     open_plan = c.post("/api/plans", json={"symbol":"005930", "name":"삼성전자", "scheduled_at":"2030-01-01T10:00:00+09:00", "qty":1, "conditions":[]}).json()["id"]
     assert c.post(f"/api/plans/{open_plan}/cancel").json() == {"status": "cancelled", "idempotent": False}
     assert c.post(f"/api/plans/{open_plan}/cancel").json() == {"status": "cancelled", "idempotent": True}
+
+
+def test_concurrent_cancel_has_one_transition_and_one_audit_event():
+    owner = TestClient(app)
+    signup(owner, "concurrent-cancel@test.com")
+    plan_id = plan(owner, conditions=[])
+    session = owner.cookies.get("session")
+    assert session is not None
+    barrier = Barrier(8)
+
+    def cancel_once():
+        with TestClient(app) as client:
+            client.cookies.set("session", session)
+            barrier.wait(timeout=5)
+            response = client.post(f"/api/plans/{plan_id}/cancel")
+            return response.status_code, response.json()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: cancel_once(), range(8)))
+
+    assert [status for status, _ in results] == [200] * 8
+    bodies = [body for _, body in results]
+    assert bodies.count({"status": "cancelled", "idempotent": False}) == 1
+    assert bodies.count({"status": "cancelled", "idempotent": True}) == 7
+    stored = owner.get("/api/plans").json()[0]
+    assert stored["status"] == "cancelled"
+    assert [event["event"] for event in stored["events"]].count("cancelled") == 1
 
 
 def test_ui_exposes_logout_cancel_dedicated_tick_symbol_and_cards():
