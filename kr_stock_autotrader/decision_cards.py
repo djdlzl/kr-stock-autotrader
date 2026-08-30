@@ -4,7 +4,7 @@ import hashlib, hmac, json, math, os, sqlite3
 from datetime import timedelta
 from pathlib import Path
 from fastapi import Header, HTTPException
-from .decision_card_schema import REQUIRED_CARD_FIELDS, VERDICTS
+from .decision_card_schema import SCHEMA_VERSION, validate_card
 from .domain import fresh_quote, market_open, now_kst, parse_kst
 
 PROMPT_PATH = Path(__file__).parents[1] / "prompts" / "decision-card-v1.md"
@@ -36,21 +36,28 @@ def list_evidence(db, symbol=None,status=None, date=None):
     if date: q+=" AND substr(known_at,1,10)=?"; p.append(date)
     return [evidence_detail(db,x["id"]) for x in db.execute(q+" ORDER BY id DESC",p)]
 def invalidate_lineage(db,evidence_id=None,card_id=None,reason="mutation"):
+    """Atomically revoke every entry-capable plan but retain open positions for exit."""
     ids=[x["id"] for x in db.execute("SELECT id FROM decision_cards WHERE "+("evidence_id=?" if evidence_id else "id=?"),(evidence_id or card_id,))]
     for cid in ids:
         db.execute("UPDATE decision_cards SET invalidated_at=?,invalidation_reason=? WHERE id=?",(now(),reason,cid))
-        db.execute("UPDATE order_plans SET status='invalidated' WHERE card_id=? AND status='approved'",(cid,))
+        db.execute("""UPDATE order_plans SET status=CASE WHEN EXISTS(
+            SELECT 1 FROM positions p WHERE p.order_plan_id=order_plans.id AND p.qty>0
+          ) THEN 'review_required' ELSE 'entry_invalidated' END
+          WHERE card_id=? AND status IN ('approved','execution_wait','partial_or_filled','exit_wait')""",(cid,))
 def mutate_evidence(db, ident, patch=None, invalidate=False):
     ts=now()
-    if invalidate: db.execute("UPDATE material_evidence SET status='invalidated',invalidated_at=?,updated_at=? WHERE id=?",(ts,ts,ident))
+    if invalidate: db.execute("UPDATE material_evidence SET status='invalidated',invalidated_at=?,updated_at=?,version=version+1 WHERE id=?",(ts,ts,ident))
     elif patch:
         if set(patch) == {"status"}:
             if patch["status"] not in {"new", "card_generated", "decision_pending", "error", "invalidated"}: raise HTTPException(422,"invalid evidence status")
             db.execute("UPDATE material_evidence SET status=?,updated_at=? WHERE id=?", (patch["status"],ts,ident))
             audit(db,"internal","status","material_evidence",ident,patch["status"])
             db.commit(); return evidence_detail(db,ident)
+        changed=False
         for k,v in patch.items():
-            if k in {"title","summary","snapshot","newness","known_at","announcement_at"}: db.execute(f"UPDATE material_evidence SET {k}=?,updated_at=? WHERE id=?", (canon(v) if k=="snapshot" else v,ts,ident))
+            if k in {"title","summary","snapshot","newness","known_at","announcement_at"}:
+                db.execute(f"UPDATE material_evidence SET {k}=?,updated_at=?,version=version+1 WHERE id=?", (canon(v) if k=="snapshot" else v,ts,ident)); changed=True
+        if not changed: raise HTTPException(422,"no mutable evidence fields")
     invalidate_lineage(db,evidence_id=ident,reason="evidence_mutated"); audit(db,"internal","invalidate" if invalidate else "update","material_evidence",ident);db.commit();return evidence_detail(db,ident)
 
 def _num(inputs, key, reasons, positive=False):
@@ -62,6 +69,11 @@ def run_filter(inputs, as_of, known_at):
     try: asdt,kdt=parse_kst(as_of),parse_kst(known_at)
     except (ValueError,TypeError): return {"verdict":"FAIL","reasons":["invalid timestamp"],"computed":{},"units":{}}
     if kdt>asdt or asdt-kdt>timedelta(days=1): reasons.append("known_at future or stale")
+    try:
+        market_known_at=parse_kst(inputs.get("market_data_known_at"))
+        if market_known_at>asdt: reasons.append("market data known_at future of as_of")
+    except (ValueError, TypeError):
+        reasons.append("missing/invalid market_data_known_at")
     numbers={k:_num(inputs,k,reasons,positive=k in {"current_volume","baseline_volume","trading_value","market_cap"}) for k in ("stock_return_pct","benchmark_return_pct","sector_return_pct","current_volume","baseline_volume","trading_value","market_cap","recent_rise_pct","gap_pct","pre_announcement_return_pct")}
     for k in ("min_trading_value","min_market_cap","max_market_cap","max_recent_rise_pct","max_gap_pct","max_pre_return_pct"): _num(inputs,k,reasons,positive=k in {"min_trading_value","min_market_cap","max_market_cap"})
     if inputs.get("trading_status")!="tradable": reasons.append("not tradable")
@@ -77,25 +89,37 @@ def run_filter(inputs, as_of, known_at):
     computed={"stock_vs_benchmark_pct":None if numbers["stock_return_pct"] is None or numbers["benchmark_return_pct"] is None else numbers["stock_return_pct"]-numbers["benchmark_return_pct"],"stock_vs_sector_pct":None if numbers["stock_return_pct"] is None or numbers["sector_return_pct"] is None else numbers["stock_return_pct"]-numbers["sector_return_pct"],"volume_ratio":volume_ratio}
     return {"verdict":"FAIL" if reasons else "PASS","reasons":reasons,"computed":computed,"units":{"stock_vs_benchmark_pct":"percent; stock_return_pct - benchmark_return_pct; positive means stock outperformed benchmark","stock_vs_sector_pct":"percent; stock_return_pct - sector_return_pct; positive means stock outperformed sector","volume_ratio":"ratio; current_volume / baseline_volume; baseline_volume > 0","as_of":"KST ISO-8601; all input known_at must be <= as_of"}}
 def save_filter(db,evidence_id,inputs,as_of,known_at):
-    row(db,"material_evidence",evidence_id); out=run_filter(inputs,as_of,known_at)
-    try:r=db.execute("INSERT INTO deterministic_filter_results(evidence_id,raw_inputs,computed_outputs,as_of,known_at,verdict,reasons,created_at) VALUES(?,?,?,?,?,?,?,?) RETURNING id",(evidence_id,canon(inputs),canon(out),as_of,known_at,out["verdict"],canon(out["reasons"]),now())).fetchone()
+    evidence=row(db,"material_evidence",evidence_id)
+    try:
+        evidence_known, filter_known, filter_as_of = parse_kst(evidence["known_at"]), parse_kst(known_at), parse_kst(as_of)
+    except (ValueError, TypeError):
+        raise HTTPException(422, "evidence/filter timestamps must be KST ISO-8601")
+    if not evidence_known <= filter_known <= filter_as_of:
+        raise HTTPException(422, "evidence.known_at <= filter.known_at <= filter.as_of required")
+    out=run_filter(inputs,as_of,known_at)
+    if out["verdict"] == "FAIL" and any("market data known_at" in reason for reason in out["reasons"]):
+        raise HTTPException(422, "market_data_known_at must be at or before as_of")
+    try:r=db.execute("INSERT INTO deterministic_filter_results(evidence_id,raw_inputs,computed_outputs,as_of,known_at,evidence_version,verdict,reasons,created_at) VALUES(?,?,?,?,?,?,?,?,?) RETURNING id",(evidence_id,canon(inputs),canon(out),as_of,known_at,evidence["version"],out["verdict"],canon(out["reasons"]),now())).fetchone()
     except sqlite3.IntegrityError: raise HTTPException(409,"duplicate filter key")
     audit(db,"internal","run","filter",r["id"]);db.commit();return filter_detail(db,r["id"])
 def filter_detail(db,ident):
     d=dict(row(db,"deterministic_filter_results",ident)); d["raw_inputs"]=json.loads(d["raw_inputs"]);d["computed_outputs"]=json.loads(d["computed_outputs"]);d["reasons"]=json.loads(d["reasons"]);return d
 
 def save_card(db,data):
-    card=data["card"]; missing=REQUIRED_CARD_FIELDS-set(card)
-    if missing or card.get("verdict") not in VERDICTS: raise HTTPException(422,"structured card required fields/verdict invalid")
+    try: card=validate_card(data["card"])
+    except (KeyError, ValueError) as exc: raise HTTPException(422, f"structured card invalid: {exc}")
     ev=row(db,"material_evidence",data["evidence_id"]); fi=filter_detail(db,data["filter_id"])
-    if fi["evidence_id"]!=ev["id"] or ev["status"]=="invalidated": raise HTTPException(409,"card requires same active evidence")
-    if card["filter_verdict"] != fi["verdict"] or not card.get("source_evidence"): raise HTTPException(422,"card source evidence/filter mismatch")
+    if fi["evidence_id"]!=ev["id"] or ev["status"]=="invalidated" or fi["evidence_version"] != ev["version"]: raise HTTPException(409,"card requires current active evidence filter")
+    if card["filter_verdict"] != fi["verdict"]: raise HTTPException(422,"card source evidence/filter mismatch")
     # A deterministic PASS is evidence quality, not an automatic trading recommendation.
     # Any allowed final verdict may follow PASS; only 매수 검토 가능 can later be approved.
     if fi["verdict"] == "FAIL" and card["verdict"] == "매수 검토 가능": raise HTTPException(422,"FAIL filter cannot be buy-review")
     lineage=data.get("lineage_key",f"{ev['symbol']}:{ev['id']}"); version=db.execute("SELECT COALESCE(MAX(version),0)+1 n FROM decision_cards WHERE lineage_key=?",(lineage,)).fetchone()["n"]
-    if version>1: db.execute("UPDATE order_plans SET status='invalidated' WHERE card_id IN (SELECT id FROM decision_cards WHERE lineage_key=?) AND status='approved'",(lineage,))
-    r=db.execute("INSERT INTO decision_cards(lineage_key,version,evidence_id,filter_id,prompt_version,prompt_hash,model,provider,card_json,verdict,confidence,generated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",(lineage,version,ev["id"],fi["id"],data.get("prompt_version","decision-card-v1"),prompt_hash(),data["model"],data["provider"],canon(card),card["verdict"],float(card["confidence"]),now())).fetchone()
+    if version>1:
+        old_ids=[item["id"] for item in db.execute("SELECT id FROM decision_cards WHERE lineage_key=?", (lineage,))]
+        for old_id in old_ids:
+            invalidate_lineage(db, card_id=old_id, reason="new_card")
+    r=db.execute("INSERT INTO decision_cards(lineage_key,version,evidence_id,filter_id,prompt_version,prompt_hash,model,provider,card_json,schema_version,verdict,confidence,generated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",(lineage,version,ev["id"],fi["id"],data.get("prompt_version","decision-card-v1"),prompt_hash(),data["model"],data["provider"],canon(card),card["schema_version"],card["verdict"],float(card["confidence"]),now())).fetchone()
     db.execute("UPDATE material_evidence SET status='card_generated',updated_at=? WHERE id=?",(now(),ev["id"]))
     audit(db,"internal","save","decision_card",r["id"]);db.commit();return card_detail(db,r["id"])
 def card_detail(db,ident):
@@ -114,7 +138,8 @@ def user_card_view(db, ident, user_id):
     draft=db.execute("SELECT snapshot_json,status,updated_at,supersedes_plan_id FROM order_plan_drafts WHERE card_id=? AND user_id=? AND status='draft'",(ident,user_id)).fetchone()
     plan_view=None
     if plan:
-        plan_view=dict(plan); plan_view["take_profit"]=json.loads(plan_view.pop("take_profit_json")); plan_view["evidence_invalidation"]=json.loads(plan_view["evidence_invalidation"])
+        plan_view=dict(plan); plan_view["take_profit"]=json.loads(plan_view.pop("take_profit_json")); plan_view["split"]=json.loads(plan_view.pop("split_json")); plan_view["evidence_invalidation"]=json.loads(plan_view["evidence_invalidation"])
+        plan_view["snapshot"]={"symbol":plan_view["symbol"],"window":{"start":plan_view["window_start"],"end":plan_view["window_end"]},"price_cap":plan_view["price_cap"],"max_amount":plan_view["max_amount"],"max_qty":plan_view["max_qty"],"split":plan_view["split"],"order_type":plan_view["order_type"],"stop_loss":plan_view["stop_loss"],"take_profit":plan_view["take_profit"],"evidence_invalidation":plan_view["evidence_invalidation"],"holding_until":plan_view["holding_until"],"review_at":plan_view["review_at"],"valid_until":plan_view["valid_until"],"expires":plan_view["expires_at"]}
         plan_view["fills"]=[dict(x) for x in db.execute("SELECT side,qty,price,filled_at FROM order_fills WHERE order_plan_id=? ORDER BY id",(plan["id"],))]
         plan_view["events"]=[dict(x) for x in db.execute("SELECT event,reason,at FROM order_events WHERE order_plan_id=? ORDER BY id",(plan["id"],))]
         plan_view["position"]=dict(db.execute("SELECT symbol,qty,avg_price,status FROM positions WHERE order_plan_id=?",(plan["id"],)).fetchone() or {})

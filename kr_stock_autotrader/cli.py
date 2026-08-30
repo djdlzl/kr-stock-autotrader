@@ -23,7 +23,7 @@ def main(argv=None):
     elif x.cmd=='evidence-detail': out=call('GET','/api/internal/evidence/'+x.evidence_id)
     elif x.cmd=='filter-detail': out=call('GET','/api/internal/filters/'+x.filter_id)
     elif x.cmd=='card-detail': out=call('GET','/api/internal/cards/'+x.card_id)
-    elif x.cmd=='pending-cards': out=call('GET','/api/internal/cards')
+    elif x.cmd=='pending-cards': out=call('GET','/api/internal/cards?missing=true')
     elif x.cmd=='evidence-add': out=call('POST','/api/internal/evidence',json.loads(x.json))
     elif x.cmd=='evidence-update':
         payload=json.loads(x.json); out=call('PATCH','/api/internal/evidence/'+str(payload.pop('id')),payload)

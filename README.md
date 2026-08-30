@@ -5,9 +5,9 @@
 ## 로그인 게이트와 Giraffe UX
 
 - 처음 방문한 `/`는 **로그인/회원가입 화면만** 제공합니다. 인증된 세션은 `/app`으로 이동하며, `/app`은 비로그인 방문자를 `/`로 돌려보냅니다. 기존 private API도 계속 `401`을 반환합니다.
-- 가입·로그인 성공 뒤에는 `/app`에서 상태 요약(전체/예약 대기/보유 중/종료), 계획 목록, 단계형 `새 매수 계획`, 별도 `시세 입력` 패널을 사용합니다. 로그아웃하면 다시 인증 화면으로 이동합니다.
-- 이 UI는 [SEED 디자인 시스템](https://seed-design.io)의 공개 semantic-color/role-typography 원칙에서 **영감을 받은 독자 구현**입니다. SEED 패키지나 당근 로고·캐릭터·상표 자산은 포함하지 않으며, 당근 또는 SEED와 제휴하거나 공식 통합한 제품이 아닙니다.
-- 390px 모바일부터 태블릿/데스크톱까지 단일 열 또는 2열 레이아웃으로 바뀌며, 44px 이상의 터치 대상, label, focus-visible, reduced-motion을 제공합니다.
+- 가입·로그인 뒤 `/app`은 **결정 카드 대시보드**를 제공합니다. 근거·결정 필터·카드를 읽고, `매수 검토 가능` + deterministic `PASS` 카드만 사용자 승인·초안·재승인을 할 수 있습니다. 승인된 계획은 immutable snapshot이며, 이후 편집은 이전 계획의 **진입만** 무효화하고 열린 paper 포지션의 손절·익절·수동 매도는 계속 관리합니다.
+- 기존 `/api/plans` 수동 계획은 legacy 기록으로 남아 있으며 **manual_only**입니다. 새 자동 실행 경로가 아니고, 이 대시보드에서 새 legacy 계획을 만들거나 실행하지 않습니다.
+- 대시보드는 390px 모바일부터 태블릿/데스크톱까지 단일 열 또는 2열 레이아웃으로 바뀌며, 44px 이상의 터치 대상, label, focus-visible을 제공합니다.
 
 ## 안전 경계
 
@@ -33,7 +33,7 @@ uvicorn app:app --host 127.0.0.1 --port 8000
 `SESSION_SECRET`가 없거나 빈 값·공개 개발 기본값·32 bytes 미만이면 앱은 요청을 받기 전에 시작을 거부합니다.
 ```
 
-`http://127.0.0.1:8000`에서 가입/로그인, 계획 입력, 조건 추가/삭제, OR/AND, tick 시세 입력, 상태·체결·충족사유·최근 평가·감사로그·취소를 사용할 수 있습니다. 390px 폭에서도 입력이 넘치지 않도록 단일열로 전환됩니다.
+`http://127.0.0.1:8000`에서 가입/로그인 후 결정 카드 대시보드를 사용합니다. 내부 수집자는 evidence → filter → immutable card를 저장하고, 사용자는 PASS인 `매수 검토 가능` 카드만 paper-only 계획으로 승인합니다. 사후 편집은 새 draft를 만들고 기존 진입을 무효화한 뒤 명시 재승인을 요구합니다. Legacy `POST /api/plans`는 수동 기록 전용입니다.
 
 ## 규칙
 
@@ -63,11 +63,9 @@ API: 가입/로그인/로그아웃, `POST/GET /api/plans`, `POST /api/plans/{id}
 
 ### Decision-card internal API and CLI
 
-`material_evidence`, deterministic filter outputs, prompt-byte hash/versioned cards, user decisions, immutable approved `order_plans`, evaluations/fills/positions and scheduler audit rows are additive SQLite tables. `POST/PATCH /api/internal/*` is fail-closed unless `X-Internal-API-Key` constant-time matches `INTERNAL_API_KEY`; ordinary session users can only read `/api/cards` and submit `/api/cards/{id}/decisions`.
+`material_evidence`와 filter/card lineage는 additive SQLite 테이블입니다. evidence mutation은 version을 증가시키고 모든 이전 filter/card/entry lineage를 무효화합니다. filter는 `evidence.known_at <= filter.known_at <= filter.as_of` 및 `market_data_known_at <= as_of`를 기록해야 하며 card는 그 evidence version과 같은 filter만 사용할 수 있습니다. Card payload는 `schema_version: 1`, 절대 HTTP(S) source URL, KST ordered window, 유한 양수 cap/수량/exit rule 및 0..1 confidence의 Pydantic schema로 검증됩니다. `POST/PATCH /api/internal/*` is fail-closed unless `X-Internal-API-Key` constant-time matches `INTERNAL_API_KEY`; ordinary session users can only read `/api/cards` and submit decisions/drafts/edits.
 
-The deterministic filter records explicit units/denominators and rejects missing, zero-denominator, future, and stale inputs. Cards never overwrite a lineage version; evidence/card changes invalidate approved plans. Decision-card paper execution is intentionally a tick evaluator: it requires an approved unexpired plan, buys before a later distinct tick can exit, caps sells by remaining position, and has no live adapter.
-
-The HTTP-only CLI never prints secrets and never starts a daemon: `GIRAFFE_URL=https://giraffe.example INTERNAL_API_KEY=... python -m kr_stock_autotrader.cli evidence-add '{...}'`. Supported commands are `today-evidence`, `evidence-add`, `evidence-detail`, `filter-run`, `pending-cards`, `card-save-result`, `scheduler-start`, and `scheduler-finish`. Scheduler rows are 07:00/08:00 orchestration records, not paper execution.
+The HTTP-only CLI never prints secrets and never starts a daemon: `GIRAFFE_URL=https://giraffe.example INTERNAL_API_KEY=... python -m kr_stock_autotrader.cli evidence-add '{...}'`. `pending-cards` calls `/api/internal/cards?missing=true`. Supported commands are `today-evidence`, `evidence-add`, `evidence-detail`, `filter-run`, `pending-cards`, `card-save-result`, `scheduler-start`, and `scheduler-finish`. Scheduler rows and the dashboard's “next run” are **bookkeeping/display only**: they do not run research or card jobs. Use the approved topic-specific external schedule after deployment; this application deliberately includes no scheduler daemon or app job infrastructure.
 
 
 ## Docker 운영 배포

@@ -31,7 +31,7 @@ def raw(**override):
         "current_volume": 200, "baseline_volume": 100,
         "recent_rise_pct": 10, "gap_pct": 2, "pre_announcement_return_pct": 3,
         "source": "dart", "announcement_at": "2026-08-31T09:00:00+09:00",
-        "economic_terms": "contract value KRW 100m",
+        "economic_terms": "contract value KRW 100m", "market_data_known_at": "2026-08-31T09:00:00+09:00",
         "min_trading_value": 10_000_000, "min_market_cap": 100_000_000,
         "max_market_cap": 10_000_000_000, "max_recent_rise_pct": 20,
         "max_gap_pct": 10, "max_pre_return_pct": 20,
@@ -43,7 +43,7 @@ def evidence(d, key="e1"):
     return create_evidence(d, {"symbol":"005930", "kind":"disclosure", "title":"contract", "summary":"x", "source":"dart", "snapshot":{"url":"x"}, "dedupe_key":key, "known_at":"2026-08-31T09:00:00+09:00"})
 
 def card(eid, fid, **card_override):
-    payload = {"symbol":"005930", "headline":"h", "conclusion":"c", "change":"c", "source_evidence":[{"id":eid}], "source_urls":["https://dart.fss.or.kr"], "business_value":"x", "certainty":"high", "priced_in":"low", "filter_verdict":"PASS", "price_cap":100, "window":{"start":"2026-08-31T09:00:00+09:00", "end":"2026-08-31T15:00:00+09:00"}, "max_amount":250, "max_qty":3, "stop_loss":80, "take_profit":[{"price":110,"qty":1}], "evidence_invalidation":{"rule":"disclosure_retracted"}, "holding_until":"2026-09-01T10:00:00+09:00", "review_at":"2026-09-01T09:00:00+09:00", "false_positive":"x", "unknowns":"x", "verdict":"매수 검토 가능", "confidence":0.5}
+    payload = {"schema_version":1, "symbol":"005930", "headline":"h", "conclusion":"c", "change":"c", "source_evidence":[{"id":eid,"source":"dart","url":"https://dart.fss.or.kr"}], "source_urls":["https://dart.fss.or.kr"], "business_value":"x", "certainty":"high", "priced_in":"low", "filter_verdict":"PASS", "price_cap":100, "window":{"start":"2026-08-31T09:00:00+09:00", "end":"2026-08-31T15:00:00+09:00"}, "max_amount":250, "max_qty":3, "stop_loss":80, "take_profit":[{"price":110,"qty":1}], "evidence_invalidation":{"rule":"disclosure_retracted"}, "holding_until":"2026-09-01T10:00:00+09:00", "review_at":"2026-09-01T09:00:00+09:00", "false_positive":"x", "unknowns":"x", "verdict":"매수 검토 가능", "confidence":0.5}
     payload.update(card_override)
     return {"evidence_id":eid, "filter_id":fid, "model":"m", "provider":"p", "card":payload}
 
@@ -79,14 +79,12 @@ def test_card_refuses_unlinked_or_fail_filter_and_new_version_invalidates_approv
     c=save_card(db,card(e['id'],f['id'])); db.execute("INSERT INTO users(email,password) VALUES('u','p')"); db.commit(); user_decision(db,c['id'],1,'approve')
     c2=save_card(db,card(e['id'],f['id']))
     assert c2['version']==2
-    assert db.execute("SELECT status FROM order_plans").fetchone()['status']=="invalidated"
+    assert db.execute("SELECT status FROM order_plans").fetchone()['status']=="entry_invalidated"
 
 def test_approval_requires_frozen_nonempty_valid_window_and_exact_duplicate_only(db):
-    e=evidence(db); f=save_filter(db,e['id'],raw(),AS_OF,"2026-08-31T09:00:00+09:00"); c=save_card(db,card(e['id'],f['id'],window={}))
-    db.execute("INSERT INTO users(email,password) VALUES('u','p')"); db.commit()
-    with pytest.raises(HTTPException): user_decision(db,c['id'],1,'approve')
-    c=save_card(db,card(e['id'],f['id'],window={"start":"2026-08-31T10:00:00+09:00","end":"2026-08-31T09:00:00+09:00"}))
-    with pytest.raises(HTTPException): user_decision(db,c['id'],1,'approve')
+    e=evidence(db); f=save_filter(db,e['id'],raw(),AS_OF,"2026-08-31T09:00:00+09:00"); db.execute("INSERT INTO users(email,password) VALUES('u','p')"); db.commit()
+    with pytest.raises(HTTPException): save_card(db,card(e['id'],f['id'],window={}))
+    with pytest.raises(HTTPException): save_card(db,card(e['id'],f['id'],window={"start":"2026-08-31T10:00:00+09:00","end":"2026-08-31T09:00:00+09:00"}))
 
 def test_evaluator_uses_server_now_caps_and_frozen_exit_rules(db):
     _, plan=make_plan(db)

@@ -20,17 +20,19 @@ def connect() -> sqlite3.Connection:
       id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, name TEXT, kind TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL,
       source TEXT NOT NULL, source_url TEXT, announcement_at TEXT, collected_at TEXT NOT NULL, known_at TEXT NOT NULL,
       snapshot TEXT NOT NULL, newness TEXT NOT NULL, dedupe_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'new',
-      created_by TEXT NOT NULL, updated_at TEXT NOT NULL, invalidated_at TEXT, audit_json TEXT NOT NULL DEFAULT '[]'
+      created_by TEXT NOT NULL, updated_at TEXT NOT NULL, invalidated_at TEXT, audit_json TEXT NOT NULL DEFAULT '[]',
+      version INTEGER NOT NULL DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS deterministic_filter_results (
       id INTEGER PRIMARY KEY, evidence_id INTEGER NOT NULL REFERENCES material_evidence(id), raw_inputs TEXT NOT NULL, computed_outputs TEXT NOT NULL,
-      as_of TEXT NOT NULL, known_at TEXT NOT NULL, verdict TEXT NOT NULL CHECK(verdict IN ('PASS','FAIL')), reasons TEXT NOT NULL, created_at TEXT NOT NULL,
-      UNIQUE(evidence_id, as_of, known_at)
+      as_of TEXT NOT NULL, known_at TEXT NOT NULL, evidence_version INTEGER NOT NULL DEFAULT 1,
+      verdict TEXT NOT NULL CHECK(verdict IN ('PASS','FAIL')), reasons TEXT NOT NULL, created_at TEXT NOT NULL,
+      UNIQUE(evidence_id, as_of, known_at, evidence_version)
     );
     CREATE TABLE IF NOT EXISTS decision_cards (
       id INTEGER PRIMARY KEY, lineage_key TEXT NOT NULL, version INTEGER NOT NULL, evidence_id INTEGER NOT NULL REFERENCES material_evidence(id),
       filter_id INTEGER NOT NULL REFERENCES deterministic_filter_results(id), prompt_version TEXT NOT NULL, prompt_hash TEXT NOT NULL,
-      model TEXT NOT NULL, provider TEXT NOT NULL, card_json TEXT NOT NULL, verdict TEXT NOT NULL, confidence REAL NOT NULL,
+      model TEXT NOT NULL, provider TEXT NOT NULL, card_json TEXT NOT NULL, schema_version INTEGER NOT NULL DEFAULT 1, verdict TEXT NOT NULL, confidence REAL NOT NULL,
       generated_at TEXT NOT NULL, invalidated_at TEXT, invalidation_reason TEXT, UNIQUE(lineage_key, version)
     );
     CREATE TABLE IF NOT EXISTS user_decisions (
@@ -60,6 +62,14 @@ def connect() -> sqlite3.Connection:
     # Existing local databases predate cumulative-notional accounting.
     if "bought_amount" not in {col["name"] for col in db.execute("PRAGMA table_info(order_plans)")}:
         db.execute("ALTER TABLE order_plans ADD COLUMN bought_amount REAL NOT NULL DEFAULT 0")
-    if "approval_generation" not in {col["name"] for col in db.execute("PRAGMA table_info(order_plans)")}:
-        db.execute("ALTER TABLE order_plans ADD COLUMN approval_generation INTEGER NOT NULL DEFAULT 1")
+    # Additive, repeat-safe migration for databases created before card lineage versions.
+    for table, column, ddl in (
+        ("material_evidence", "version", "INTEGER NOT NULL DEFAULT 1"),
+        ("deterministic_filter_results", "evidence_version", "INTEGER NOT NULL DEFAULT 1"),
+        ("decision_cards", "schema_version", "INTEGER NOT NULL DEFAULT 1"),
+        ("order_plans", "approval_generation", "INTEGER NOT NULL DEFAULT 1"),
+        ("order_plans", "bought_amount", "REAL NOT NULL DEFAULT 0"),
+    ):
+        if column not in {col["name"] for col in db.execute(f"PRAGMA table_info({table})")}:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
     return db
