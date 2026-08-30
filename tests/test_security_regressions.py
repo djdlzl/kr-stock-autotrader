@@ -51,7 +51,7 @@ def test_tick_cannot_evaluate_another_users_plan():
     plan(owner)
     assert tick(attacker, "attacker-tick").status_code == 200
     row = owner.get("/api/plans").json()[0]
-    assert row["status"] == "scheduled"
+    assert row["status"] == "manual_only"
     assert row["events"] == [{"event": "created", "reason": "", "at": row["events"][0]["at"]}]
 
 
@@ -62,11 +62,11 @@ def test_future_and_stale_known_at_fail_closed_for_buy_and_sell():
     now = datetime.now(KST)
     for key, time in (("stale", now - timedelta(minutes=6)), ("future", now + timedelta(seconds=1))):
         assert tick(c, key, time.isoformat()).status_code == 200
-        assert c.get("/api/plans").json()[0]["status"] == "scheduled"
+        assert c.get("/api/plans").json()[0]["status"] == "manual_only"
     assert pid
 
 
-def test_deadline_is_iso_kst_and_empty_conditions_do_not_auto_sell(monkeypatch):
+def test_legacy_conditions_do_not_auto_execute(monkeypatch):
     import kr_stock_autotrader.service as service
     evaluation_time = datetime(2026, 8, 28, 10, 0, tzinfo=KST)
     monkeypatch.setattr(service, "now_kst", lambda: evaluation_time)
@@ -78,9 +78,9 @@ def test_deadline_is_iso_kst_and_empty_conditions_do_not_auto_sell(monkeypatch):
     })
     assert response.status_code == 200, response.text
     assert tick(c, "deadline-buy").status_code == 200
-    assert c.get("/api/plans").json()[0]["status"] == "filled"
+    assert c.get("/api/plans").json()[0]["status"] == "manual_only"
     assert tick(c, "deadline-sell").status_code == 200
-    assert c.get("/api/plans").json()[0]["status"] == "closed"
+    assert c.get("/api/plans").json()[0]["fills"] == []
 
 
 def test_missing_or_public_default_secret_fails_closed_in_fresh_process():
@@ -166,18 +166,17 @@ def test_token_claims_reject_known_default_forgery_and_future_iat(monkeypatch):
     assert c.get("/api/plans").status_code == 401
 
 
-def test_closed_cancel_is_truthful_and_cancel_is_idempotent(monkeypatch):
+def test_manual_only_cancel_is_truthful_and_idempotent(monkeypatch):
     import kr_stock_autotrader.service as service
     now = datetime(2026, 8, 28, 10, 0, tzinfo=KST)
     monkeypatch.setattr(service, "now_kst", lambda: now)
     c = TestClient(app)
     signup(c, "cancel-state@test.com")
     closed = plan(c)
-    assert tick(c, "closed-buy", now.isoformat()).status_code == 200
-    assert tick(c, "closed-sell", now.isoformat()).status_code == 200
-    response = c.post(f"/api/plans/{closed}/cancel")
-    assert response.status_code == 409
-    assert response.json()["detail"]["current_status"] == "closed"
+    assert tick(c, "legacy-tick", now.isoformat()).status_code == 200
+    assert c.get("/api/plans").json()[0]["fills"] == []
+    assert c.post(f"/api/plans/{closed}/cancel").json() == {"status": "cancelled", "idempotent": False}
+    assert c.post(f"/api/plans/{closed}/cancel").json() == {"status": "cancelled", "idempotent": True}
     open_plan = c.post("/api/plans", json={"symbol":"005930", "name":"삼성전자", "scheduled_at":"2030-01-01T10:00:00+09:00", "qty":1, "conditions":[]}).json()["id"]
     assert c.post(f"/api/plans/{open_plan}/cancel").json() == {"status": "cancelled", "idempotent": False}
     assert c.post(f"/api/plans/{open_plan}/cancel").json() == {"status": "cancelled", "idempotent": True}

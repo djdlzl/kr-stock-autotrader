@@ -10,7 +10,7 @@ from .auth import csrf_origin_ok, current_user, hash_password, issue_session, ve
 from .config import COOKIE_SECURE, LIVE_TRADING, SIGNUP_ENABLED
 from .db import connect
 from .domain import Quote, parse_kst
-from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, save_card, list_cards, card_detail, user_decision, evaluate_order_plan)
+from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, save_card, list_cards, card_detail, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML
 
@@ -174,7 +174,7 @@ def create_plan(data: PlanIn, request: Request):
     db = connect()
     try:
         row = db.execute(
-            "INSERT INTO plans(user_id,symbol,name,scheduled_at,qty,order_type,limit_price,combine_mode) VALUES(?,?,?,?,?,?,?,?) RETURNING id",
+            "INSERT INTO plans(user_id,symbol,name,scheduled_at,qty,order_type,limit_price,combine_mode,status) VALUES(?,?,?,?,?,?,?,?, 'manual_only') RETURNING id",
             (uid, data.symbol, data.name, data.scheduled_at, data.qty, data.order_type, data.limit_price, data.combine_mode),
         ).fetchone()
         db.executemany(
@@ -183,7 +183,7 @@ def create_plan(data: PlanIn, request: Request):
         )
         audit(db, row["id"], "created")
         db.commit()
-        return {"id": row["id"], "status": "scheduled"}
+        return {"id": row["id"], "status": "manual_only", "executable": False}
     finally:
         db.close()
 
@@ -364,18 +364,44 @@ async def user_card_decision(card_id: int, request: Request):
     try:return user_decision(db,card_id,uid,data['decision'],data.get('note',''))
     finally:db.close()
 
+@app.post('/api/cards/{card_id}/order-plan-draft')
+async def user_order_plan_draft(card_id: int, request: Request):
+    csrf_origin_ok(request); uid=current_user(request); data=await request.json(); db=connect()
+    try: return edit_draft(db,card_id,uid,data)
+    finally: db.close()
+
 @app.post('/api/order-plans/{plan_id}/edit')
 async def user_order_plan_edit(plan_id: int, request: Request):
     """Any edit is authenticated and revokes the immutable approved snapshot."""
-    csrf_origin_ok(request); uid=current_user(request); await request.json()
+    csrf_origin_ok(request); uid=current_user(request); data=await request.json()
     db=connect()
     try:
-        plan=db.execute('SELECT * FROM order_plans WHERE id=? AND user_id=?',(plan_id,uid)).fetchone()
+        return edit_order_plan(db, plan_id, uid, data)
+    finally: db.close()
+
+@app.get('/api/order-plans/{plan_id}')
+def user_order_plan_detail(plan_id: int, request: Request):
+    uid=current_user(request); db=connect()
+    try:
+        plan=db.execute("SELECT * FROM order_plans WHERE id=? AND user_id=?",(plan_id,uid)).fetchone()
         if not plan: raise HTTPException(404,'order plan not found')
-        if plan['status'] != 'approved': raise HTTPException(409,'only an approved plan can be edited for reapproval')
-        db.execute("UPDATE order_plans SET status='invalidated' WHERE id=?",(plan_id,))
-        audit(db,plan_id,'edit_invalidates',key=f'edit-invalidates:{plan_id}');db.commit()
-        return {'id':plan_id,'status':'invalidated','reapproval_required':True}
+        out=dict(plan)
+        draft=db.execute("SELECT snapshot_json,status,updated_at FROM order_plan_drafts WHERE card_id=? AND user_id=? AND status='draft'",(plan['card_id'],uid)).fetchone()
+        out['draft']={**dict(draft), 'snapshot':__import__('json').loads(draft['snapshot_json'])} if draft else None
+        out['events']=[dict(x) for x in db.execute("SELECT event,reason,at FROM order_events WHERE order_plan_id=? ORDER BY id",(plan_id,))]
+        out['position']=dict(db.execute("SELECT qty,avg_price,status FROM positions WHERE order_plan_id=?",(plan_id,)).fetchone() or {})
+        return out
+    finally: db.close()
+
+@app.post('/api/order-plans/{plan_id}/close')
+async def user_order_plan_close(plan_id: int, request: Request):
+    """An authenticated explicit event may close only an already-open paper position."""
+    csrf_origin_ok(request); uid=current_user(request); data=await request.json(); db=connect()
+    try:
+        plan=db.execute("SELECT user_id FROM order_plans WHERE id=?",(plan_id,)).fetchone()
+        if not plan or plan['user_id'] != uid: raise HTTPException(404,'order plan not found')
+        data['manual_exit']=True
+        return evaluate_order_plan(db,plan_id,data)
     finally: db.close()
 
 @app.get("/", response_class=HTMLResponse)

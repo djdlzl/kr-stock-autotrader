@@ -30,7 +30,7 @@ def test_evidence_dedupe_immutable_card_approval_and_buy_then_exit(db):
  assert first['fills'][0]['side']=='buy'
  assert evaluate_order_plan(db,plan,{'tick_key':'a','known_at':'2026-08-31T10:00:00+09:00','price':90,'liquidity':1})['idempotent']
  second=evaluate_order_plan(db,plan,{'tick_key':'b','known_at':'2026-08-31T10:01:00+09:00','server_now':'2026-08-31T10:01:00+09:00','price':90,'liquidity':1,'trading_value':1,'fill_qty':1})
- assert second['fills'][0]['side']=='sell' and second['fills'][0]['qty']==1
+ assert second['fills'][0]['side']=='sell' and second['fills'][0]['qty']==2  # frozen stop-loss closes remaining position
 def test_internal_writes_fail_closed(monkeypatch):
  monkeypatch.setenv('INTERNAL_API_KEY','secret'); from app import app
  c=TestClient(app); payload={'symbol':'005930','kind':'x','title':'x','summary':'x','source':'x','snapshot':{},'dedupe_key':'api','known_at':'2026-08-31T08:00:00+09:00'}

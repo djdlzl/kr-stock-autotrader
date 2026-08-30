@@ -100,46 +100,95 @@ def _valid_plan(card):
     except (KeyError,ValueError,TypeError): raise HTTPException(422,"nonempty KST window and valid_until required")
     if start>=end: raise HTTPException(422,"window start must precede end")
     return x,window,expiry
+def _snapshot(card, override=None):
+    x = dict(card["card"])
+    x.update(override or {})
+    frozen = dict(card); frozen["card"] = x
+    _valid_plan(frozen)
+    return x
+
+def edit_draft(db, card_id, user_id, override):
+    c=card_detail(db,card_id)
+    if c["invalidated_at"]: raise HTTPException(409,"card invalidated")
+    x=_snapshot(c,override)
+    db.execute("INSERT INTO order_plan_drafts(card_id,user_id,snapshot_json,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(card_id,user_id,status) DO UPDATE SET snapshot_json=excluded.snapshot_json,updated_at=excluded.updated_at",(card_id,user_id,canon(x),now(),now()))
+    db.commit(); return {"card_id":card_id,"status":"draft","draft":x}
+
+def edit_order_plan(db, plan_id, user_id, override):
+    """Store a validated user draft; post-approval edits revoke entries, not exits."""
+    p = row(db, "order_plans", plan_id)
+    if p["user_id"] != user_id: raise HTTPException(404, "order plan not found")
+    c = card_detail(db, p["card_id"])
+    base = {"symbol":p["symbol"], "window":{"start":p["window_start"],"end":p["window_end"]}, "price_cap":p["price_cap"], "max_amount":p["max_amount"], "max_qty":p["max_qty"], "order_type":p["order_type"], "stop_loss":p["stop_loss"], "take_profit":json.loads(p["take_profit_json"]), "evidence_invalidation":json.loads(p["evidence_invalidation"]), "holding_until":p["holding_until"], "review_at":p["review_at"], "valid_until":p["valid_until"]}
+    base.update(override or {}); _snapshot(c, base)
+    db.execute("INSERT INTO order_plan_drafts(card_id,user_id,snapshot_json,supersedes_plan_id,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(card_id,user_id,status) DO UPDATE SET snapshot_json=excluded.snapshot_json,supersedes_plan_id=excluded.supersedes_plan_id,updated_at=excluded.updated_at", (c["id"],user_id,canon(base),plan_id,now(),now()))
+    position = db.execute("SELECT qty FROM positions WHERE order_plan_id=?", (plan_id,)).fetchone()
+    status = "review_required" if position and position["qty"] > 0 else "entry_invalidated"
+    db.execute("UPDATE order_plans SET status=? WHERE id=?", (status,plan_id))
+    audit(db,str(user_id),"edit_invalidates_entry","order_plan",plan_id); db.commit()
+    return {"order_plan_id":plan_id,"status":status,"reapproval_required":True,"draft":base}
+
 def user_decision(db,card_id,user_id,decision,note=""):
     c=card_detail(db,card_id)
-    if decision!="approve": db.execute("INSERT INTO user_decisions(card_id,user_id,decision,decided_at,note) VALUES(?,?,?,?,?) ON CONFLICT(card_id,user_id) DO UPDATE SET decision=excluded.decision,decided_at=excluded.decided_at,note=excluded.note",(card_id,user_id,decision,now(),note));db.execute("UPDATE order_plans SET status='invalidated' WHERE card_id=? AND status='approved'",(card_id,));db.commit();return {"decision":decision}
+    if decision!="approve":
+        db.execute("INSERT INTO user_decisions(card_id,user_id,decision,decided_at,note) VALUES(?,?,?,?,?) ON CONFLICT(card_id,user_id) DO UPDATE SET decision=excluded.decision,decided_at=excluded.decided_at,note=excluded.note",(card_id,user_id,decision,now(),note))
+        for p in db.execute("SELECT id FROM order_plans WHERE card_id=? AND user_id=? AND status IN ('approved','execution_wait','partial_or_filled','exit_wait')",(card_id,user_id)):
+            pos=db.execute("SELECT qty FROM positions WHERE order_plan_id=?",(p["id"],)).fetchone(); db.execute("UPDATE order_plans SET status=? WHERE id=?",("review_required" if pos and pos["qty"] else "entry_invalidated",p["id"]))
+        db.commit(); return {"decision":decision}
     if c["invalidated_at"]: raise HTTPException(409,"card invalidated; regenerate and reapprove")
-    x,window,expiry=_valid_plan(c); snapshot=canon(x); vh=hashlib.sha256(canon({"card":c["id"],"user":user_id,"snapshot":snapshot}).encode()).hexdigest()
+    draft=db.execute("SELECT * FROM order_plan_drafts WHERE card_id=? AND user_id=? AND status='draft'",(card_id,user_id)).fetchone()
+    x=_snapshot(c,json.loads(draft["snapshot_json"]) if draft else None); window=x["window"]; expiry=parse_kst(x.get("valid_until") or x["holding_until"])
+    snapshot=canon(x); vh=hashlib.sha256(canon({"card":c["id"],"user":user_id,"snapshot":snapshot}).encode()).hexdigest()
     existing=db.execute("SELECT id FROM order_plans WHERE version_hash=?",(vh,)).fetchone()
     if existing: return {"decision":"approve","order_plan_hash":vh,"idempotent":True,"order_plan_id":existing["id"]}
     db.execute("INSERT INTO user_decisions(card_id,user_id,decision,decided_at,note) VALUES(?,?,?,?,?) ON CONFLICT(card_id,user_id) DO UPDATE SET decision=excluded.decision,decided_at=excluded.decided_at,note=excluded.note",(card_id,user_id,"approve",now(),note))
     p=db.execute("INSERT INTO order_plans(card_id,card_version,user_id,approved_at,valid_until,symbol,window_start,window_end,price_cap,max_amount,max_qty,split_json,order_type,stop_loss,take_profit_json,evidence_invalidation,holding_until,review_at,expires_at,status,version_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",(c["id"],c["version"],user_id,now(),expiry.isoformat(),x["symbol"],window["start"],window["end"],x["price_cap"],x["max_amount"],x["max_qty"],canon(x.get("split",[])),x.get("order_type","limit"),x["stop_loss"],canon(x["take_profit"]),canon(x["evidence_invalidation"]),x.get("holding_until"),x.get("review_at"),expiry.isoformat(),"approved",vh)).fetchone()
+    if draft: db.execute("UPDATE order_plan_drafts SET status='approved' WHERE id=?",(draft["id"],))
     audit(db,str(user_id),"approve","decision_card",card_id);db.commit();return {"decision":"approve","order_plan_hash":vh,"order_plan_id":p["id"],"idempotent":False}
+
 def evaluate_order_plan(db,plan_id,tick,server_now=None):
-    p=dict(row(db,"order_plans",plan_id)); reasons=[]
-    try: known=parse_kst(tick["known_at"]); current=parse_kst(server_now or tick.get("server_now") or now())
-    except (KeyError,ValueError,TypeError): known=current=None; reasons.append("invalid_known_at")
-    key=tick.get("tick_key")
+    p=dict(row(db,"order_plans",plan_id)); key=tick.get("tick_key")
     if not key: raise HTTPException(422,"tick_key required")
     if db.execute("SELECT 1 FROM order_evaluations WHERE order_plan_id=? AND tick_key=?",(plan_id,key)).fetchone(): return {"idempotent":True,"fills":[]}
+    reasons=[]
+    try: known=parse_kst(tick["known_at"]); current=parse_kst(server_now or tick.get("server_now") or now())
+    except (KeyError,ValueError,TypeError): known=current=None; reasons.append("invalid_known_at")
     if current is None or not fresh_quote(type("Q",(),{"known_at":known})(),current): reasons.append("stale_or_future_quote")
-    if p["status"]!="approved" or current>parse_kst(p["expires_at"]): reasons.append("unapproved_or_expired")
-    if not market_open(current) or current<parse_kst(p["window_start"]) or current>parse_kst(p["window_end"]): reasons.append("market_or_order_window_closed")
-    if not _positive(tick.get("price")) or tick["price"]>p["price_cap"] or tick.get("gap_pct",0)>10 or not _positive(tick.get("liquidity")) or not _positive(tick.get("trading_value")) or tick.get("conflicting_disclosure"): reasons.append("precheck_failed")
-    if reasons:
-        db.execute("INSERT INTO order_evaluations(order_plan_id,tick_key,result,reasons,evaluated_at) VALUES(?,?,?,?,?)",(plan_id,key,"REJECT",canon(reasons),now())); db.execute("INSERT INTO order_events(order_plan_id,event_key,event,reason,at) VALUES(?,?,?,?,?)",(plan_id,f"{plan_id}:{key}:reject","rejected",canon(reasons),now()));db.commit();return {"fills":[],"reasons":reasons}
-    remaining_qty=p["max_qty"]-p["bought_qty"]; requested=int(tick.get("fill_qty",remaining_qty)); side=None; qty=0
-    # A frozen exit wins over further entries; arbitrary caller exit flags are ignored.
-    exit_rule=None
-    if p["bought_qty"]>p["sold_qty"]:
-        take=any(_positive(r.get("price")) and tick["price"]>=r["price"] for r in json.loads(p["take_profit_json"]))
-        if tick["price"]<=p["stop_loss"]: exit_rule="stop_loss"
-        elif take: exit_rule="take_profit"
-        elif current>=parse_kst(p["holding_until"]) if p["holding_until"] else False: exit_rule="holding_until"
-        elif current>=parse_kst(p["review_at"]) if p["review_at"] else False: exit_rule="review_at"
-        if exit_rule: side="sell"; qty=min(requested,p["bought_qty"]-p["sold_qty"])
-    if not side:
-        amount_qty=math.floor((p["max_amount"]-p["bought_qty"]*tick["price"])/tick["price"])
-        if remaining_qty>0 and amount_qty>0: side="buy"; qty=min(requested,remaining_qty,amount_qty)
-    if not side or qty<=0:
-        db.execute("INSERT INTO order_evaluations(order_plan_id,tick_key,result,reasons,evaluated_at) VALUES(?,?,?,?,?)",(plan_id,key,"NOOP","[]",now()));db.commit();return {"fills":[]}
+    remaining=p["bought_qty"]-p["sold_qty"]
+    # Exit gates are deliberately independent from entry validity and prechecks.
+    rule=None; tranche_qty=None
+    if not reasons and remaining>0:
+        if tick.get("manual_exit"): rule="manual"
+        elif tick.get("evidence_invalidated"): rule="evidence_invalidation"
+        elif _positive(tick.get("price")) and tick["price"]<=p["stop_loss"]: rule="stop_loss"
+        else:
+            for i,r in enumerate(json.loads(p["take_profit_json"])):
+                stage=f"take_profit:{i}"
+                used=db.execute("SELECT 1 FROM exit_lineage WHERE order_plan_id=? AND rule=?",(plan_id,stage)).fetchone()
+                if not used and _positive(r.get("price")) and tick.get("price",0)>=r["price"]:
+                    rule=stage; tranche_qty=int(r.get("qty",0)); break
+            if not rule and p["holding_until"] and current>=parse_kst(p["holding_until"]): rule="holding_until"
+            if not rule and p["review_at"] and current>=parse_kst(p["review_at"]): rule="review_at"
+    if rule:
+        qty=remaining if rule in {"manual","evidence_invalidation","stop_loss","holding_until","review_at"} else min(remaining,tranche_qty)
+        side="sell"
+    else:
+        entry_reasons=list(reasons)
+        if p["status"] not in {"approved","execution_wait","partial_or_filled"} or current>parse_kst(p["expires_at"]): entry_reasons.append("unapproved_or_expired")
+        if not market_open(current) or current<parse_kst(p["window_start"]) or current>parse_kst(p["window_end"]): entry_reasons.append("market_or_order_window_closed")
+        if not _positive(tick.get("price")) or tick["price"]>p["price_cap"] or tick.get("gap_pct",0)>10 or not _positive(tick.get("liquidity")) or not _positive(tick.get("trading_value")) or tick.get("conflicting_disclosure"): entry_reasons.append("precheck_failed")
+        if entry_reasons:
+            db.execute("INSERT INTO order_evaluations(order_plan_id,tick_key,result,reasons,evaluated_at) VALUES(?,?,?,?,?)",(plan_id,key,"REJECT",canon(entry_reasons),now())); db.execute("INSERT INTO order_events(order_plan_id,event_key,event,reason,at) VALUES(?,?,?,?,?)",(plan_id,f"{plan_id}:{key}:entry_reject","entry_rejected",canon(entry_reasons),now())); db.commit(); return {"fills":[],"reasons":entry_reasons}
+        requested=max(0,int(tick.get("fill_qty",p["max_qty"]-p["bought_qty"])))
+        qty=min(requested,p["max_qty"]-p["bought_qty"],math.floor((p["max_amount"]-p["bought_amount"])/tick["price"])); side="buy"
+    if qty<=0:
+        db.execute("INSERT INTO order_evaluations(order_plan_id,tick_key,result,reasons,evaluated_at) VALUES(?,?,?,?,?)",(plan_id,key,"NOOP",canon(reasons),now())); db.commit(); return {"fills":[]}
     event_key=f"{plan_id}:{key}:{side}"; fill=db.execute("INSERT INTO order_fills(order_plan_id,event_key,side,qty,price,filled_at) VALUES(?,?,?,?,?,?) RETURNING id",(plan_id,event_key,side,qty,tick["price"],now())).fetchone()
-    db.execute("INSERT INTO order_events(order_plan_id,event_key,event,reason,at) VALUES(?,?,?,?,?)",(plan_id,event_key,"filled",exit_rule or "approved_buy",now()))
-    if side=="buy": db.execute("UPDATE order_plans SET bought_qty=bought_qty+?,last_tick_key=? WHERE id=?",(qty,key,plan_id));db.execute("INSERT INTO positions(order_plan_id,symbol,qty,avg_price,status) VALUES(?,?,?,?,?) ON CONFLICT(order_plan_id) DO UPDATE SET qty=qty+excluded.qty,status='open'",(plan_id,p["symbol"],qty,tick["price"],"open"))
-    else: db.execute("UPDATE order_plans SET sold_qty=sold_qty+?,last_tick_key=? WHERE id=?",(qty,key,plan_id));db.execute("UPDATE positions SET qty=qty-?,status=CASE WHEN qty-?=0 THEN 'closed' ELSE 'open' END WHERE order_plan_id=?",(qty,qty,plan_id));db.execute("INSERT INTO exit_lineage(order_plan_id,fill_id,rule,quote_known_at,created_at) VALUES(?,?,?,?,?)",(plan_id,fill["id"],exit_rule,known.isoformat(),now()))
-    db.execute("INSERT INTO order_evaluations(order_plan_id,tick_key,result,reasons,evaluated_at) VALUES(?,?,?,?,?)",(plan_id,key,"FILLED",canon([side]),now()));db.commit();return {"fills":[{"side":side,"qty":qty,"price":tick["price"]}]}
+    db.execute("INSERT INTO order_events(order_plan_id,event_key,event,reason,at) VALUES(?,?,?,?,?)",(plan_id,event_key,"exit_filled" if side=="sell" else "buy_filled",rule or "approved_entry",now()))
+    if side=="buy":
+        new_amount=p["bought_amount"]+qty*tick["price"]; new_qty=p["bought_qty"]+qty
+        db.execute("UPDATE order_plans SET bought_qty=?,bought_amount=?,last_tick_key=?,status=? WHERE id=?",(new_qty,new_amount,key,"partial_or_filled",plan_id))
+        db.execute("INSERT INTO positions(order_plan_id,symbol,qty,avg_price,status) VALUES(?,?,?,?,?) ON CONFLICT(order_plan_id) DO UPDATE SET avg_price=(positions.avg_price*positions.qty+excluded.avg_price*excluded.qty)/(positions.qty+excluded.qty),qty=positions.qty+excluded.qty,status='open'",(plan_id,p["symbol"],qty,tick["price"],"open"))
+    else:
+        after=remaining-qty; db.execute("UPDATE order_plans SET sold_qty=sold_qty+?,last_tick_key=?,status=? WHERE id=?",(qty,key,"closed" if after==0 else "exit_wait",plan_id)); db.execute("UPDATE positions SET qty=qty-?,status=CASE WHEN qty-?=0 THEN 'closed' ELSE 'open' END WHERE order_plan_id=?",(qty,qty,plan_id)); db.execute("INSERT INTO exit_lineage(order_plan_id,fill_id,rule,quote_known_at,created_at) VALUES(?,?,?,?,?)",(plan_id,fill["id"],rule,known.isoformat(),now()))
+    db.execute("INSERT INTO order_evaluations(order_plan_id,tick_key,result,reasons,evaluated_at) VALUES(?,?,?,?,?)",(plan_id,key,"FILLED",canon([side,rule] if rule else [side]),now())); db.commit(); return {"fills":[{"side":side,"qty":qty,"price":tick["price"]}]}

@@ -24,19 +24,15 @@ def test_auth_separation_and_ui_smoke():
     assert other.get('/api/plans').json()==[]
 
 
-def test_paper_e2e_fill_sell_and_idempotency(monkeypatch):
+def test_legacy_plan_is_readable_but_never_paper_filled(monkeypatch):
     monkeypatch.setattr(service, "now_kst", lambda: NOW)
     x=TestClient(app); x.post('/api/signup',json={'email':'flow@test.com','password':'long-password'})
-    plan=x.post('/api/plans',json={'symbol':'005930','name':'삼성전자','scheduled_at':'2020-01-01T10:00','qty':3,'combine_mode':'OR','conditions':[{'kind':'absolute_price','operator':'>=','value':70000}]}).json()['id']
+    response=x.post('/api/plans',json={'symbol':'005930','name':'삼성전자','scheduled_at':'2020-01-01T10:00','qty':3,'combine_mode':'OR','conditions':[{'kind':'absolute_price','operator':'>=','value':70000}]})
+    assert response.json()['executable'] is False
+    plan=response.json()['id']
     tick={'symbol':'005930','price':70000,'volume':100,'baseline_volume':100,'known_at':NOW.isoformat(),'idempotency_key':'once'}
     assert x.post('/api/ticks',json=tick).status_code==200
     row=x.get('/api/plans').json()[0]
-    assert row['id']==plan and row['status']=='filled' and row['sold_qty']==0
-    assert [(f['side'], f['qty']) for f in row['fills']] == [('buy', 3)]
-    events=len(row['events']); x.post('/api/ticks',json=tick)
-    assert len(x.get('/api/plans').json()[0]['events'])==events
-    second = {**tick, 'idempotency_key': 'next-fresh-tick'}
-    assert x.post('/api/ticks',json=second).status_code == 200
-    row = x.get('/api/plans').json()[0]
-    assert row['status'] == 'closed' and row['sold_qty'] == 3
-    assert [(f['side'], f['qty']) for f in row['fills']] == [('buy', 3), ('sell', 3)]
+    assert row['id']==plan and row['status']=='manual_only' and row['sold_qty']==0 and row['fills']==[]
+    x.post('/api/ticks',json={**tick, 'idempotency_key':'next'})
+    assert x.get('/api/plans').json()[0]['fills']==[]

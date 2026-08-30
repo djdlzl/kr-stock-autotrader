@@ -42,7 +42,12 @@ def connect() -> sqlite3.Connection:
       approved_at TEXT NOT NULL, valid_until TEXT NOT NULL, symbol TEXT NOT NULL, window_start TEXT, window_end TEXT, price_cap REAL NOT NULL,
       max_amount REAL NOT NULL, max_qty INTEGER NOT NULL, split_json TEXT NOT NULL, order_type TEXT NOT NULL, stop_loss REAL, take_profit_json TEXT NOT NULL,
       evidence_invalidation TEXT NOT NULL, holding_until TEXT, review_at TEXT, expires_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'approved', version_hash TEXT NOT NULL UNIQUE,
-      bought_qty INTEGER NOT NULL DEFAULT 0, sold_qty INTEGER NOT NULL DEFAULT 0, last_tick_key TEXT
+      bought_qty INTEGER NOT NULL DEFAULT 0, bought_amount REAL NOT NULL DEFAULT 0, sold_qty INTEGER NOT NULL DEFAULT 0, last_tick_key TEXT
+    );
+    CREATE TABLE IF NOT EXISTS order_plan_drafts (
+      id INTEGER PRIMARY KEY, card_id INTEGER NOT NULL REFERENCES decision_cards(id), user_id INTEGER NOT NULL REFERENCES users(id),
+      snapshot_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', supersedes_plan_id INTEGER REFERENCES order_plans(id),
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(card_id,user_id,status)
     );
     CREATE TABLE IF NOT EXISTS order_evaluations (id INTEGER PRIMARY KEY, order_plan_id INTEGER NOT NULL REFERENCES order_plans(id), tick_key TEXT NOT NULL, result TEXT NOT NULL, reasons TEXT NOT NULL, evaluated_at TEXT NOT NULL, UNIQUE(order_plan_id,tick_key));
     CREATE TABLE IF NOT EXISTS order_events (id INTEGER PRIMARY KEY, order_plan_id INTEGER NOT NULL REFERENCES order_plans(id), event_key TEXT NOT NULL UNIQUE, event TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL);
@@ -52,4 +57,7 @@ def connect() -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS scheduler_runs (id INTEGER PRIMARY KEY, run_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, detail TEXT NOT NULL DEFAULT '{}');
     CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, detail TEXT NOT NULL, at TEXT NOT NULL);
     """)
+    # Existing local databases predate cumulative-notional accounting.
+    if "bought_amount" not in {col["name"] for col in db.execute("PRAGMA table_info(order_plans)")}:
+        db.execute("ALTER TABLE order_plans ADD COLUMN bought_amount REAL NOT NULL DEFAULT 0")
     return db
