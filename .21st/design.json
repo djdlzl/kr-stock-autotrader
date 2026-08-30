@@ -19,13 +19,13 @@
   "design": {
     "colorMode": "light",
     "colors": {
-      "primary": "#ff6f0f",
-      "primaryLow": "#fff0e5",
-      "paper": "#fffaf6",
+      "primary": "#2563eb",
+      "primaryLow": "#eff6ff",
+      "paper": "#f8fafc",
       "sheet": "#ffffff",
-      "ink": "#1f1d1b",
-      "inkLow": "#6d6863",
-      "divider": "#e9e1da",
+      "ink": "#172033",
+      "inkLow": "#64748b",
+      "divider": "#dbe3ef",
       "success": "#126b49",
       "warning": "#a95b00",
       "danger": "#c73524"
@@ -89,7 +89,7 @@
       "rationale": "The project is server-rendered vanilla HTML; React/shadcn code would add unnecessary infrastructure."
     },
     {
-      "decision": "Taste dials: variance 3, motion 2, density 5",
+      "decision": "Taste dials: variance 3, motion 2, density 6",
       "rationale": "This is a trust-first financial planning product; accessibility and clarity override marketing-page theatrics."
     }
   ],

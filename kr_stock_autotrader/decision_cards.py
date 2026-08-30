@@ -90,8 +90,9 @@ def save_card(db,data):
     ev=row(db,"material_evidence",data["evidence_id"]); fi=filter_detail(db,data["filter_id"])
     if fi["evidence_id"]!=ev["id"] or ev["status"]=="invalidated": raise HTTPException(409,"card requires same active evidence")
     if card["filter_verdict"] != fi["verdict"] or not card.get("source_evidence"): raise HTTPException(422,"card source evidence/filter mismatch")
-    if fi["verdict"] == "PASS" and card["verdict"] != "매수 검토 가능": raise HTTPException(422,"PASS filter requires buy-review verdict")
-    if fi["verdict"] == "FAIL" and card["verdict"] not in {"제외","관찰","판단 보류"}: raise HTTPException(422,"FAIL filter cannot be buy-review")
+    # A deterministic PASS is evidence quality, not an automatic trading recommendation.
+    # Any allowed final verdict may follow PASS; only 매수 검토 가능 can later be approved.
+    if fi["verdict"] == "FAIL" and card["verdict"] == "매수 검토 가능": raise HTTPException(422,"FAIL filter cannot be buy-review")
     lineage=data.get("lineage_key",f"{ev['symbol']}:{ev['id']}"); version=db.execute("SELECT COALESCE(MAX(version),0)+1 n FROM decision_cards WHERE lineage_key=?",(lineage,)).fetchone()["n"]
     if version>1: db.execute("UPDATE order_plans SET status='invalidated' WHERE card_id IN (SELECT id FROM decision_cards WHERE lineage_key=?) AND status='approved'",(lineage,))
     r=db.execute("INSERT INTO decision_cards(lineage_key,version,evidence_id,filter_id,prompt_version,prompt_hash,model,provider,card_json,verdict,confidence,generated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",(lineage,version,ev["id"],fi["id"],data.get("prompt_version","decision-card-v1"),prompt_hash(),data["model"],data["provider"],canon(card),card["verdict"],float(card["confidence"]),now())).fetchone()
@@ -100,11 +101,25 @@ def save_card(db,data):
 def card_detail(db,ident):
     d=dict(row(db,"decision_cards",ident));d["card"]=json.loads(d.pop("card_json"));return d
 def user_card_view(db, ident, user_id):
+    """Safe read model for the owner-facing UI; never expose internal raw input."""
     result=card_detail(db,ident)
+    evidence=evidence_detail(db,result["evidence_id"])
+    result["evidence"]={k:evidence.get(k) for k in ("id","symbol","name","kind","title","summary","source","source_url","announcement_at","collected_at","known_at","status")}
+    result["evidence"]["snapshot_available"]=bool(evidence.get("snapshot"))
+    filter_result=filter_detail(db,result["filter_id"])
+    result["filter"]={k:filter_result.get(k) for k in ("id","verdict","reasons","as_of","known_at")}
+    result["filter"]["computed"]=filter_result.get("computed_outputs",{}).get("computed",{})
     decision=db.execute("SELECT decision,decided_at,note FROM user_decisions WHERE card_id=? AND user_id=?",(ident,user_id)).fetchone()
-    plan=db.execute("SELECT id,status,approval_generation,approved_at FROM order_plans WHERE card_id=? AND user_id=? ORDER BY id DESC LIMIT 1",(ident,user_id)).fetchone()
-    draft=db.execute("SELECT status,updated_at,supersedes_plan_id FROM order_plan_drafts WHERE card_id=? AND user_id=? AND status='draft'",(ident,user_id)).fetchone()
-    result["user_state"]={"decision":dict(decision) if decision else None,"order_plan":dict(plan) if plan else None,"draft":dict(draft) if draft else None}
+    plan=db.execute("SELECT * FROM order_plans WHERE card_id=? AND user_id=? ORDER BY id DESC LIMIT 1",(ident,user_id)).fetchone()
+    draft=db.execute("SELECT snapshot_json,status,updated_at,supersedes_plan_id FROM order_plan_drafts WHERE card_id=? AND user_id=? AND status='draft'",(ident,user_id)).fetchone()
+    plan_view=None
+    if plan:
+        plan_view=dict(plan); plan_view["take_profit"]=json.loads(plan_view.pop("take_profit_json")); plan_view["evidence_invalidation"]=json.loads(plan_view["evidence_invalidation"])
+        plan_view["fills"]=[dict(x) for x in db.execute("SELECT side,qty,price,filled_at FROM order_fills WHERE order_plan_id=? ORDER BY id",(plan["id"],))]
+        plan_view["events"]=[dict(x) for x in db.execute("SELECT event,reason,at FROM order_events WHERE order_plan_id=? ORDER BY id",(plan["id"],))]
+        plan_view["position"]=dict(db.execute("SELECT symbol,qty,avg_price,status FROM positions WHERE order_plan_id=?",(plan["id"],)).fetchone() or {})
+        plan_view["exit_lineage"]=[dict(x) for x in db.execute("SELECT rule,quote_known_at,created_at FROM exit_lineage WHERE order_plan_id=? ORDER BY id",(plan["id"],))]
+    result["user_state"]={"decision":dict(decision) if decision else None,"order_plan":plan_view,"draft":({**dict(draft),"snapshot":json.loads(draft["snapshot_json"])} if draft else None)}
     return result
 
 def list_cards(db, missing=False):

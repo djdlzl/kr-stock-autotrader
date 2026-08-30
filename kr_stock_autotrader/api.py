@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 from .auth import csrf_origin_ok, current_user, hash_password, issue_session, verify_password
 from .config import COOKIE_SECURE, LIVE_TRADING, SIGNUP_ENABLED
 from .db import connect
-from .domain import Quote, parse_kst
+from .domain import Quote, parse_kst, now_kst
 from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML
@@ -356,11 +356,59 @@ def internal_card_detail(card_id: int, _: None = Depends(require_internal_api_ke
     try:return card_detail(db,card_id)
     finally:db.close()
 
+@app.get('/api/cards/summary')
+def user_cards_summary(request: Request, date: str | None = None):
+    """Current-user, date-scoped dashboard aggregate; intentionally no raw inputs."""
+    from datetime import datetime, time, timedelta
+    uid = current_user(request)
+    current = now_kst()
+    try:
+        requested = datetime.strptime(date, "%Y-%m-%d").date() if date else current.date()
+    except (TypeError, ValueError):
+        raise HTTPException(422, "기준일은 YYYY-MM-DD 형식입니다")
+    day = requested.isoformat()
+    def next_run(hour):
+        candidate = datetime.combine(current.date(), time(hour), tzinfo=current.tzinfo)
+        if candidate <= current: candidate += timedelta(days=1)
+        return candidate.isoformat()
+    db=connect()
+    try:
+        evidence_count=db.execute("SELECT count(*) n FROM material_evidence WHERE substr(known_at,1,10)=?",(day,)).fetchone()["n"]
+        pass_count=db.execute("SELECT count(*) n FROM deterministic_filter_results WHERE substr(as_of,1,10)=? AND verdict='PASS'",(day,)).fetchone()["n"]
+        cards=db.execute("SELECT verdict,count(*) n FROM decision_cards WHERE substr(generated_at,1,10)=? GROUP BY verdict",(day,)).fetchall()
+        by_verdict={x["verdict"]:x["n"] for x in cards}
+        decisions=db.execute("SELECT decision,count(*) n FROM user_decisions WHERE user_id=? AND substr(decided_at,1,10)=? GROUP BY decision",(uid,day)).fetchall()
+        by_decision={x["decision"]:x["n"] for x in decisions}
+        missing=db.execute("SELECT count(*) n FROM material_evidence e WHERE substr(e.known_at,1,10)=? AND e.status!='invalidated' AND NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id)",(day,)).fetchone()["n"]
+        failures=db.execute("SELECT count(*) n FROM material_evidence WHERE substr(known_at,1,10)=? AND status='error'",(day,)).fetchone()["n"]
+        scheduler=[]
+        for kind, label in (("research","리서치"),("card","카드")):
+            run=db.execute("SELECT status,started_at,finished_at,detail FROM scheduler_runs WHERE kind=? ORDER BY id DESC LIMIT 1",(kind,)).fetchone()
+            import json
+            detail=json.loads(run["detail"] or "{}") if run else {}
+            scheduler.append({"종류":label,"상태":run["status"] if run else "미실행","건수":int(detail.get("count",0) or 0),"실패":bool(run and run["status"] in {"error","failed"}),"시각":(run["finished_at"] or run["started_at"]) if run else None})
+        return {"기준일":day,"전체 근거":evidence_count,"필터 PASS":pass_count,"카드 생성":sum(by_verdict.values()),"카드 미생성":missing,"판단 보류":by_verdict.get("판단 보류",0),"매수 검토 가능":by_verdict.get("매수 검토 가능",0),"관찰":by_verdict.get("관찰",0),"제외":by_verdict.get("제외",0),"승인":by_decision.get("approve",0),"보류":by_decision.get("hold",0),"거절":by_decision.get("reject",0),"실패·근거 부족":failures,"최근 실행":{"07:00":scheduler[0],"08:00":scheduler[1]},"스케줄러":scheduler,"다음 실행":{"07:00 KST":next_run(7),"08:00 KST":next_run(8)}}
+    finally: db.close()
+
+
 @app.get('/api/cards')
 def user_cards(request: Request):
     uid=current_user(request); db=connect()
     try:return [user_card_view(db, item["id"], uid) for item in db.execute("SELECT id FROM decision_cards ORDER BY id DESC")]
     finally:db.close()
+
+@app.get('/api/cards/missing')
+def user_missing_cards(request: Request, date: str | None = None):
+    """Authenticated evidence rows for the 카드 미생성 tab."""
+    current_user(request)
+    if date:
+        try: __import__('datetime').datetime.strptime(date, "%Y-%m-%d")
+        except ValueError: raise HTTPException(422, "기준일은 YYYY-MM-DD 형식입니다")
+    db=connect()
+    try:
+        rows=list_cards(db, missing=True)
+        return [x for x in rows if not date or x.get("known_at", "")[:10] == date]
+    finally: db.close()
 
 @app.get('/api/cards/{card_id}')
 def user_card(card_id: int, request: Request):
