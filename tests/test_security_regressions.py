@@ -171,6 +171,9 @@ def test_concurrent_cancel_has_one_transition_and_one_audit_event():
 
 
 def test_ui_exposes_logout_cancel_dedicated_tick_symbol_and_cards():
-    html = TestClient(app).get("/").text
-    for required in ("logout()", "cancelPlan(", "id=tickSymbol", "label for=tickSymbol", "plan-card", "최근 평가", "감사 로그", "@media(max-width:390px)"):
+    client = TestClient(app)
+    assert client.post("/api/signup", json={"email": "ui-controls@test.com", "password": "long-password"}).status_code == 200
+    html = client.get("/app").text
+    for required in ('id="logout"', "cancel", 'name="symbol"', "plan-card", "최근 평가", "감사 로그", "@media(max-width:390px)"):
         assert required in html
+    assert "디버그 JSON" not in html
