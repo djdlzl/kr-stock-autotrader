@@ -88,4 +88,5 @@ IMAGE_TAG="$(git rev-parse --short HEAD)" docker compose -f compose.prod.yml up 
 - `COOKIE_SECURE=true`이며 Uvicorn은 Caddy의 forwarded headers를 사용합니다.
 - SQLite는 호스트 `./data/autotrader.db`에 영속 저장됩니다.
 - `SESSION_SECRET`는 `.env`에만 두고 Git에 커밋하지 않습니다.
+- 내부 수집/카드/평가 API에는 `INTERNAL_API_KEY`를 `.env`에 설정하고 호출 시 `X-Internal-API-Key`로 전달합니다. 값은 이미지·문서·Git에 넣지 않습니다.
 - 증권사/live adapter는 없으며 이 배포도 paper-only입니다.

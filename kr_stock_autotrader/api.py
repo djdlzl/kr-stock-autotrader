@@ -380,7 +380,14 @@ def user_cards_summary(request: Request, date: str | None = None):
         decisions=db.execute("SELECT decision,count(*) n FROM user_decisions WHERE user_id=? AND substr(decided_at,1,10)=? GROUP BY decision",(uid,day)).fetchall()
         by_decision={x["decision"]:x["n"] for x in decisions}
         missing=db.execute("SELECT count(*) n FROM material_evidence e WHERE substr(e.known_at,1,10)=? AND e.status!='invalidated' AND NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id)",(day,)).fetchone()["n"]
-        failures=db.execute("SELECT count(*) n FROM material_evidence WHERE substr(known_at,1,10)=? AND status='error'",(day,)).fetchone()["n"]
+        # Operationally unresolved evidence is a union: an explicit collection
+        # error or an active evidence item with no generated card. Keep it as
+        # one evidence-ID denominator so an error without a card is not doubled.
+        failures=db.execute("""SELECT count(*) n FROM material_evidence e
+            WHERE substr(e.known_at,1,10)=? AND (
+              e.status='error' OR (e.status!='invalidated' AND NOT EXISTS
+                (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id))
+            )""",(day,)).fetchone()["n"]
         scheduler=[]
         for kind, label in (("research","리서치"),("card","카드")):
             run=db.execute("SELECT status,started_at,finished_at,detail FROM scheduler_runs WHERE kind=? ORDER BY id DESC LIMIT 1",(kind,)).fetchone()
