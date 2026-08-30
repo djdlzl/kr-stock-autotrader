@@ -82,6 +82,73 @@ def test_primary_and_success_tokens_meet_aa_and_plan_interactions_validate():
     assert "backdrop-filter" not in html
     assert "<form id=\"plan-form\">" in html
     assert "panel.checkValidity()" in html and "panel.reportValidity()" in html
-    assert "e.currentTarget.checkValidity()" in html and "e.currentTarget.reportValidity()" in html
+    assert "function syncLimitField()" in html
+    assert "limitInput.disabled=!isLimit" in html
+    assert "limitInput.required=isLimit" in html
+    assert "if(!isLimit)limitInput.value=''" in html
+    assert "syncLimitField();" in html
     assert "matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'" in html
     assert " — " not in html
+
+
+def test_wizard_blocks_direct_forward_jumps_and_reveals_first_invalid_control():
+    client = TestClient(app)
+    assert client.post(
+        "/api/signup", json={"email": "wizard-validation@test.com", "password": "long-password"}
+    ).status_code == 200
+    html = client.get("/app").text
+
+    # The only step-button route is the guarded navigator: backwards is allowed,
+    # while a forward jump must be exactly one validated panel.
+    assert "function requestStep(target)" in html
+    assert "if(target<=step){showStep(target);return}" in html
+    assert "if(target!==step+1){tell(" in html
+    assert "if(validatePanel(step))showStep(target)" in html
+    assert "x.onclick=()=>requestStep(Number(x.dataset.step))" in html
+    assert "$('#next-step').onclick=()=>requestStep(step+1)" in html
+    assert "x.onclick=()=>showStep(Number(x.dataset.step))" not in html
+
+    # Submit discovers the first invalid enabled control, reveals its containing
+    # panel, reports it, focuses it, and only then permits the POST path.
+    assert "function revealFirstInvalid(form)" in html
+    assert "[...form.elements].find(control=>typeof control.checkValidity==='function'&&!control.checkValidity())" in html
+    assert "invalid.closest('[data-step-panel]')" in html
+    assert "if(panel)showStep(Number(panel.dataset.stepPanel))" in html
+    assert "invalid.reportValidity();invalid.focus();return true" in html
+    assert "if(!validatePlanForm())return;const f=new FormData(e.currentTarget)" in html
+
+
+def test_wizard_validation_semantics_execute_in_lightweight_node_dom():
+    """Exercise the embedded guard with a tiny DOM shim; no JS package is needed."""
+    import shutil
+    import subprocess
+
+    from kr_stock_autotrader.ui import APP_HTML
+
+    node = shutil.which("node")
+    assert node, "Node is required for the repository's lightweight embedded-JS regression"
+    script = "let step=0;" + APP_HTML.split("let step=0;", 1)[1].split("function addCondition()", 1)[0]
+    harness = r'''
+const events=[];
+function control(valid=true){return {valid, disabled:false, required:false, value:'', hidden:false, report:0, focused:0, checkValidity(){return this.disabled||this.valid}, reportValidity(){this.report++;return this.checkValidity()}, focus(){this.focused++}, closest(selector){return selector==='[data-step-panel]'?this.panel:null}}}
+function panel(n, controls=[]){const p=control(true);p.dataset={stepPanel:String(n)};p.controls=controls;p.checkValidity=()=>controls.every(x=>x.checkValidity());p.reportValidity=()=>{p.report++;return p.checkValidity()};return p}
+const symbol=control(false), name=control(true), scheduled=control(true), qty=control(true), limit=control(false), condition=control(true);
+const panels=[panel(0,[symbol,name,scheduled]),panel(1,[qty,limit]),panel(2,[condition])];
+for(const p of panels) for(const c of p.controls) c.panel=p;
+const wrap={hidden:true}, order={value:'market'}, form={elements:[symbol,name,scheduled,qty,limit,condition], addEventListener(){}};
+const steps=[0,1,2].map(n=>({dataset:{step:String(n)},classList:{toggle(){}},setAttribute(){},removeAttribute(){}}));
+const ids={'#plan-form':form,'[name="limit_price"]':limit,'#order-type':order,'#limit-wrap':wrap,'#back-step':{hidden:false},'#next-step':{hidden:false},'#save-plan':{hidden:false,addEventListener(){}}};
+globalThis.document={querySelector(s){if(s.startsWith('[data-step-panel="')) return panels[Number(s.match(/\d+/)[0])]; return ids[s]},querySelectorAll(s){if(s==='[data-step-panel]') return panels;if(s==='.step') return steps;return []}};
+globalThis.$=s=>document.querySelector(s);globalThis.tell=t=>events.push(t);
+''' + script + r'''
+showStep(0); syncLimitField(); if(!(limit.disabled && !limit.required && wrap.hidden && limit.value==='')) throw Error('market state');
+order.value='limit'; syncLimitField(); if(limit.disabled || !limit.required || wrap.hidden) throw Error('limit state');
+limit.value='70000'; order.value='market'; syncLimitField(); if(!limit.disabled || limit.required || !wrap.hidden || limit.value!=='') throw Error('market reset');
+order.value='limit'; syncLimitField();
+requestStep(2); if(events.length!==1 || panels[0].hidden) throw Error('direct jump bypass');
+requestStep(1); if(panels[0].report!==1 || panels[1].hidden!==true) throw Error('invalid forward bypass');
+symbol.valid=true; requestStep(1); if(panels[1].hidden) throw Error('valid next failed');
+symbol.valid=false; if(!revealFirstInvalid(form) || panels[0].hidden || symbol.report!==1 || symbol.focused!==1) throw Error('invalid reveal');
+'''
+    result = subprocess.run([node, "-e", harness], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
