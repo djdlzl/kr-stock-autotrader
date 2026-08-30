@@ -163,12 +163,15 @@ def _positive(value): return isinstance(value,(int,float)) and not isinstance(va
 def _valid_plan(card):
     x=card["card"]; window=x.get("window") or {}
     if not all(_positive(x.get(k)) for k in ("price_cap","max_amount")) or not isinstance(x.get("max_qty"),int) or isinstance(x.get("max_qty"),bool) or x["max_qty"]<=0 or not _positive(x.get("stop_loss")) or not x.get("evidence_invalidation"): raise HTTPException(422,"positive frozen order and exit rules required")
-    if x.get("order_type", "limit") not in {"limit","market"}: raise HTTPException(422,"invalid order_type")
+    if x.get("order_type") not in {"limit","market"}: raise HTTPException(422,"invalid order_type")
     if not isinstance(x.get("take_profit"),list) or not x["take_profit"] or any(not isinstance(rule,dict) or not _positive(rule.get("price")) or not isinstance(rule.get("qty"),int) or isinstance(rule.get("qty"),bool) or rule["qty"]<=0 for rule in x["take_profit"]): raise HTTPException(422,"positive take-profit rules required")
-    try: start,end,expiry=parse_kst(window["start"]),parse_kst(window["end"]),parse_kst(x.get("valid_until") or x.get("holding_until"))
-    except (KeyError,ValueError,TypeError): raise HTTPException(422,"nonempty KST window and valid_until required")
+    try:
+        start, end = parse_kst(window["start"]), parse_kst(window["end"])
+        holding_until, review_at = parse_kst(x["holding_until"]), parse_kst(x["review_at"])
+        valid_until, expires = parse_kst(x["valid_until"]), parse_kst(x["expires"])
+    except (KeyError, ValueError, TypeError): raise HTTPException(422,"nonempty KST window and exit times required")
     if start>=end: raise HTTPException(422,"window start must precede end")
-    return x,window,expiry
+    return x,window,valid_until
 def _snapshot(card, override=None):
     x = dict(card["card"])
     x.update(override or {})

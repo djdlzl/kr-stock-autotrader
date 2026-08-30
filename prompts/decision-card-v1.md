@@ -9,7 +9,7 @@ Produce one structured, immutable decision card from the supplied **same-lineage
 4. Assess whether the effect is already priced in using only supplied observations; separate unknowns.
 5. Preserve the deterministic filter result. A FAIL filter can only produce `제외`, `관찰`, or `판단 보류`—never `매수 검토 가능`.
 6. For biotech, distinguish economically calculable events from binary clinical/regulatory risk. Do not exclude merely because the issuer is biotech.
-7. Specify frozen paper-only entry/exit constraints. If data is insufficient, choose `판단 보류`.
+7. Specify frozen paper-only entry/exit constraints only for `매수 검토 가능`. If data is insufficient, choose `판단 보류`; for `관찰`, `제외`, or `판단 보류`, use JSON `null` (or an empty string/list/object where the field type calls for it) for unavailable order fields. Never fabricate placeholder prices, quantities, times, order types, or exit rules. A `매수 검토 가능` card instead requires concrete, evidence-supported entry, exit, invalidation, and KST time values for every order-plan field.
 
 ## Required JSON fields
 `symbol`, `headline`, `conclusion`, `change`, `source_evidence`, `source_urls`, `business_value`, `certainty`, `priced_in`, `filter_verdict`, `price_cap`, `window` (`start` and `end`, KST), `max_amount`, `max_qty`, `stop_loss`, `take_profit` (including split-sell rules), `evidence_invalidation`, `holding_until`, `review_at`, `false_positive`, `unknowns`, `verdict`, `confidence`.

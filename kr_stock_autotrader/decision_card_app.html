@@ -6,7 +6,7 @@
 <script>
 const $=s=>document.querySelector(s), esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const decisionLabel={approve:'승인',hold:'보류',reject:'거절'}, planLabel={approved:'승인됨',review_required:'재검토 필요',entry_invalidated:'진입 무효화',partial_or_filled:'보유 중',exit_wait:'매도 대기',closed:'종료',invalidated:'무효화'}; let cards=[],missing=[],tab='전체'; const tabs=['전체','매수 검토 가능','관찰','제외','판단 보류','승인','보류','거절','카드 미생성'];
-function korean(v){if(v===null||v===undefined||v==='')return '없음';if(Array.isArray(v))return v.map(korean).join(' · ')||'없음';if(typeof v==='object')return Object.entries(v).map(([k,x])=>`${k}: ${korean(x)}`).join(' · ');return String(v)}
+function korean(v){if(v===null||v===undefined||v==='')return '해당 없음';if(Array.isArray(v))return v.map(korean).join(' · ')||'해당 없음';if(typeof v==='object')return Object.entries(v).map(([k,x])=>`${k}: ${korean(x)}`).join(' · ')||'해당 없음';return String(v)}
 function localValue(iso){if(!iso)return '';const d=new Date(iso);if(Number.isNaN(d))return '';const parts=new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(d).replace(' ','T');return parts}
 function isoKst(v){return v?`${v}:00+09:00`:null}
 async function api(path,opt={}){const r=await fetch('/api/'+path,{headers:{'Content-Type':'application/json'},...opt});let d={};try{d=await r.json()}catch{}if(r.status===401){location.assign('/?expired=1');throw Error('세션이 만료되었습니다. 로그인 화면으로 이동합니다.')}if(!r.ok)throw Error(typeof d.detail==='string'?d.detail:'요청을 처리하지 못했습니다.');return d}

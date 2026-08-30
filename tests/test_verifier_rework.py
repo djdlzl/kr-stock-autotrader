@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from kr_stock_autotrader import db as dbmod
 from kr_stock_autotrader.auth import issue_session
 from kr_stock_autotrader.decision_cards import (
-    evaluate_order_plan, mutate_evidence, save_card, save_filter, user_card_view,
+    edit_draft, evaluate_order_plan, mutate_evidence, save_card, save_filter, user_card_view,
     user_decision,
 )
 from tests.test_decision_card_invariants import AS_OF, card, evidence, make_plan, raw, tick
@@ -105,6 +105,42 @@ def test_schema_rejects_boolean_trading_scalars_but_accepts_numbers(db):
                                 max_qty=3, stop_loss=80.5,
                                 take_profit=[{"price": 110, "qty": 1}], confidence=0.5))
     assert saved["schema_version"] == 1
+
+
+def test_nonbuy_cards_preserve_honest_null_order_fields_but_cannot_trade(db):
+    item = evidence(db)
+    fail = save_filter(db, item["id"], raw(baseline_volume=0), AS_OF, "2026-08-31T09:00:00+09:00")
+    unavailable = {
+        "price_cap": None, "window": None, "max_amount": None, "max_qty": None,
+        "stop_loss": None, "take_profit": [], "evidence_invalidation": "",
+        "holding_until": "", "review_at": None, "valid_until": "", "expires": None,
+        "order_type": None,
+    }
+    pending = save_card(db, card(item["id"], fail["id"], filter_verdict="FAIL", verdict="판단 보류", **unavailable))
+    assert pending["card"]["price_cap"] is None and pending["card"]["take_profit"] == []
+    db.execute("INSERT INTO users(email,password) VALUES('null-order@test','p')"); db.commit()
+    with pytest.raises(HTTPException): edit_draft(db, pending["id"], 1, {})
+    with pytest.raises(HTTPException): user_decision(db, pending["id"], 1, "approve")
+
+    observed = save_card(db, card(item["id"], save_filter(db, item["id"], raw(), "2026-08-31T10:01:00+09:00", "2026-08-31T09:01:00+09:00")["id"], verdict="관찰", **unavailable))
+    assert observed["card"]["window"] is None
+
+
+def test_buy_review_rejects_each_unavailable_order_field(db):
+    item = evidence(db)
+    filt = save_filter(db, item["id"], raw(), AS_OF, "2026-08-31T09:00:00+09:00")
+    complete = {
+        "valid_until": "2026-09-01T10:00:00+09:00", "expires": "2026-09-01T10:00:00+09:00",
+        "order_type": "limit",
+    }
+    for unavailable in (
+        {"price_cap": None}, {"window": None}, {"max_amount": None}, {"max_qty": None},
+        {"stop_loss": None}, {"take_profit": []}, {"evidence_invalidation": ""},
+        {"holding_until": ""}, {"review_at": None}, {"valid_until": None},
+        {"expires": ""}, {"order_type": ""}, {"order_type": None},
+    ):
+        with pytest.raises(HTTPException):
+            save_card(db, card(item["id"], filt["id"], **(complete | unavailable)))
 
 
 def test_internal_status_invalidated_revokes_partial_entry_and_preserves_exit(monkeypatch, db):

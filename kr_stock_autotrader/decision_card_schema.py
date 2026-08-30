@@ -98,21 +98,23 @@ class DecisionCard(BaseModel):
     certainty: str = Field(min_length=1)
     priced_in: str = Field(min_length=1)
     filter_verdict: Literal['PASS', 'FAIL']
-    price_cap: float = Field(gt=0)
-    window: Window
-    max_amount: float = Field(gt=0)
-    max_qty: StrictInt = Field(gt=0)
-    stop_loss: float = Field(gt=0)
-    take_profit: list[TakeProfit] = Field(min_length=1)
-    evidence_invalidation: dict | str
-    holding_until: str
-    review_at: str
+    # Non-buy judgments may state that no evidence-supported order plan exists.
+    # The model validator below keeps every one of these strict for buy review.
+    price_cap: float | None = Field(default=None, gt=0)
+    window: Window | dict | None = None
+    max_amount: float | None = Field(default=None, gt=0)
+    max_qty: StrictInt | None = Field(default=None, gt=0)
+    stop_loss: float | None = Field(default=None, gt=0)
+    take_profit: list[TakeProfit] | None = None
+    evidence_invalidation: dict | str | None = None
+    holding_until: str | None = None
+    review_at: str | None = None
     false_positive: str = Field(min_length=1)
     unknowns: str = Field(min_length=1)
     verdict: Literal['매수 검토 가능', '관찰', '제외', '판단 보류']
     confidence: float = Field(ge=0, le=1)
     valid_until: str | None = None
-    order_type: Literal['limit', 'market'] = 'limit'
+    order_type: Literal['limit', 'market', ''] | None = None
     split: list = Field(default_factory=list)
     expires: str | None = None
 
@@ -130,20 +132,42 @@ class DecisionCard(BaseModel):
     @field_validator('price_cap', 'max_amount', 'stop_loss', 'confidence', mode='before')
     @classmethod
     def numeric_scalars(cls, value: object) -> object:
+        if value is None:
+            return value
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError('must be a numeric scalar')
         return value
 
     @field_validator('price_cap', 'max_amount', 'stop_loss', 'confidence')
     @classmethod
-    def finite(cls, value: float) -> float:
+    def finite(cls, value: float | None) -> float | None:
+        if value is None:
+            return value
         if not math.isfinite(value): raise ValueError('must be finite')
         return value
 
     @field_validator('holding_until', 'review_at', 'valid_until', 'expires')
     @classmethod
     def dates(cls, value: str | None) -> str | None:
-        return _kst(value) if value is not None else None
+        return _kst(value) if value not in (None, '') else value
+
+    @model_validator(mode='after')
+    def buy_review_requires_concrete_order_plan(self):
+        """Never let a buy-review card turn missing evidence into an order."""
+        if self.verdict != '매수 검토 가능':
+            if isinstance(self.window, dict) and self.window:
+                raise ValueError('non-buy window may only be null or empty')
+            return self
+        required = (
+            self.price_cap, self.window, self.max_amount, self.max_qty, self.stop_loss,
+            self.take_profit, self.evidence_invalidation, self.holding_until, self.review_at,
+            self.valid_until, self.expires, self.order_type,
+        )
+        if not isinstance(self.window, Window) or any(value in (None, '', [], {}) for value in required) or (
+            isinstance(self.evidence_invalidation, str) and not self.evidence_invalidation.strip()
+        ):
+            raise ValueError('buy-review requires concrete order and exit fields')
+        return self
 
 
 def validate_card(payload: object) -> dict:

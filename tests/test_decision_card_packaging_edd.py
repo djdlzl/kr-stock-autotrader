@@ -17,6 +17,12 @@ REPO = Path(__file__).parents[1]
 INTERNAL = {"X-Internal-API-Key": "test-internal-key"}
 AS_OF = "2026-08-31T10:00:00+09:00"
 KNOWN = "2026-08-31T09:00:00+09:00"
+NONBUY_UNAVAILABLE_ORDER_FIELDS = {
+    "price_cap": None, "window": None, "max_amount": None, "max_qty": None,
+    "stop_loss": None, "take_profit": [], "evidence_invalidation": "",
+    "holding_until": None, "review_at": None, "valid_until": None, "expires": None,
+    "order_type": None,
+}
 
 
 def evidence_payload(key, *, title="계약", symbol="005930"):
@@ -100,7 +106,8 @@ def test_full_api_db_paper_lifecycle_edd(monkeypatch, tmp_path):
     # A visible FAIL card exists but its state cannot create a draft or approval.
     failing_evidence = client.post("/api/internal/evidence", json=evidence_payload("fail-evidence", title="불확실 공시"), headers=INTERNAL).json()
     failing_filter = client.post("/api/internal/filters", json={"evidence_id": failing_evidence["id"], "inputs": raw(baseline_volume=0), "as_of": AS_OF, "known_at": KNOWN}, headers=INTERNAL).json()
-    fail_card = create_card(client, failing_evidence["id"], failing_filter["id"], lineage="edd-fail", filter_verdict="FAIL", verdict="관찰")
+    fail_card = create_card(client, failing_evidence["id"], failing_filter["id"], lineage="edd-fail", filter_verdict="FAIL", verdict="관찰", **NONBUY_UNAVAILABLE_ORDER_FIELDS)
+    assert fail_card["card"]["price_cap"] is None and fail_card["card"]["take_profit"] == []
 
     assert client.post("/api/signup", json={"email": "edd@example.test", "password": "password-for-edd"}).status_code == 200
     assert "결정 카드 운영" in client.get("/app").text
