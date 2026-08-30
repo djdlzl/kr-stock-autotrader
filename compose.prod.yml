@@ -12,6 +12,7 @@ services:
       SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-28800}
       SIGNUP_ENABLED: ${SIGNUP_ENABLED:-false}
       KR_HOLIDAYS: ${KR_HOLIDAYS:-}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY is required}
     volumes:
       - ./data:/data
     networks:

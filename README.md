@@ -61,6 +61,15 @@ API: 가입/로그인/로그아웃, `POST/GET /api/plans`, `POST /api/plans/{id}
 
 테스트는 정확한 ±5% 경계, stale/future known-at fail-closed, 상대 거래량 0분모, OR/AND, 사용자 격리, idempotency, 체결 수량, deadline KST, Paper E2E를 검증합니다.
 
+### Decision-card internal API and CLI
+
+`material_evidence`, deterministic filter outputs, prompt-byte hash/versioned cards, user decisions, immutable approved `order_plans`, evaluations/fills/positions and scheduler audit rows are additive SQLite tables. `POST/PATCH /api/internal/*` is fail-closed unless `X-Internal-API-Key` constant-time matches `INTERNAL_API_KEY`; ordinary session users can only read `/api/cards` and submit `/api/cards/{id}/decisions`.
+
+The deterministic filter records explicit units/denominators and rejects missing, zero-denominator, future, and stale inputs. Cards never overwrite a lineage version; evidence/card changes invalidate approved plans. Decision-card paper execution is intentionally a tick evaluator: it requires an approved unexpired plan, buys before a later distinct tick can exit, caps sells by remaining position, and has no live adapter.
+
+The HTTP-only CLI never prints secrets and never starts a daemon: `GIRAFFE_URL=https://giraffe.example INTERNAL_API_KEY=... python -m kr_stock_autotrader.cli evidence-add '{...}'`. Supported commands are `today-evidence`, `evidence-add`, `evidence-detail`, `filter-run`, `pending-cards`, `card-save-result`, `scheduler-start`, and `scheduler-finish`. Scheduler rows are 07:00/08:00 orchestration records, not paper execution.
+
+
 ## Docker 운영 배포
 
 `compose.prod.yml`은 기존 Caddy Docker network 뒤에서만 실행하며 앱 포트를 호스트에 공개하지 않습니다.

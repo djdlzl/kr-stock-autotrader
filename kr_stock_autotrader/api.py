@@ -2,7 +2,7 @@
 import sqlite3
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
@@ -10,6 +10,7 @@ from .auth import csrf_origin_ok, current_user, hash_password, issue_session, ve
 from .config import COOKIE_SECURE, LIVE_TRADING, SIGNUP_ENABLED
 from .db import connect
 from .domain import Quote, parse_kst
+from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, save_card, list_cards, card_detail, user_decision, evaluate_order_plan)
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML
 
@@ -246,6 +247,111 @@ def submit_tick(data: TickIn, request: Request):
     finally:
         db.close()
 
+
+@app.post('/api/internal/evidence')
+async def internal_evidence_create(request: Request, _: None = Depends(require_internal_api_key)):
+    data = await request.json(); db = connect()
+    try: return create_evidence(db, data)
+    finally: db.close()
+
+@app.get('/api/internal/evidence')
+def internal_evidence_list(symbol: str | None = None, status: str | None = None, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try: return list_evidence(db, symbol, status)
+    finally: db.close()
+
+@app.get('/api/internal/evidence/{evidence_id}')
+def internal_evidence_detail(evidence_id: int, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try: return evidence_detail(db, evidence_id)
+    finally: db.close()
+
+@app.patch('/api/internal/evidence/{evidence_id}')
+async def internal_evidence_update(evidence_id: int, request: Request, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try: return mutate_evidence(db, evidence_id, await request.json())
+    finally: db.close()
+
+@app.post('/api/internal/evidence/{evidence_id}/invalidate')
+def internal_evidence_invalidate(evidence_id: int, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try: return mutate_evidence(db, evidence_id, invalidate=True)
+    finally: db.close()
+
+@app.post('/api/internal/filters')
+async def internal_filter(request: Request, _: None = Depends(require_internal_api_key)):
+    data=await request.json(); db=connect()
+    try:return save_filter(db,data['evidence_id'],data['inputs'],data['as_of'],data['known_at'])
+    finally:db.close()
+
+@app.get('/api/internal/filters/{filter_id}')
+def internal_filter_detail(filter_id: int, _: None = Depends(require_internal_api_key)):
+    db=connect()
+    try:return filter_detail(db,filter_id)
+    finally:db.close()
+
+@app.post('/api/internal/cards/generate')
+async def internal_card_generate(request: Request, _: None = Depends(require_internal_api_key)):
+    """Create no LLM output: callers receive the immutable prompt/input request to run externally."""
+    data=await request.json(); db=connect()
+    try:
+        ev=evidence_detail(db,data['evidence_id']); fi=filter_detail(db,data['filter_id'])
+        return {'prompt_version':'decision-card-v1','prompt_hash':__import__('kr_stock_autotrader.decision_cards',fromlist=['prompt_hash']).prompt_hash(),'evidence':ev,'filter':fi}
+    finally:db.close()
+
+@app.post('/api/internal/cards/results')
+async def internal_card_save(request: Request, _: None = Depends(require_internal_api_key)):
+    db=connect()
+    try:return save_card(db,await request.json())
+    finally:db.close()
+
+@app.post('/api/internal/order-plans/{plan_id}/evaluate')
+async def internal_order_evaluate(plan_id: int, request: Request, _: None = Depends(require_internal_api_key)):
+    """Paper-only tick evaluator; it neither schedules nor has a live adapter."""
+    db=connect()
+    try:return evaluate_order_plan(db,plan_id,await request.json())
+    finally:db.close()
+
+@app.post('/api/internal/scheduler-runs/{run_key}/start')
+async def scheduler_start(run_key: str, request: Request, _: None = Depends(require_internal_api_key)):
+    data=await request.json(); db=connect()
+    try:
+        db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?, 'started',?,?) ON CONFLICT(run_key) DO UPDATE SET status='started',started_at=excluded.started_at,detail=excluded.detail",(run_key,data['kind'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(data)))
+        db.commit(); return {'run_key':run_key,'status':'started'}
+    finally: db.close()
+
+@app.post('/api/internal/scheduler-runs/{run_key}/finish')
+async def scheduler_finish(run_key: str, request: Request, _: None = Depends(require_internal_api_key)):
+    data=await request.json(); db=connect()
+    try:
+        db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=?",(data['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(data),run_key)); db.commit(); return {'run_key':run_key,'status':data['status']}
+    finally: db.close()
+
+@app.get('/api/internal/cards')
+def internal_cards(_: None = Depends(require_internal_api_key)):
+    db=connect()
+    try:return list_cards(db)
+    finally:db.close()
+
+@app.get('/api/cards')
+def user_cards(request: Request):
+    current_user(request); db=connect()
+    try:return list_cards(db)
+    finally:db.close()
+
+@app.get('/api/cards/{card_id}')
+def user_card(card_id: int, request: Request):
+    current_user(request); db=connect()
+    try:return card_detail(db,card_id)
+    finally:db.close()
+
+@app.post('/api/cards/{card_id}/decisions')
+async def user_card_decision(card_id: int, request: Request):
+    csrf_origin_ok(request); uid=current_user(request); data=await request.json()
+    if data.get('decision') not in {'approve','hold','reject'}: raise HTTPException(422,'invalid decision')
+    db=connect()
+    try:return user_decision(db,card_id,uid,data['decision'],data.get('note',''))
+    finally:db.close()
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
