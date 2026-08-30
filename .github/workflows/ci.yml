@@ -1,0 +1,13 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      SESSION_SECRET: ci-test-session-secret-that-is-at-least-thirty-two-bytes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: python -m venv .venv && .venv/bin/pip install -r requirements.txt
+      - run: .venv/bin/pytest -q
