@@ -26,7 +26,7 @@
       "ink": "#1f1d1b",
       "inkLow": "#6d6863",
       "divider": "#e9e1da",
-      "success": "#16835b",
+      "success": "#126b49",
       "warning": "#a95b00",
       "danger": "#c73524"
     },
@@ -45,7 +45,8 @@
     "preferredPrimitives": [
       "semantic HTML",
       "labeled inputs",
-      "segmented tabs",
+      "segmented authentication button group",
+      "wizard step navigation",
       "status summary",
       "disclosure details",
       "inline notices"

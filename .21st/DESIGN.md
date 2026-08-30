@@ -14,7 +14,7 @@ A trust-first Korean paper-trading product for non-expert users, using a calm SE
 
 - FastAPI with server-rendered HTML, vanilla CSS, and vanilla JavaScript.
 - Reuse the project shells and semantic tokens before adding primitives.
-- 21st.dev sign-in, dashboard, form, tabs, card, and empty-state collections are composition references only.
+- 21st.dev sign-in, dashboard, form, button-group, wizard, card, and empty-state collections are composition references only.
 - Do not import React/shadcn components into this app solely to imitate a reference.
 
 ## Required product patterns
@@ -31,7 +31,7 @@ A trust-first Korean paper-trading product for non-expert users, using a calm SE
 - Primary: `#ff6f0f`; primary low: `#fff0e5`.
 - Paper: `#fffaf6`; sheet: `#ffffff`.
 - Ink: `#1f1d1b`; low ink: `#6d6863`; divider: `#e9e1da`.
-- Semantic status: success `#16835b`, warning `#a95b00`, danger `#c73524`.
+- Semantic status: success `#126b49`, warning `#a95b00`, danger `#c73524`.
 - Base spacing: 8px. Inputs 12px radius, cards 16px, authentication shell 20px.
 
 ## Avoid
