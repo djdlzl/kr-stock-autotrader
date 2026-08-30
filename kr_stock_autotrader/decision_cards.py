@@ -24,7 +24,7 @@ def row(db, table, ident):
 def create_evidence(db, data):
     ts=now()
     try:
-        r=db.execute("""INSERT INTO material_evidence(symbol,name,kind,title,summary,source,source_url,announcement_at,collected_at,known_at,snapshot,newness,dedupe_key,status,created_by,updated_at,audit_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?) RETURNING id""", (data["symbol"],data.get("name"),data["kind"],data["title"],data["summary"],data["source"],data.get("source_url"),data.get("announcement_at"),data.get("collected_at",ts),data["known_at"],canon(data["snapshot"]),data.get("newness","new"),data["dedupe_key"],data.get("created_by","internal"),ts,"[]")).fetchone()
+        r=db.execute("""INSERT INTO material_evidence(symbol,name,kind,title,summary,source,source_url,announcement_at,collected_at,known_at,snapshot,newness,dedupe_key,status,created_by,updated_at,audit_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'new',?,?,?) RETURNING id""", (data["symbol"],data.get("name"),data["kind"],data["title"],data["summary"],data["source"],data.get("source_url"),data.get("announcement_at"),data.get("collected_at",ts),data["known_at"],canon(data["snapshot"]),data.get("newness","new"),data["dedupe_key"],data.get("created_by","internal"),ts,"[]")).fetchone()
     except sqlite3.IntegrityError: raise HTTPException(409,"duplicate evidence dedupe_key")
     audit(db,data.get("created_by","internal"),"create","material_evidence",r["id"]); db.commit(); return evidence_detail(db,r["id"])
 def evidence_detail(db, ident):
@@ -44,6 +44,11 @@ def mutate_evidence(db, ident, patch=None, invalidate=False):
     ts=now()
     if invalidate: db.execute("UPDATE material_evidence SET status='invalidated',invalidated_at=?,updated_at=? WHERE id=?",(ts,ts,ident))
     elif patch:
+        if set(patch) == {"status"}:
+            if patch["status"] not in {"new", "card_generated", "decision_pending", "error", "invalidated"}: raise HTTPException(422,"invalid evidence status")
+            db.execute("UPDATE material_evidence SET status=?,updated_at=? WHERE id=?", (patch["status"],ts,ident))
+            audit(db,"internal","status","material_evidence",ident,patch["status"])
+            db.commit(); return evidence_detail(db,ident)
         for k,v in patch.items():
             if k in {"title","summary","snapshot","newness","known_at","announcement_at"}: db.execute(f"UPDATE material_evidence SET {k}=?,updated_at=? WHERE id=?", (canon(v) if k=="snapshot" else v,ts,ident))
     invalidate_lineage(db,evidence_id=ident,reason="evidence_mutated"); audit(db,"internal","invalidate" if invalidate else "update","material_evidence",ident);db.commit();return evidence_detail(db,ident)
@@ -83,19 +88,35 @@ def save_card(db,data):
     card=data["card"]; missing=REQUIRED_CARD_FIELDS-set(card)
     if missing or card.get("verdict") not in VERDICTS: raise HTTPException(422,"structured card required fields/verdict invalid")
     ev=row(db,"material_evidence",data["evidence_id"]); fi=filter_detail(db,data["filter_id"])
-    if fi["evidence_id"]!=ev["id"] or fi["verdict"]!="PASS" or ev["status"]!="active": raise HTTPException(409,"card requires active PASS filter for same evidence")
-    if card["filter_verdict"]!="PASS" or not card.get("source_evidence"): raise HTTPException(422,"card source evidence/filter mismatch")
+    if fi["evidence_id"]!=ev["id"] or ev["status"]=="invalidated": raise HTTPException(409,"card requires same active evidence")
+    if card["filter_verdict"] != fi["verdict"] or not card.get("source_evidence"): raise HTTPException(422,"card source evidence/filter mismatch")
+    if fi["verdict"] == "PASS" and card["verdict"] != "매수 검토 가능": raise HTTPException(422,"PASS filter requires buy-review verdict")
+    if fi["verdict"] == "FAIL" and card["verdict"] not in {"제외","관찰","판단 보류"}: raise HTTPException(422,"FAIL filter cannot be buy-review")
     lineage=data.get("lineage_key",f"{ev['symbol']}:{ev['id']}"); version=db.execute("SELECT COALESCE(MAX(version),0)+1 n FROM decision_cards WHERE lineage_key=?",(lineage,)).fetchone()["n"]
     if version>1: db.execute("UPDATE order_plans SET status='invalidated' WHERE card_id IN (SELECT id FROM decision_cards WHERE lineage_key=?) AND status='approved'",(lineage,))
     r=db.execute("INSERT INTO decision_cards(lineage_key,version,evidence_id,filter_id,prompt_version,prompt_hash,model,provider,card_json,verdict,confidence,generated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",(lineage,version,ev["id"],fi["id"],data.get("prompt_version","decision-card-v1"),prompt_hash(),data["model"],data["provider"],canon(card),card["verdict"],float(card["confidence"]),now())).fetchone()
+    db.execute("UPDATE material_evidence SET status='card_generated',updated_at=? WHERE id=?",(now(),ev["id"]))
     audit(db,"internal","save","decision_card",r["id"]);db.commit();return card_detail(db,r["id"])
 def card_detail(db,ident):
     d=dict(row(db,"decision_cards",ident));d["card"]=json.loads(d.pop("card_json"));return d
-def list_cards(db): return [card_detail(db,x["id"]) for x in db.execute("SELECT id FROM decision_cards ORDER BY id DESC")]
+def user_card_view(db, ident, user_id):
+    result=card_detail(db,ident)
+    decision=db.execute("SELECT decision,decided_at,note FROM user_decisions WHERE card_id=? AND user_id=?",(ident,user_id)).fetchone()
+    plan=db.execute("SELECT id,status,approval_generation,approved_at FROM order_plans WHERE card_id=? AND user_id=? ORDER BY id DESC LIMIT 1",(ident,user_id)).fetchone()
+    draft=db.execute("SELECT status,updated_at,supersedes_plan_id FROM order_plan_drafts WHERE card_id=? AND user_id=? AND status='draft'",(ident,user_id)).fetchone()
+    result["user_state"]={"decision":dict(decision) if decision else None,"order_plan":dict(plan) if plan else None,"draft":dict(draft) if draft else None}
+    return result
+
+def list_cards(db, missing=False):
+    if missing:
+        return [evidence_detail(db,x["id"]) for x in db.execute("SELECT id FROM material_evidence WHERE status != 'invalidated' AND NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.evidence_id=material_evidence.id) ORDER BY id DESC")]
+    return [card_detail(db,x["id"]) for x in db.execute("SELECT id FROM decision_cards ORDER BY id DESC")]
 def _positive(value): return isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and value>0
 def _valid_plan(card):
     x=card["card"]; window=x.get("window") or {}
-    if not all(_positive(x.get(k)) for k in ("price_cap","max_amount","max_qty")) or not x.get("stop_loss") or not x.get("take_profit") or not x.get("evidence_invalidation"): raise HTTPException(422,"positive frozen order and exit rules required")
+    if not all(_positive(x.get(k)) for k in ("price_cap","max_amount")) or not isinstance(x.get("max_qty"),int) or isinstance(x.get("max_qty"),bool) or x["max_qty"]<=0 or not _positive(x.get("stop_loss")) or not x.get("evidence_invalidation"): raise HTTPException(422,"positive frozen order and exit rules required")
+    if x.get("order_type", "limit") not in {"limit","market"}: raise HTTPException(422,"invalid order_type")
+    if not isinstance(x.get("take_profit"),list) or not x["take_profit"] or any(not isinstance(rule,dict) or not _positive(rule.get("price")) or not isinstance(rule.get("qty"),int) or isinstance(rule.get("qty"),bool) or rule["qty"]<=0 for rule in x["take_profit"]): raise HTTPException(422,"positive take-profit rules required")
     try: start,end,expiry=parse_kst(window["start"]),parse_kst(window["end"]),parse_kst(x.get("valid_until") or x.get("holding_until"))
     except (KeyError,ValueError,TypeError): raise HTTPException(422,"nonempty KST window and valid_until required")
     if start>=end: raise HTTPException(422,"window start must precede end")
@@ -107,9 +128,15 @@ def _snapshot(card, override=None):
     _valid_plan(frozen)
     return x
 
+EDITABLE_DRAFT_FIELDS=frozenset({"window","price_cap","max_amount","max_qty","split","order_type","stop_loss","take_profit","evidence_invalidation","holding_until","review_at","valid_until","expires"})
+def _validate_override(override):
+    if not isinstance(override,dict) or set(override)-EDITABLE_DRAFT_FIELDS: raise HTTPException(422,"invalid draft override fields")
+
 def edit_draft(db, card_id, user_id, override):
     c=card_detail(db,card_id)
     if c["invalidated_at"]: raise HTTPException(409,"card invalidated")
+    if c["card"]["filter_verdict"] != "PASS" or c["verdict"] != "매수 검토 가능": raise HTTPException(409,"non-PASS card cannot create draft")
+    _validate_override(override)
     x=_snapshot(c,override)
     db.execute("INSERT INTO order_plan_drafts(card_id,user_id,snapshot_json,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(card_id,user_id,status) DO UPDATE SET snapshot_json=excluded.snapshot_json,updated_at=excluded.updated_at",(card_id,user_id,canon(x),now(),now()))
     db.commit(); return {"card_id":card_id,"status":"draft","draft":x}
@@ -118,6 +145,7 @@ def edit_order_plan(db, plan_id, user_id, override):
     """Store a validated user draft; post-approval edits revoke entries, not exits."""
     p = row(db, "order_plans", plan_id)
     if p["user_id"] != user_id: raise HTTPException(404, "order plan not found")
+    _validate_override(override)
     c = card_detail(db, p["card_id"])
     base = {"symbol":p["symbol"], "window":{"start":p["window_start"],"end":p["window_end"]}, "price_cap":p["price_cap"], "max_amount":p["max_amount"], "max_qty":p["max_qty"], "order_type":p["order_type"], "stop_loss":p["stop_loss"], "take_profit":json.loads(p["take_profit_json"]), "evidence_invalidation":json.loads(p["evidence_invalidation"]), "holding_until":p["holding_until"], "review_at":p["review_at"], "valid_until":p["valid_until"]}
     base.update(override or {}); _snapshot(c, base)
@@ -136,13 +164,16 @@ def user_decision(db,card_id,user_id,decision,note=""):
             pos=db.execute("SELECT qty FROM positions WHERE order_plan_id=?",(p["id"],)).fetchone(); db.execute("UPDATE order_plans SET status=? WHERE id=?",("review_required" if pos and pos["qty"] else "entry_invalidated",p["id"]))
         db.commit(); return {"decision":decision}
     if c["invalidated_at"]: raise HTTPException(409,"card invalidated; regenerate and reapprove")
+    if c["card"]["filter_verdict"] != "PASS" or c["verdict"] != "매수 검토 가능": raise HTTPException(409,"only PASS buy-review card is approvable")
     draft=db.execute("SELECT * FROM order_plan_drafts WHERE card_id=? AND user_id=? AND status='draft'",(card_id,user_id)).fetchone()
     x=_snapshot(c,json.loads(draft["snapshot_json"]) if draft else None); window=x["window"]; expiry=parse_kst(x.get("valid_until") or x["holding_until"])
-    snapshot=canon(x); vh=hashlib.sha256(canon({"card":c["id"],"user":user_id,"snapshot":snapshot}).encode()).hexdigest()
-    existing=db.execute("SELECT id FROM order_plans WHERE version_hash=?",(vh,)).fetchone()
-    if existing: return {"decision":"approve","order_plan_hash":vh,"idempotent":True,"order_plan_id":existing["id"]}
+    snapshot=canon(x); base_hash=hashlib.sha256(canon({"card":c["id"],"user":user_id,"snapshot":snapshot}).encode()).hexdigest()
+    existing=db.execute("SELECT id,version_hash FROM order_plans WHERE card_id=? AND user_id=? AND version_hash LIKE ? AND status IN ('approved','execution_wait','partial_or_filled') ORDER BY id DESC LIMIT 1",(c["id"],user_id,base_hash+":%")).fetchone()
+    if existing: return {"decision":"approve","order_plan_hash":existing["version_hash"],"idempotent":True,"order_plan_id":existing["id"]}
+    generation=db.execute("SELECT COALESCE(MAX(approval_generation),0)+1 n FROM order_plans WHERE card_id=? AND user_id=?",(c["id"],user_id)).fetchone()["n"]
+    vh=f"{base_hash}:{generation}"
     db.execute("INSERT INTO user_decisions(card_id,user_id,decision,decided_at,note) VALUES(?,?,?,?,?) ON CONFLICT(card_id,user_id) DO UPDATE SET decision=excluded.decision,decided_at=excluded.decided_at,note=excluded.note",(card_id,user_id,"approve",now(),note))
-    p=db.execute("INSERT INTO order_plans(card_id,card_version,user_id,approved_at,valid_until,symbol,window_start,window_end,price_cap,max_amount,max_qty,split_json,order_type,stop_loss,take_profit_json,evidence_invalidation,holding_until,review_at,expires_at,status,version_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",(c["id"],c["version"],user_id,now(),expiry.isoformat(),x["symbol"],window["start"],window["end"],x["price_cap"],x["max_amount"],x["max_qty"],canon(x.get("split",[])),x.get("order_type","limit"),x["stop_loss"],canon(x["take_profit"]),canon(x["evidence_invalidation"]),x.get("holding_until"),x.get("review_at"),expiry.isoformat(),"approved",vh)).fetchone()
+    p=db.execute("INSERT INTO order_plans(card_id,card_version,user_id,approved_at,valid_until,symbol,window_start,window_end,price_cap,max_amount,max_qty,split_json,order_type,stop_loss,take_profit_json,evidence_invalidation,holding_until,review_at,expires_at,status,version_hash,approval_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",(c["id"],c["version"],user_id,now(),expiry.isoformat(),x["symbol"],window["start"],window["end"],x["price_cap"],x["max_amount"],x["max_qty"],canon(x.get("split",[])),x.get("order_type","limit"),x["stop_loss"],canon(x["take_profit"]),canon(x["evidence_invalidation"]),x.get("holding_until"),x.get("review_at"),expiry.isoformat(),"approved",vh,generation)).fetchone()
     if draft: db.execute("UPDATE order_plan_drafts SET status='approved' WHERE id=?",(draft["id"],))
     audit(db,str(user_id),"approve","decision_card",card_id);db.commit();return {"decision":"approve","order_plan_hash":vh,"order_plan_id":p["id"],"idempotent":False}
 
@@ -157,6 +188,7 @@ def evaluate_order_plan(db,plan_id,tick,server_now=None):
     remaining=p["bought_qty"]-p["sold_qty"]
     # Exit gates are deliberately independent from entry validity and prechecks.
     rule=None; tranche_qty=None
+    if not reasons and not market_open(current): reasons.append("market_closed")
     if not reasons and remaining>0:
         if tick.get("manual_exit"): rule="manual"
         elif tick.get("evidence_invalidated"): rule="evidence_invalidation"

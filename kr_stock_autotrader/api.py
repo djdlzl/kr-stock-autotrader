@@ -10,7 +10,7 @@ from .auth import csrf_origin_ok, current_user, hash_password, issue_session, ve
 from .config import COOKIE_SECURE, LIVE_TRADING, SIGNUP_ENABLED
 from .db import connect
 from .domain import Quote, parse_kst
-from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, save_card, list_cards, card_detail, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
+from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML
 
@@ -332,10 +332,22 @@ async def scheduler_finish(run_key: str, request: Request, _: None = Depends(req
         db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=?",(data['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(data),run_key)); db.commit(); return {'run_key':run_key,'status':data['status'],'count':data.get('count',0),'detail':data.get('detail',{})}
     finally: db.close()
 
-@app.get('/api/internal/cards')
-def internal_cards(_: None = Depends(require_internal_api_key)):
+@app.get('/api/internal/scheduler-runs/latest')
+def scheduler_latest(kind: str, date: str | None = None, _: None = Depends(require_internal_api_key)):
     db=connect()
-    try:return list_cards(db)
+    try:
+        query="SELECT * FROM scheduler_runs WHERE kind=?"; params=[kind]
+        if date:
+            query+=" AND (substr(started_at,1,10)=? OR run_key LIKE ?)"; params.extend([date,f"%{date}%"])
+        item=db.execute(query+" ORDER BY id DESC LIMIT 1",params).fetchone()
+        if not item: raise HTTPException(404,'scheduler run not found')
+        result=dict(item); result['detail']=__import__('json').loads(result['detail']); return result
+    finally: db.close()
+
+@app.get('/api/internal/cards')
+def internal_cards(missing: bool = False, _: None = Depends(require_internal_api_key)):
+    db=connect()
+    try:return list_cards(db, missing=missing)
     finally:db.close()
 
 @app.get('/api/internal/cards/{card_id}')
@@ -346,14 +358,14 @@ def internal_card_detail(card_id: int, _: None = Depends(require_internal_api_ke
 
 @app.get('/api/cards')
 def user_cards(request: Request):
-    current_user(request); db=connect()
-    try:return list_cards(db)
+    uid=current_user(request); db=connect()
+    try:return [user_card_view(db, item["id"], uid) for item in db.execute("SELECT id FROM decision_cards ORDER BY id DESC")]
     finally:db.close()
 
 @app.get('/api/cards/{card_id}')
 def user_card(card_id: int, request: Request):
-    current_user(request); db=connect()
-    try:return card_detail(db,card_id)
+    uid=current_user(request); db=connect()
+    try:return user_card_view(db,card_id,uid)
     finally:db.close()
 
 @app.post('/api/cards/{card_id}/decisions')

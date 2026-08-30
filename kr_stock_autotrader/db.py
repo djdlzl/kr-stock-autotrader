@@ -19,7 +19,7 @@ def connect() -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS material_evidence (
       id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, name TEXT, kind TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL,
       source TEXT NOT NULL, source_url TEXT, announcement_at TEXT, collected_at TEXT NOT NULL, known_at TEXT NOT NULL,
-      snapshot TEXT NOT NULL, newness TEXT NOT NULL, dedupe_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'active',
+      snapshot TEXT NOT NULL, newness TEXT NOT NULL, dedupe_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'new',
       created_by TEXT NOT NULL, updated_at TEXT NOT NULL, invalidated_at TEXT, audit_json TEXT NOT NULL DEFAULT '[]'
     );
     CREATE TABLE IF NOT EXISTS deterministic_filter_results (
@@ -41,7 +41,7 @@ def connect() -> sqlite3.Connection:
       id INTEGER PRIMARY KEY, card_id INTEGER NOT NULL REFERENCES decision_cards(id), card_version INTEGER NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id),
       approved_at TEXT NOT NULL, valid_until TEXT NOT NULL, symbol TEXT NOT NULL, window_start TEXT, window_end TEXT, price_cap REAL NOT NULL,
       max_amount REAL NOT NULL, max_qty INTEGER NOT NULL, split_json TEXT NOT NULL, order_type TEXT NOT NULL, stop_loss REAL, take_profit_json TEXT NOT NULL,
-      evidence_invalidation TEXT NOT NULL, holding_until TEXT, review_at TEXT, expires_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'approved', version_hash TEXT NOT NULL UNIQUE,
+      evidence_invalidation TEXT NOT NULL, holding_until TEXT, review_at TEXT, expires_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'approved', version_hash TEXT NOT NULL UNIQUE, approval_generation INTEGER NOT NULL DEFAULT 1,
       bought_qty INTEGER NOT NULL DEFAULT 0, bought_amount REAL NOT NULL DEFAULT 0, sold_qty INTEGER NOT NULL DEFAULT 0, last_tick_key TEXT
     );
     CREATE TABLE IF NOT EXISTS order_plan_drafts (
@@ -60,4 +60,6 @@ def connect() -> sqlite3.Connection:
     # Existing local databases predate cumulative-notional accounting.
     if "bought_amount" not in {col["name"] for col in db.execute("PRAGMA table_info(order_plans)")}:
         db.execute("ALTER TABLE order_plans ADD COLUMN bought_amount REAL NOT NULL DEFAULT 0")
+    if "approval_generation" not in {col["name"] for col in db.execute("PRAGMA table_info(order_plans)")}:
+        db.execute("ALTER TABLE order_plans ADD COLUMN approval_generation INTEGER NOT NULL DEFAULT 1")
     return db
