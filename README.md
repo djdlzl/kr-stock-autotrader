@@ -1,6 +1,6 @@
-# KR Stock Autotrader — Paper-first MVP
+# Giraffe — Paper-first Korean Stock Autotrader
 
-한국 주식의 예약 매수와 조건부 매도를 **모의 체결**하는 standalone FastAPI MVP입니다. 투자 추천이나 성과를 주장하지 않습니다.
+**Giraffe**는 한국 주식의 예약 매수와 조건부 매도를 **모의 체결**하는 standalone FastAPI MVP입니다. 투자 추천이나 성과를 주장하지 않습니다.
 
 ## 안전 경계
 
