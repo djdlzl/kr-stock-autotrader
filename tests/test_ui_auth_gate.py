@@ -24,7 +24,7 @@ def test_signup_login_logout_navigation_and_json_contracts():
     assert client.get("/", follow_redirects=False).headers["location"] == "/app"
     app_page = client.get("/app")
     assert app_page.status_code == 200
-    for expected in ("새 매수 계획", "시세 입력", "내 계획", "예약 대기", "로그아웃"):
+    for expected in ("결정 카드", "카드 미생성", "매수 검토 가능", "로그아웃"):
         assert expected in app_page.text
     logout = client.post("/api/logout")
     assert logout.status_code == 200 and logout.json() == {"ok": True}
@@ -33,15 +33,14 @@ def test_signup_login_logout_navigation_and_json_contracts():
     assert login.status_code == 200 and login.json() == {"ok": True}
 
 
-def test_app_shell_source_has_responsive_accessibility_and_plan_controls():
+def test_app_shell_source_has_responsive_accessibility_and_decision_controls():
     client = TestClient(app)
     assert client.post("/api/signup", json={"email": "ux-smoke@test.com", "password": "long-password"}).status_code == 200
     html = client.get("/app").text
     for required in (
-        "--primary:#3b82f6", "--primary-low:#eaf2ff", "min-height:44px", ":focus-visible",
-        "@media(max-width:768px)", "@media(max-width:390px)", "prefers-reduced-motion",
-        "status-grid", "condition-row", "cancel", "조건 삭제", "confirm(",
-        "data-panel=\"create\"", "data-panel=\"tick\"", "세션이 만료되어 로그인 화면으로 이동",
+        "--primary:#2563eb", "--primary-low:#eff6ff", "min-height:44px", ":focus-visible",
+        "@media(max-width:700px)", "@media(max-width:390px)", "prefers-reduced-motion",
+        "카드 미생성", "근거 무효화 조건", "confirm(", "세션이 만료되었습니다",
     ):
         assert required in html
-    assert "디버그 JSON" not in html
+    assert "디버그 JSON" not in html and "새 매수 계획" not in html

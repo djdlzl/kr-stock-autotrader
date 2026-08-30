@@ -2,14 +2,15 @@
 import sqlite3
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from .auth import csrf_origin_ok, current_user, hash_password, issue_session, verify_password
 from .config import COOKIE_SECURE, LIVE_TRADING, SIGNUP_ENABLED
 from .db import connect
-from .domain import Quote, parse_kst
+from .domain import Quote, parse_kst, now_kst
+from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML
 
@@ -173,7 +174,7 @@ def create_plan(data: PlanIn, request: Request):
     db = connect()
     try:
         row = db.execute(
-            "INSERT INTO plans(user_id,symbol,name,scheduled_at,qty,order_type,limit_price,combine_mode) VALUES(?,?,?,?,?,?,?,?) RETURNING id",
+            "INSERT INTO plans(user_id,symbol,name,scheduled_at,qty,order_type,limit_price,combine_mode,status) VALUES(?,?,?,?,?,?,?,?, 'manual_only') RETURNING id",
             (uid, data.symbol, data.name, data.scheduled_at, data.qty, data.order_type, data.limit_price, data.combine_mode),
         ).fetchone()
         db.executemany(
@@ -182,7 +183,7 @@ def create_plan(data: PlanIn, request: Request):
         )
         audit(db, row["id"], "created")
         db.commit()
-        return {"id": row["id"], "status": "scheduled"}
+        return {"id": row["id"], "status": "manual_only", "executable": False}
     finally:
         db.close()
 
@@ -246,6 +247,229 @@ def submit_tick(data: TickIn, request: Request):
     finally:
         db.close()
 
+
+@app.post('/api/internal/evidence')
+async def internal_evidence_create(request: Request, _: None = Depends(require_internal_api_key)):
+    data = await request.json(); db = connect()
+    try: return create_evidence(db, data)
+    finally: db.close()
+
+@app.get('/api/internal/evidence')
+def internal_evidence_list(symbol: str | None = None, status: str | None = None, date: str | None = None, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try: return list_evidence(db, symbol, status, date)
+    finally: db.close()
+
+@app.get('/api/internal/evidence/{evidence_id}')
+def internal_evidence_detail(evidence_id: int, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try: return evidence_detail(db, evidence_id)
+    finally: db.close()
+
+@app.patch('/api/internal/evidence/{evidence_id}')
+async def internal_evidence_update(evidence_id: int, request: Request, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try: return mutate_evidence(db, evidence_id, await request.json())
+    finally: db.close()
+
+@app.post('/api/internal/evidence/{evidence_id}/invalidate')
+def internal_evidence_invalidate(evidence_id: int, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try: return mutate_evidence(db, evidence_id, invalidate=True)
+    finally: db.close()
+
+@app.post('/api/internal/filters')
+async def internal_filter(request: Request, _: None = Depends(require_internal_api_key)):
+    data=await request.json(); db=connect()
+    try:return save_filter(db,data['evidence_id'],data['inputs'],data['as_of'],data['known_at'])
+    finally:db.close()
+
+@app.get('/api/internal/filters/{filter_id}')
+def internal_filter_detail(filter_id: int, _: None = Depends(require_internal_api_key)):
+    db=connect()
+    try:return filter_detail(db,filter_id)
+    finally:db.close()
+
+@app.post('/api/internal/cards/generate')
+async def internal_card_generate(request: Request, _: None = Depends(require_internal_api_key)):
+    """Create no LLM output: callers receive the immutable prompt/input request to run externally."""
+    data=await request.json(); db=connect()
+    try:
+        ev=evidence_detail(db,data['evidence_id']); fi=filter_detail(db,data['filter_id'])
+        return {'prompt_version':'decision-card-v1','prompt_hash':__import__('kr_stock_autotrader.decision_cards',fromlist=['prompt_hash']).prompt_hash(),'evidence':ev,'filter':fi}
+    finally:db.close()
+
+@app.post('/api/internal/cards/results')
+async def internal_card_save(request: Request, _: None = Depends(require_internal_api_key)):
+    db=connect()
+    try:return save_card(db,await request.json())
+    finally:db.close()
+
+@app.post('/api/internal/order-plans/{plan_id}/evaluate')
+async def internal_order_evaluate(plan_id: int, request: Request, _: None = Depends(require_internal_api_key)):
+    """Paper-only tick evaluator; it neither schedules nor has a live adapter."""
+    db=connect()
+    try:return evaluate_order_plan(db,plan_id,await request.json())
+    finally:db.close()
+
+@app.post('/api/internal/scheduler-runs/{run_key}/start')
+async def scheduler_start(run_key: str, request: Request, _: None = Depends(require_internal_api_key)):
+    data=await request.json(); db=connect()
+    try:
+        existing=db.execute("SELECT kind,status FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
+        if existing:
+            if existing['kind'] != data['kind']: raise HTTPException(409,'run_key kind conflict')
+            return {'run_key':run_key,'kind':existing['kind'],'status':existing['status'],'idempotent':True}
+        db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?, 'started',?,?)",(run_key,data['kind'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(data)))
+        db.commit(); return {'run_key':run_key,'kind':data['kind'],'status':'started','idempotent':False}
+    finally: db.close()
+
+@app.post('/api/internal/scheduler-runs/{run_key}/finish')
+async def scheduler_finish(run_key: str, request: Request, _: None = Depends(require_internal_api_key)):
+    data=await request.json(); db=connect()
+    try:
+        if not db.execute("SELECT 1 FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone(): raise HTTPException(404,'scheduler run not found')
+        db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=?",(data['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(data),run_key)); db.commit(); return {'run_key':run_key,'status':data['status'],'count':data.get('count',0),'detail':data.get('detail',{})}
+    finally: db.close()
+
+@app.get('/api/internal/scheduler-runs/latest')
+def scheduler_latest(kind: str, date: str | None = None, _: None = Depends(require_internal_api_key)):
+    db=connect()
+    try:
+        query="SELECT * FROM scheduler_runs WHERE kind=?"; params=[kind]
+        if date:
+            query+=" AND (substr(started_at,1,10)=? OR run_key LIKE ?)"; params.extend([date,f"%{date}%"])
+        item=db.execute(query+" ORDER BY id DESC LIMIT 1",params).fetchone()
+        if not item: raise HTTPException(404,'scheduler run not found')
+        result=dict(item); result['detail']=__import__('json').loads(result['detail']); return result
+    finally: db.close()
+
+@app.get('/api/internal/cards')
+def internal_cards(missing: bool = False, _: None = Depends(require_internal_api_key)):
+    db=connect()
+    try:return list_cards(db, missing=missing)
+    finally:db.close()
+
+@app.get('/api/internal/cards/{card_id}')
+def internal_card_detail(card_id: int, _: None = Depends(require_internal_api_key)):
+    db=connect()
+    try:return card_detail(db,card_id)
+    finally:db.close()
+
+@app.get('/api/cards/summary')
+def user_cards_summary(request: Request, date: str | None = None):
+    """Current-user, date-scoped dashboard aggregate; intentionally no raw inputs."""
+    from datetime import datetime, time, timedelta
+    uid = current_user(request)
+    current = now_kst()
+    try:
+        requested = datetime.strptime(date, "%Y-%m-%d").date() if date else current.date()
+    except (TypeError, ValueError):
+        raise HTTPException(422, "기준일은 YYYY-MM-DD 형식입니다")
+    day = requested.isoformat()
+    def next_run(hour):
+        candidate = datetime.combine(current.date(), time(hour), tzinfo=current.tzinfo)
+        if candidate <= current: candidate += timedelta(days=1)
+        return candidate.isoformat()
+    db=connect()
+    try:
+        evidence_count=db.execute("SELECT count(*) n FROM material_evidence WHERE substr(known_at,1,10)=?",(day,)).fetchone()["n"]
+        pass_count=db.execute("SELECT count(*) n FROM deterministic_filter_results WHERE substr(as_of,1,10)=? AND verdict='PASS'",(day,)).fetchone()["n"]
+        cards=db.execute("SELECT verdict,count(*) n FROM decision_cards WHERE substr(generated_at,1,10)=? GROUP BY verdict",(day,)).fetchall()
+        by_verdict={x["verdict"]:x["n"] for x in cards}
+        decisions=db.execute("SELECT decision,count(*) n FROM user_decisions WHERE user_id=? AND substr(decided_at,1,10)=? GROUP BY decision",(uid,day)).fetchall()
+        by_decision={x["decision"]:x["n"] for x in decisions}
+        missing=db.execute("SELECT count(*) n FROM material_evidence e WHERE substr(e.known_at,1,10)=? AND e.status!='invalidated' AND NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id)",(day,)).fetchone()["n"]
+        # Operationally unresolved evidence is a union: an explicit collection
+        # error or an active evidence item with no generated card. Keep it as
+        # one evidence-ID denominator so an error without a card is not doubled.
+        failures=db.execute("""SELECT count(*) n FROM material_evidence e
+            WHERE substr(e.known_at,1,10)=? AND (
+              e.status='error' OR (e.status!='invalidated' AND NOT EXISTS
+                (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id))
+            )""",(day,)).fetchone()["n"]
+        scheduler=[]
+        for kind, label in (("research","리서치"),("card","카드")):
+            run=db.execute("SELECT status,started_at,finished_at,detail FROM scheduler_runs WHERE kind=? ORDER BY id DESC LIMIT 1",(kind,)).fetchone()
+            import json
+            detail=json.loads(run["detail"] or "{}") if run else {}
+            scheduler.append({"종류":label,"상태":run["status"] if run else "미실행","건수":int(detail.get("count",0) or 0),"실패":bool(run and run["status"] in {"error","failed"}),"시각":(run["finished_at"] or run["started_at"]) if run else None})
+        return {"기준일":day,"전체 근거":evidence_count,"필터 PASS":pass_count,"카드 생성":sum(by_verdict.values()),"카드 미생성":missing,"판단 보류":by_verdict.get("판단 보류",0),"매수 검토 가능":by_verdict.get("매수 검토 가능",0),"관찰":by_verdict.get("관찰",0),"제외":by_verdict.get("제외",0),"승인":by_decision.get("approve",0),"보류":by_decision.get("hold",0),"거절":by_decision.get("reject",0),"실패·근거 부족":failures,"최근 실행":{"07:00":scheduler[0],"08:00":scheduler[1]},"스케줄러":scheduler,"다음 실행":{"07:00 KST":next_run(7),"08:00 KST":next_run(8)}}
+    finally: db.close()
+
+
+@app.get('/api/cards')
+def user_cards(request: Request):
+    uid=current_user(request); db=connect()
+    try:return [user_card_view(db, item["id"], uid) for item in db.execute("SELECT id FROM decision_cards ORDER BY id DESC")]
+    finally:db.close()
+
+@app.get('/api/cards/missing')
+def user_missing_cards(request: Request, date: str | None = None):
+    """Authenticated evidence rows for the 카드 미생성 tab."""
+    current_user(request)
+    if date:
+        try: __import__('datetime').datetime.strptime(date, "%Y-%m-%d")
+        except ValueError: raise HTTPException(422, "기준일은 YYYY-MM-DD 형식입니다")
+    db=connect()
+    try:
+        rows=list_cards(db, missing=True)
+        return [x for x in rows if not date or x.get("known_at", "")[:10] == date]
+    finally: db.close()
+
+@app.get('/api/cards/{card_id}')
+def user_card(card_id: int, request: Request):
+    uid=current_user(request); db=connect()
+    try:return user_card_view(db,card_id,uid)
+    finally:db.close()
+
+@app.post('/api/cards/{card_id}/decisions')
+async def user_card_decision(card_id: int, request: Request):
+    csrf_origin_ok(request); uid=current_user(request); data=await request.json()
+    if data.get('decision') not in {'approve','hold','reject'}: raise HTTPException(422,'invalid decision')
+    db=connect()
+    try:return user_decision(db,card_id,uid,data['decision'],data.get('note',''))
+    finally:db.close()
+
+@app.post('/api/cards/{card_id}/order-plan-draft')
+async def user_order_plan_draft(card_id: int, request: Request):
+    csrf_origin_ok(request); uid=current_user(request); data=await request.json(); db=connect()
+    try: return edit_draft(db,card_id,uid,data)
+    finally: db.close()
+
+@app.post('/api/order-plans/{plan_id}/edit')
+async def user_order_plan_edit(plan_id: int, request: Request):
+    """Any edit is authenticated and revokes the immutable approved snapshot."""
+    csrf_origin_ok(request); uid=current_user(request); data=await request.json()
+    db=connect()
+    try:
+        return edit_order_plan(db, plan_id, uid, data)
+    finally: db.close()
+
+@app.get('/api/order-plans/{plan_id}')
+def user_order_plan_detail(plan_id: int, request: Request):
+    uid=current_user(request); db=connect()
+    try:
+        plan=db.execute("SELECT * FROM order_plans WHERE id=? AND user_id=?",(plan_id,uid)).fetchone()
+        if not plan: raise HTTPException(404,'order plan not found')
+        out=dict(plan)
+        draft=db.execute("SELECT snapshot_json,status,updated_at FROM order_plan_drafts WHERE card_id=? AND user_id=? AND status='draft'",(plan['card_id'],uid)).fetchone()
+        out['draft']={**dict(draft), 'snapshot':__import__('json').loads(draft['snapshot_json'])} if draft else None
+        out['events']=[dict(x) for x in db.execute("SELECT event,reason,at FROM order_events WHERE order_plan_id=? ORDER BY id",(plan_id,))]
+        out['position']=dict(db.execute("SELECT qty,avg_price,status FROM positions WHERE order_plan_id=?",(plan_id,)).fetchone() or {})
+        return out
+    finally: db.close()
+
+@app.post('/api/order-plans/{plan_id}/close')
+async def user_order_plan_close(plan_id: int, request: Request):
+    """An authenticated explicit event may close only an already-open paper position."""
+    csrf_origin_ok(request); uid=current_user(request); data=await request.json(); db=connect()
+    try:
+        plan=db.execute("SELECT user_id FROM order_plans WHERE id=?",(plan_id,)).fetchone()
+        if not plan or plan['user_id'] != uid: raise HTTPException(404,'order plan not found')
+        data['manual_exit']=True
+        return evaluate_order_plan(db,plan_id,data)
+    finally: db.close()
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):

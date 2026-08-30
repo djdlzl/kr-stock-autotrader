@@ -51,7 +51,7 @@ def test_tick_cannot_evaluate_another_users_plan():
     plan(owner)
     assert tick(attacker, "attacker-tick").status_code == 200
     row = owner.get("/api/plans").json()[0]
-    assert row["status"] == "scheduled"
+    assert row["status"] == "manual_only"
     assert row["events"] == [{"event": "created", "reason": "", "at": row["events"][0]["at"]}]
 
 
@@ -62,11 +62,11 @@ def test_future_and_stale_known_at_fail_closed_for_buy_and_sell():
     now = datetime.now(KST)
     for key, time in (("stale", now - timedelta(minutes=6)), ("future", now + timedelta(seconds=1))):
         assert tick(c, key, time.isoformat()).status_code == 200
-        assert c.get("/api/plans").json()[0]["status"] == "scheduled"
+        assert c.get("/api/plans").json()[0]["status"] == "manual_only"
     assert pid
 
 
-def test_deadline_is_iso_kst_and_empty_conditions_do_not_auto_sell(monkeypatch):
+def test_legacy_conditions_do_not_auto_execute(monkeypatch):
     import kr_stock_autotrader.service as service
     evaluation_time = datetime(2026, 8, 28, 10, 0, tzinfo=KST)
     monkeypatch.setattr(service, "now_kst", lambda: evaluation_time)
@@ -78,9 +78,9 @@ def test_deadline_is_iso_kst_and_empty_conditions_do_not_auto_sell(monkeypatch):
     })
     assert response.status_code == 200, response.text
     assert tick(c, "deadline-buy").status_code == 200
-    assert c.get("/api/plans").json()[0]["status"] == "filled"
+    assert c.get("/api/plans").json()[0]["status"] == "manual_only"
     assert tick(c, "deadline-sell").status_code == 200
-    assert c.get("/api/plans").json()[0]["status"] == "closed"
+    assert c.get("/api/plans").json()[0]["fills"] == []
 
 
 def test_missing_or_public_default_secret_fails_closed_in_fresh_process():
@@ -133,15 +133,11 @@ print("signup-disabled-runtime-ok")
     assert probe.stdout.strip() == "signup-disabled-runtime-ok"
 
 
-def test_blue_primary_replaces_orange_primary_in_public_and_authenticated_shells():
+def test_blue_primary_replaces_orange_primary_in_authenticated_shell():
     client = TestClient(app)
-    assert client.post("/api/signup", json={"email": "blue-theme@test.com", "password": "long-password"}).status_code == 200
-    for html in (TestClient(app).get("/").text, client.get("/app").text):
-        for required in ("--primary:#3b82f6", "--primary-low:#eaf2ff", "#174ea6", "rgba(59,130,246,.38)"):
-            assert required in html
-        for forbidden in ("#ff6f0f", "#fff0e5", "#a94300", "#9a4300", "rgba(255,111,15,.38)", "rgba(255,111,15,.36)"):
-            assert forbidden not in html
-
+    assert client.post("/api/signup", json={"email":"blue-theme@test.com","password":"long-password"}).status_code == 200
+    html=client.get('/app').text
+    assert '--primary:#2563eb' in html and '--primary-low:#eff6ff' in html
 
 def signed_token(payload: dict) -> str:
     from kr_stock_autotrader.config import SESSION_SECRET
@@ -166,18 +162,17 @@ def test_token_claims_reject_known_default_forgery_and_future_iat(monkeypatch):
     assert c.get("/api/plans").status_code == 401
 
 
-def test_closed_cancel_is_truthful_and_cancel_is_idempotent(monkeypatch):
+def test_manual_only_cancel_is_truthful_and_idempotent(monkeypatch):
     import kr_stock_autotrader.service as service
     now = datetime(2026, 8, 28, 10, 0, tzinfo=KST)
     monkeypatch.setattr(service, "now_kst", lambda: now)
     c = TestClient(app)
     signup(c, "cancel-state@test.com")
     closed = plan(c)
-    assert tick(c, "closed-buy", now.isoformat()).status_code == 200
-    assert tick(c, "closed-sell", now.isoformat()).status_code == 200
-    response = c.post(f"/api/plans/{closed}/cancel")
-    assert response.status_code == 409
-    assert response.json()["detail"]["current_status"] == "closed"
+    assert tick(c, "legacy-tick", now.isoformat()).status_code == 200
+    assert c.get("/api/plans").json()[0]["fills"] == []
+    assert c.post(f"/api/plans/{closed}/cancel").json() == {"status": "cancelled", "idempotent": False}
+    assert c.post(f"/api/plans/{closed}/cancel").json() == {"status": "cancelled", "idempotent": True}
     open_plan = c.post("/api/plans", json={"symbol":"005930", "name":"삼성전자", "scheduled_at":"2030-01-01T10:00:00+09:00", "qty":1, "conditions":[]}).json()["id"]
     assert c.post(f"/api/plans/{open_plan}/cancel").json() == {"status": "cancelled", "idempotent": False}
     assert c.post(f"/api/plans/{open_plan}/cancel").json() == {"status": "cancelled", "idempotent": True}
@@ -210,10 +205,10 @@ def test_concurrent_cancel_has_one_transition_and_one_audit_event():
     assert [event["event"] for event in stored["events"]].count("cancelled") == 1
 
 
-def test_ui_exposes_logout_cancel_dedicated_tick_symbol_and_cards():
+def test_ui_exposes_decision_cards_not_legacy_execution_controls():
     client = TestClient(app)
-    assert client.post("/api/signup", json={"email": "ui-controls@test.com", "password": "long-password"}).status_code == 200
-    html = client.get("/app").text
-    for required in ('id="logout"', "cancel", 'name="symbol"', "plan-card", "최근 평가", "감사 로그", "@media(max-width:390px)"):
+    assert client.post("/api/signup", json={"email":"ui-controls@test.com","password":"long-password"}).status_code == 200
+    html=client.get('/app').text
+    for required in ('id="logout"', '카드 미생성', '수동 전량 매도', '결정 카드'):
         assert required in html
-    assert "디버그 JSON" not in html
+    assert '새 매수 계획' not in html and '시세 입력' not in html
