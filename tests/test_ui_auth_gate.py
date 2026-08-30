@@ -8,7 +8,7 @@ def test_unauthenticated_root_is_auth_shell_without_private_controls():
     response = TestClient(app).get("/")
     assert response.status_code == 200
     html = response.text
-    for expected in ("모의투자 계획을 시작하세요", "로그인", "회원가입", "role=\"tablist\""):
+    for expected in ("모의투자 계획을 시작하세요", "로그인", "회원가입", "role=\"group\""):
         assert expected in html
     for forbidden in ("내 계획", "시세 입력", "새 매수 계획", "감사 로그", "디버그 JSON"):
         assert forbidden not in html

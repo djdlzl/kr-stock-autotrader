@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "project": {
+    "name": "Giraffe",
+    "productType": "authenticated paper-trading planner",
+    "stack": [
+      "FastAPI",
+      "server-rendered HTML",
+      "vanilla CSS",
+      "vanilla JavaScript"
+    ]
+  },
+  "sources": {
+    "tokens": ["kr_stock_autotrader/ui.py"],
+    "components": ["AUTH_HTML", "APP_HTML"],
+    "assets": [],
+    "instructions": ["README.md"]
+  },
+  "design": {
+    "colorMode": "light",
+    "colors": {
+      "primary": "#ff6f0f",
+      "primaryLow": "#fff0e5",
+      "paper": "#fffaf6",
+      "sheet": "#ffffff",
+      "ink": "#1f1d1b",
+      "inkLow": "#6d6863",
+      "divider": "#e9e1da",
+      "success": "#16835b",
+      "warning": "#a95b00",
+      "danger": "#c73524"
+    },
+    "typography": {
+      "family": "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
+      "roles": ["caption", "body", "title", "heading"]
+    },
+    "spacing": {"base": "8px"},
+    "radius": {"input": "12px", "card": "16px", "shell": "20px", "badge": "pill"},
+    "shadows": {"card": "warm tinted low elevation"},
+    "motion": {"intensity": 2, "rule": "feedback and state transitions only; honor reduced motion"},
+    "density": "daily app / medium"
+  },
+  "components": {
+    "installed": [],
+    "preferredPrimitives": [
+      "semantic HTML",
+      "labeled inputs",
+      "segmented tabs",
+      "status summary",
+      "disclosure details",
+      "inline notices"
+    ],
+    "patterns": [
+      "server-enforced auth shell",
+      "authenticated dashboard",
+      "progressive task panels",
+      "human-readable plan cards",
+      "empty/loading/error states"
+    ]
+  },
+  "constraints": {
+    "must": [
+      "Unauthenticated root contains auth shell only",
+      "Authenticated app requires a valid session",
+      "Paper-only: no broker adapter or live order",
+      "SEED-inspired semantic tokens without Daangn assets or affiliation",
+      "Korean plain-language copy",
+      "44px minimum touch targets",
+      "Visible focus and reduced-motion handling",
+      "Mobile single-column fallback"
+    ],
+    "avoid": [
+      "Official Daangn logos, characters, or implied affiliation",
+      "CDN or frontend build dependency",
+      "Decorative gradients, glass effects, or excessive animation",
+      "Raw debug JSON in the user interface",
+      "Private plan or quote controls in unauthenticated HTML",
+      "Replacing existing project primitives with React-only 21st components"
+    ]
+  },
+  "decisions": [
+    {
+      "decision": "Trust-first Giraffe product UI with SEED-inspired semantic color roles and restrained motion",
+      "rationale": "Paper trading requires calm hierarchy, explicit safety boundaries, and low cognitive load."
+    },
+    {
+      "decision": "Use 21st sign-in, dashboard, form, tabs, card, and empty-state patterns as composition references only",
+      "rationale": "The project is server-rendered vanilla HTML; React/shadcn code would add unnecessary infrastructure."
+    },
+    {
+      "decision": "Taste dials: variance 3, motion 2, density 5",
+      "rationale": "This is a trust-first financial planning product; accessibility and clarity override marketing-page theatrics."
+    }
+  ],
+  "evidence": [
+    {"source": "https://seed-design.io", "note": "semantic token and interaction principles"},
+    {"source": "https://21st.dev/community/components", "note": "public sign-in, dashboard, form, tabs, card, and empty-state pattern library; CLI search requires account login"},
+    {"source": "https://github.com/21st-dev/skill", "note": "official 21st UI build and review workflow"}
+  ],
+  "generatedAt": "2026-08-30T12:04:15.448Z"
+}

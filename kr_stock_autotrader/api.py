@@ -95,6 +95,23 @@ class TickIn(BaseModel):
 app = FastAPI(title="Giraffe — Paper Only")
 
 
+def merge_vary(existing: str | None, token: str) -> str:
+    """Add a Vary token once without discarding upstream response variants."""
+    tokens = [item.strip() for item in (existing or "").split(",") if item.strip()]
+    if token.lower() not in {item.lower() for item in tokens}:
+        tokens.append(token)
+    return ", ".join(tokens)
+
+
+@app.middleware("http")
+async def prevent_session_response_caching(request: Request, call_next):
+    """Never let shared caches reuse auth, redirect, or user-data responses."""
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["Vary"] = merge_vary(response.headers.get("Vary"), "Cookie")
+    return response
+
+
 def set_session(response: Response, uid: int) -> None:
     response.set_cookie(
         "session", issue_session(uid), httponly=True, samesite="lax",
