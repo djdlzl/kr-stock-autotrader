@@ -1,0 +1,26 @@
+services:
+  app:
+    build:
+      context: .
+    image: kr-stock-autotrader:${IMAGE_TAG:-latest}
+    container_name: kr-stock-autotrader
+    restart: unless-stopped
+    environment:
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+      DATABASE_PATH: /data/autotrader.db
+      COOKIE_SECURE: "true"
+      SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-28800}
+      KR_HOLIDAYS: ${KR_HOLIDAYS:-}
+    volumes:
+      - ./data:/data
+    networks:
+      - web_gateway
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  web_gateway:
+    external: true
+    name: caddy-web-gateway_default

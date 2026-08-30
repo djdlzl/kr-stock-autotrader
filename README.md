@@ -53,3 +53,23 @@ API: 가입/로그인/로그아웃, `POST/GET /api/plans`, `POST /api/plans/{id}
 ```
 
 테스트는 정확한 ±5% 경계, stale/future known-at fail-closed, 상대 거래량 0분모, OR/AND, 사용자 격리, idempotency, 체결 수량, deadline KST, Paper E2E를 검증합니다.
+
+## Docker 운영 배포
+
+`compose.prod.yml`은 기존 Caddy Docker network 뒤에서만 실행하며 앱 포트를 호스트에 공개하지 않습니다.
+
+```bash
+cp .env.prod.example .env
+python3 -c 'import secrets; print(secrets.token_urlsafe(48))'  # 출력값을 SESSION_SECRET에 설정
+mkdir -p data
+sudo chown 10001:10001 data
+IMAGE_TAG="$(git rev-parse --short HEAD)" docker compose -f compose.prod.yml up -d --build
+```
+
+운영 계약:
+
+- 외부 HTTPS는 Caddy가 종료하고 앱은 `caddy-web-gateway_default` network의 `kr-stock-autotrader:8000`으로만 연결됩니다.
+- `COOKIE_SECURE=true`이며 Uvicorn은 Caddy의 forwarded headers를 사용합니다.
+- SQLite는 호스트 `./data/autotrader.db`에 영속 저장됩니다.
+- `SESSION_SECRET`는 `.env`에만 두고 Git에 커밋하지 않습니다.
+- 증권사/live adapter는 없으며 이 배포도 paper-only입니다.
