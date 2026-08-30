@@ -4,7 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 os.environ["DATABASE_PATH"] = tempfile.mktemp(suffix=".db")
-os.environ["SESSION_SECRET"] = "test-secret"
+os.environ["SESSION_SECRET"] = "test-session-secret-that-is-at-least-thirty-two-bytes-long"
 from fastapi.testclient import TestClient
 from app import app
 import kr_stock_autotrader.service as service
@@ -31,7 +31,12 @@ def test_paper_e2e_fill_sell_and_idempotency(monkeypatch):
     tick={'symbol':'005930','price':70000,'volume':100,'baseline_volume':100,'known_at':NOW.isoformat(),'idempotency_key':'once'}
     assert x.post('/api/ticks',json=tick).status_code==200
     row=x.get('/api/plans').json()[0]
-    assert row['id']==plan and row['status']=='closed' and row['sold_qty']==3
-    assert [(f['side'], f['qty']) for f in row['fills']] == [('buy', 3), ('sell', 3)]
+    assert row['id']==plan and row['status']=='filled' and row['sold_qty']==0
+    assert [(f['side'], f['qty']) for f in row['fills']] == [('buy', 3)]
     events=len(row['events']); x.post('/api/ticks',json=tick)
     assert len(x.get('/api/plans').json()[0]['events'])==events
+    second = {**tick, 'idempotency_key': 'next-fresh-tick'}
+    assert x.post('/api/ticks',json=second).status_code == 200
+    row = x.get('/api/plans').json()[0]
+    assert row['status'] == 'closed' and row['sold_qty'] == 3
+    assert [(f['side'], f['qty']) for f in row['fills']] == [('buy', 3), ('sell', 3)]

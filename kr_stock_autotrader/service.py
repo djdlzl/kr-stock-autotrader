@@ -32,6 +32,9 @@ def evaluate_tick(db: sqlite3.Connection, user_id: int, quote: Quote, tick_key: 
             broker.fill(db, plan["id"], "buy", plan["qty"], quote.price)
             db.execute("UPDATE plans SET status='filled',buy_price=?,last_evaluation=? WHERE id=?", (quote.price, quote.known_at.isoformat(), plan["id"]))
             audit(db, plan["id"], "paper_buy_filled", f"{plan['qty']}@{quote.price}", key)
+            # A newly acquired position cannot be sold on the same quote.  A distinct,
+            # fresh tick is required before automatic exit conditions are evaluated.
+            continue
         current = db.execute("SELECT * FROM plans WHERE id=? AND user_id=?", (plan["id"], user_id)).fetchone()
         if current["status"] != "filled":
             continue

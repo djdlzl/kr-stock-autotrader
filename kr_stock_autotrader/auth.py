@@ -2,7 +2,7 @@
 import base64, hashlib, hmac, json, os
 from datetime import timedelta
 from fastapi import HTTPException, Request
-from .config import SESSION_SECRET, SESSION_TTL_SECONDS
+from .config import SESSION_CLOCK_SKEW_SECONDS, SESSION_SECRET, SESSION_TTL_SECONDS
 from .domain import now_kst
 
 
@@ -34,9 +34,14 @@ def current_user(request: Request) -> int:
         if not hmac.compare_digest(signature, expected):
             raise ValueError
         data = json.loads(base64.urlsafe_b64decode(body))
-        if not isinstance(data["uid"], int) or int(now_kst().timestamp()) > data["exp"]:
+        uid, issued_at, expires_at = data["uid"], data["iat"], data["exp"]
+        # Exact integers exclude bool and strings: session claims are never coerced.
+        if any(type(value) is not int for value in (uid, issued_at, expires_at)):
             raise ValueError
-        return data["uid"]
+        now = int(now_kst().timestamp())
+        if issued_at > now + SESSION_CLOCK_SKEW_SECONDS or issued_at > expires_at or now > expires_at:
+            raise ValueError
+        return uid
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         raise HTTPException(401, "로그인이 필요합니다")
 
