@@ -152,3 +152,45 @@ symbol.valid=false; if(!revealFirstInvalid(form) || panels[0].hidden || symbol.r
 '''
     result = subprocess.run([node, "-e", harness], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_plan_card_executes_explicit_buy_time_and_sell_condition_details():
+    """Plan cards must expose the two decision-critical fields with clear labels."""
+    import json
+    import shutil
+    import subprocess
+
+    from kr_stock_autotrader.ui import APP_HTML
+
+    node = shutil.which("node")
+    assert node, "Node is required for the embedded plan-card regression"
+    script = APP_HTML.split("const $=", 1)[1].split("function render(plans)", 1)[0]
+    plan = {
+        "id": 7,
+        "symbol": "005930",
+        "name": "삼성전자",
+        "scheduled_at": "2026-08-31T09:00:00+09:00",
+        "qty": 3,
+        "order_type": "limit",
+        "limit_price": 70000,
+        "combine_mode": "AND",
+        "status": "scheduled",
+        "conditions": [
+            {"kind": "absolute_price", "operator": ">=", "value": "75000"},
+            {"kind": "deadline", "operator": ">=", "value": "2026-09-04T14:30:00+09:00"},
+        ],
+        "events": [],
+    }
+    harness = (
+        "globalThis.document={querySelector(){return {textContent:'',className:''}}};"
+        "const $=" + script
+        + f";console.log(card({json.dumps(plan, ensure_ascii=False)}));"
+    )
+    result = subprocess.run([node, "-e", harness], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    card_html = result.stdout
+    assert "매수 예정" in card_html
+    assert "2026. 8. 31." in card_html and "오전 9:00" in card_html
+    assert "매도 조건" in card_html and "모두 충족" in card_html
+    assert "가격 75,000원 이상" in card_html
+    assert "마감 시각 2026. 9. 4. 오후 2:30 이후" in card_html
