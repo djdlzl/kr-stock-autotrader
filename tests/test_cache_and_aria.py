@@ -45,14 +45,11 @@ def test_session_sensitive_routes_and_auth_posts_are_private_and_vary_by_cookie(
     assert_private_response(anonymous.post("/api/logout"))
 
 
-def test_auth_switch_is_a_pressed_button_group_not_false_tabs():
+def test_auth_shell_is_login_only_without_signup_controls_or_code():
     html = TestClient(app).get("/").text
-    assert 'role="group"' in html
-    assert 'aria-label="인증 방식"' in html
-    assert 'id="login-tab" aria-pressed="true"' in html
-    assert 'id="signup-tab" aria-pressed="false"' in html
-    assert "setAttribute('aria-pressed'" in html
-    for forbidden in ('role="tablist"', 'role="tab"', 'aria-controls="login-panel"', 'aria-controls="signup-panel"'):
+    assert html.count('type="submit"') == 1
+    assert "fetch('/api/login'" in html
+    for forbidden in ("회원가입", "signup", "login-tab", "signup-tab", "role=\"group\"", "role=\"tablist\"", "role=\"tab\"", "aria-controls=\"login-panel\"", "aria-controls=\"signup-panel\""):
         assert forbidden not in html
 
 
@@ -71,7 +68,7 @@ def test_plan_stepper_is_step_navigation_not_false_tabs():
 
 
 def test_primary_and_success_tokens_meet_aa_and_plan_interactions_validate():
-    assert contrast_ratio("#1f1d1b", "#ff6f0f") >= 4.5
+    assert contrast_ratio("#1f1d1b", "#3b82f6") >= 4.5
     assert contrast_ratio("#126b49", "#e9f8f0") >= 4.5
     client = TestClient(app)
     assert client.post(

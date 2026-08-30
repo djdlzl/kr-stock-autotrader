@@ -4,14 +4,16 @@ from fastapi.testclient import TestClient
 from app import app
 
 
-def test_unauthenticated_root_is_auth_shell_without_private_controls():
+def test_unauthenticated_root_is_login_only_shell_without_private_controls():
     response = TestClient(app).get("/")
     assert response.status_code == 200
     html = response.text
-    for expected in ("모의투자 계획을 시작하세요", "로그인", "회원가입", "role=\"group\""):
+    for expected in ("모의투자 계획을 시작하세요", "로그인", "autocomplete=\"current-password\""):
         assert expected in html
-    for forbidden in ("내 계획", "시세 입력", "새 매수 계획", "감사 로그", "디버그 JSON"):
+    for forbidden in ("회원가입", "signup", "login-tab", "signup-tab", "role=\"group\"", "내 계획", "시세 입력", "새 매수 계획", "감사 로그", "디버그 JSON"):
         assert forbidden not in html
+    assert html.count('type="submit"') == 1
+    assert "fetch('/api/login'" in html
     assert TestClient(app).get("/app", follow_redirects=False).status_code == 303
 
 
@@ -36,7 +38,7 @@ def test_app_shell_source_has_responsive_accessibility_and_plan_controls():
     assert client.post("/api/signup", json={"email": "ux-smoke@test.com", "password": "long-password"}).status_code == 200
     html = client.get("/app").text
     for required in (
-        "--primary:#ff6f0f", "--primary-low", "min-height:44px", ":focus-visible",
+        "--primary:#3b82f6", "--primary-low:#eaf2ff", "min-height:44px", ":focus-visible",
         "@media(max-width:768px)", "@media(max-width:390px)", "prefers-reduced-motion",
         "status-grid", "condition-row", "cancel", "조건 삭제", "confirm(",
         "data-panel=\"create\"", "data-panel=\"tick\"", "세션이 만료되어 로그인 화면으로 이동",

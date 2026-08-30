@@ -10,6 +10,7 @@ services:
       DATABASE_PATH: /data/autotrader.db
       COOKIE_SECURE: "true"
       SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-28800}
+      SIGNUP_ENABLED: ${SIGNUP_ENABLED:-false}
       KR_HOLIDAYS: ${KR_HOLIDAYS:-}
     volumes:
       - ./data:/data
