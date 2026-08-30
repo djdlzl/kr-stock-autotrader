@@ -69,7 +69,7 @@ def test_decision_card_accessibility_controls_and_mobile_rules():
 
 def test_decision_card_ui_uses_safe_korean_formatting_and_no_raw_json():
     from kr_stock_autotrader.ui import APP_HTML
-    assert 'function korean' in APP_HTML and 'innerHTML=JSON.stringify' not in APP_HTML
+    assert 'function korean' in APP_HTML and '해당 없음' in APP_HTML and 'innerHTML=JSON.stringify' not in APP_HTML
 
 def test_decision_card_ui_has_order_type_select_and_kst_conversion():
     from kr_stock_autotrader.ui import APP_HTML
