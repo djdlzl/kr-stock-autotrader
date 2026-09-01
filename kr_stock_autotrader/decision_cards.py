@@ -29,6 +29,12 @@ def create_evidence(db, data):
     audit(db,data.get("created_by","internal"),"create","material_evidence",r["id"]); db.commit(); return evidence_detail(db,r["id"])
 def evidence_detail(db, ident):
     d=dict(row(db,"material_evidence",ident)); d["snapshot"]=json.loads(d["snapshot"]); return d
+def missing_evidence_view(db, ident):
+    """Return only actionable display fields; raw collection data stays internal."""
+    evidence=evidence_detail(db, ident)
+    safe={k:evidence.get(k) for k in ("id","symbol","name","kind","title","summary","source","source_url","announcement_at","collected_at","known_at","status","version")}
+    safe["snapshot_available"]=bool(evidence.get("snapshot"))
+    return safe
 def list_evidence(db, symbol=None,status=None, date=None):
     q="SELECT id FROM material_evidence WHERE 1=1"; p=[]
     if symbol: q+=" AND symbol=?"; p.append(symbol)
@@ -167,7 +173,7 @@ def list_cards(db, missing=False, date=None):
           WHERE status != 'invalidated' AND NOT EXISTS (
             SELECT 1 FROM decision_cards c WHERE c.evidence_id=material_evidence.id
           )""" + date_clause + " ORDER BY id DESC"
-        return [evidence_detail(db, item["id"]) for item in db.execute(query, params)]
+        return [missing_evidence_view(db, item["id"]) for item in db.execute(query, params)]
     query = """SELECT c.id FROM decision_cards c
       JOIN material_evidence e ON e.id=c.evidence_id WHERE 1=1"""
     if date:

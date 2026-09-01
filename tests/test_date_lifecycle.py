@@ -1,4 +1,7 @@
 """RED/green contracts for KST business-date card lifecycle."""
+import os
+import re
+import subprocess
 from fastapi.testclient import TestClient
 
 from kr_stock_autotrader import db as dbmod
@@ -76,3 +79,70 @@ def test_date_ui_has_server_date_picker_lifecycle_notice_and_mobile_constraints(
     for text in ("재료 업무일", "카드 생성시각", "원문 발표시각", "카드 버전", "무효", "기준일", "type=\"date\"", "fresh quote/tick", "동결 조건 재검증", "overflow-x:hidden"):
         assert text in html
     assert "cards/summary'+q" in html and "cards/missing'+q" in html
+
+
+def test_previous_business_day_is_timezone_independent():
+    """The browser's local zone must not move a KST calendar date back two days."""
+    from kr_stock_autotrader.ui import APP_HTML
+    helper = re.search(r"const previousBusinessDate=(day=>\{.*?\});", APP_HTML).group(1)
+    for zone in ("Pacific/Kiritimati", "Asia/Seoul", "America/Los_Angeles"):
+        output = subprocess.check_output(
+            ["node", "-e", f"console.log(({helper})('2026-09-01'))"],
+            text=True, env={**os.environ, "TZ": zone},
+        ).strip()
+        assert output == "2026-08-31"
+
+
+def test_missing_cards_expose_only_safe_evidence_fields(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "safe-missing.db"))
+    db = dbmod.connect()
+    missing, _ = _seed(db, "LEAK", "2026-08-31T10:00:00+09:00", make_card=False)
+    db.execute("UPDATE material_evidence SET title=?, snapshot=?, audit_json=?, created_by=?, dedupe_key=? WHERE id=?", (
+        "safe title", '{"secret":"LEAK"}', '["LEAK"]', "LEAK", "LEAK", missing["id"]
+    ))
+    db.commit(); db.close()
+    from app import app
+    anonymous = TestClient(app)
+    assert anonymous.get("/api/cards/missing?date=2026-08-31").status_code == 401
+    client = TestClient(app)
+    assert client.post("/api/signup", json={"email": "safe-missing@test.com", "password": "long-password"}).status_code == 200
+    response = client.get("/api/cards/missing?date=2026-08-31")
+    assert response.status_code == 200
+    item = response.json()[0]
+    assert set(item) <= {"id", "symbol", "name", "kind", "title", "summary", "source", "source_url", "announcement_at", "collected_at", "known_at", "status", "version", "snapshot_available"}
+    assert "LEAK" not in response.text
+    assert not {"snapshot", "audit_json", "created_by", "dedupe_key", "newness", "updated_at", "invalidated_at"} & set(item)
+
+
+def test_summary_uses_latest_active_lineage_card_when_newer_version_invalidated(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "active-lineage.db"))
+    db = dbmod.connect()
+    evidence, v1 = _seed(db, "lineage", "2026-08-31T10:00:00+09:00")
+    v2 = save_card(db, card(evidence["id"], v1["filter_id"]))
+    db.execute("UPDATE decision_cards SET invalidated_at=NULL WHERE id=?", (v1["id"],))
+    db.execute("UPDATE decision_cards SET invalidated_at=? WHERE id=?", ("2026-08-31T11:00:00+09:00", v2["id"]))
+    db.execute("INSERT INTO users(email,password) VALUES(?,?)", ("active-lineage@test.com", "p"))
+    db.commit(); db.close()
+    from app import app
+    client = TestClient(app)
+    client.cookies.set("session", __import__("kr_stock_autotrader.auth", fromlist=["issue_session"]).issue_session(1))
+    assert client.post(f"/api/cards/{v1['id']}/decisions", json={"decision": "hold"}).status_code == 200
+    summary = client.get("/api/cards/summary?date=2026-08-31").json()
+    assert summary["카드 생성"] == 1 and summary["보류"] == 1
+    assert [item["id"] for item in client.get("/api/cards?date=2026-08-31").json()] == [v2["id"], v1["id"]]
+
+
+def test_historical_summary_uses_only_selected_business_day_scheduler_runs(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "scheduler-day.db"))
+    db = dbmod.connect()
+    for day, status in (("2026-08-31", "success"), ("2026-09-01", "failed")):
+        for kind, hour in (("research", "0700"), ("card", "0800")):
+            db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,finished_at,detail) VALUES(?,?,?,?,?,?)", (
+                f"{kind}-{day}-{hour}-kst", kind, status, f"{day}T{hour[:2]}:00:00+09:00", f"{day}T{hour[:2]}:01:00+09:00", '{"count": 3}'
+            ))
+    db.execute("INSERT INTO users(email,password) VALUES(?,?)", ("scheduler-day@test.com", "p")); db.commit(); db.close()
+    from app import app
+    client = TestClient(app); client.cookies.set("session", __import__("kr_stock_autotrader.auth", fromlist=["issue_session"]).issue_session(1))
+    historical = client.get("/api/cards/summary?date=2026-08-31").json()
+    assert historical["최근 실행"]["07:00"]["상태"] == "success"
+    assert historical["최근 실행"]["08:00"]["상태"] == "success"

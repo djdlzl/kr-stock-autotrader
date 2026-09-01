@@ -390,7 +390,7 @@ def user_cards_summary(request: Request, date: str | None = None):
         evidence_count=db.execute("SELECT count(*) n FROM material_evidence WHERE substr(known_at,1,10)=?",(day,)).fetchone()["n"]
         active_cards = """SELECT c.* FROM decision_cards c JOIN material_evidence e ON e.id=c.evidence_id
           WHERE substr(e.known_at,1,10)=? AND c.invalidated_at IS NULL
-          AND NOT EXISTS (SELECT 1 FROM decision_cards newer WHERE newer.lineage_key=c.lineage_key AND newer.version>c.version)"""
+          AND NOT EXISTS (SELECT 1 FROM decision_cards newer WHERE newer.lineage_key=c.lineage_key AND newer.version>c.version AND newer.invalidated_at IS NULL)"""
         cards=db.execute("SELECT verdict,count(*) n FROM (" + active_cards + ") GROUP BY verdict",(day,)).fetchall()
         by_verdict={x["verdict"]:x["n"] for x in cards}
         filters=db.execute("""SELECT f.verdict,count(*) n FROM deterministic_filter_results f
@@ -406,7 +406,9 @@ def user_cards_summary(request: Request, date: str | None = None):
           AND (e.status='error' OR (e.status!='invalidated' AND NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id)))""", (day,)).fetchone()["n"]
         scheduler=[]
         for kind, label in (("research","리서치"),("card","카드")):
-            run=db.execute("SELECT status,started_at,finished_at,detail FROM scheduler_runs WHERE kind=? ORDER BY id DESC LIMIT 1",(kind,)).fetchone()
+            run=db.execute("""SELECT status,started_at,finished_at,detail FROM scheduler_runs
+              WHERE kind=? AND (run_key LIKE ? OR substr(started_at,1,10)=?)
+              ORDER BY id DESC LIMIT 1""",(kind,f"{kind}-{day}-%",day)).fetchone()
             import json
             detail=json.loads(run["detail"] or "{}") if run else {}
             scheduler.append({"종류":label,"상태":run["status"] if run else "미실행","건수":int(detail.get("count",0) or 0),"실패":bool(run and run["status"] in {"error","failed"}),"시각":(run["finished_at"] or run["started_at"]) if run else None})

@@ -10,6 +10,18 @@ Method: TDD + EDD — focused KST business-date/current-card/user-isolation cont
 - Compile: `.venv/bin/python -m compileall -q kr_stock_autotrader app.py` → passed.
 - Whitespace: `git diff --check` → passed.
 
+## Independent-review rework (B1–B3, N1)
+
+- Method: TDD + EDD — timezone-pure UI calendar helper and hostile/TestClient API + SQLite lifecycle fixtures.
+- RED: `.venv/bin/pytest -q tests/test_date_lifecycle.py` → `4 failed, 2 passed` before repairs (timezone helper absent, raw evidence fields exposed, invalidated newer card suppressed active prior version, and historical summary showed newer-day scheduler status).
+- GREEN: `.venv/bin/pytest -q tests/test_date_lifecycle.py` → `6 passed, 1 warning`; the Node regression runs the browser helper under `Pacific/Kiritimati`, `Asia/Seoul`, and `America/Los_Angeles` and returns `2026-08-31` in each.
+- Full regression: `.venv/bin/pytest -q` → `66 passed, 1 warning` (the pre-existing Starlette TestClient deprecation warning only).
+- Compile: `python -m compileall -q app.py kr_stock_autotrader` → passed; `git diff --check` → passed.
+- B1: Previous-day navigation now applies UTC calendar-component arithmetic to `YYYY-MM-DD`, never mixing a KST-offset parse with local `setDate`/ISO serialization.
+- B2: `/api/cards/missing` projects a safe evidence read model only; its hostile sentinel test confirms no snapshot/raw/audit/dedupe/creator/internal fields leak and anonymous access remains 401.
+- B3: The current-card anti-join now ignores newer invalidated versions, so the latest active card and its current-user decision are counted while history remains append-only.
+- N1: Scheduler status in a selected historical overview is filtered by the selected run-key business day (with selected KST started-day fallback), never a global latest run.
+
 ## Changed files
 
 - `kr_stock_autotrader/api.py`
