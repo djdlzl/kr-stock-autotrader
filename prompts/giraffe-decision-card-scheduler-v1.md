@@ -22,11 +22,13 @@
 
 - KST 실행일 `YYYY-MM-DD`와 `run_key=card-YYYY-MM-DD-0800-kst`를 만든다.
 - `python -m kr_stock_autotrader.cli scheduler-start "$run_key" card`를 호출한다.
-- `today-evidence --date YYYY-MM-DD`와 `pending-cards`를 조회한다.
-- 처리 대상은 당일 evidence 중 `status != invalidated`이고 현재 evidence version에 카드가 없는 항목이다.
-- 과거 날짜의 미처리 evidence는 자동으로 섞지 않는다. 별도 복구 run에서만 처리한다.
+- `today-evidence --date YYYY-MM-DD`와 `pending-cards`를 모두 조회한다.
+- `today-evidence`는 원문 공개일(`known_at`) 기준 교차검증용이다. 07:00 수집 작업은 전날 장후 공개 재료도 오늘 저장할 수 있으므로 이것만으로 처리 대상을 정하지 않는다.
+- 처리 대상은 `pending-cards` 중 `collected_at`의 KST 날짜가 실행일과 같고, `status != invalidated`이며 현재 evidence version에 카드가 없는 항목이다.
+- 즉, 오늘 07:00 실행에서 새로 저장·확인된 재료는 원문 공개일이 전날이어도 반드시 처리한다.
+- `collected_at`이 과거 날짜인 미처리 evidence는 자동으로 섞지 않는다. 별도 복구 run에서만 처리한다.
 - 같은 evidence version, filter lineage, prompt version/hash로 이미 카드가 있으면 재생성하지 않는다.
-- evidence가 0건이면 API readback 정상 여부를 확인한 뒤 `done`, count=0으로 종료한다.
+- 처리 대상이 0건이면 두 API readback 정상 여부를 확인한 뒤 `done`, count=0으로 종료한다.
 
 ## 시간·known-at 규칙
 
