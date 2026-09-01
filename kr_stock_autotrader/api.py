@@ -3,6 +3,7 @@ import sqlite3
 import re
 import threading
 import time as monotonic_time
+from contextlib import contextmanager
 from datetime import datetime, time, timedelta
 from typing import Literal
 
@@ -108,13 +109,68 @@ class LiveDryRunIn(BaseModel):
     dry_run_key: str = Field(pattern=r"^[A-Za-z0-9_-]{8,64}$")
 
 
-# Single-process contract: key locks serialize receipt check → quote → receipt commit.
-_dry_run_locks: dict[tuple[int, int, str], threading.Lock] = {}
+# Single-process contract: keyed locks serialize work without retaining every seen key.
+# Registry entries count their holder and queued waiters, and disappear after the last exit.
+class _LockSlot:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.references = 0
+
+
+_dry_run_locks: dict[tuple[int, int, str], _LockSlot] = {}
 _dry_run_locks_guard = threading.Lock()
+_quote_locks: dict[tuple[int, str], _LockSlot] = {}
+_quote_locks_guard = threading.Lock()
 _quote_cache: dict[tuple[int, str], tuple[float, dict]] = {}
 _quote_cache_lock = threading.Lock()
 QUOTE_CACHE_TTL_SECONDS = 2.0
+QUOTE_CACHE_MAX_ENTRIES = 256
 _default_kis_client: KISReadOnlyClient | None = None
+
+
+@contextmanager
+def _registered_lock(registry: dict, guard: threading.Lock, identity: tuple):
+    with guard:
+        slot = registry.get(identity)
+        if slot is None:
+            slot = _LockSlot()
+            registry[identity] = slot
+        slot.references += 1
+    acquired = False
+    try:
+        slot.lock.acquire()
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            slot.lock.release()
+        with guard:
+            slot.references -= 1
+            if slot.references == 0 and registry.get(identity) is slot:
+                del registry[identity]
+
+
+def _purge_quote_cache(now: float) -> None:
+    for key, (cached_at, _) in tuple(_quote_cache.items()):
+        if now - cached_at > QUOTE_CACHE_TTL_SECONDS:
+            del _quote_cache[key]
+
+
+def _cache_get(key: tuple[int, str], now: float) -> dict | None:
+    with _quote_cache_lock:
+        _purge_quote_cache(now)
+        cached = _quote_cache.get(key)
+        return dict(cached[1]) if cached else None
+
+
+def _cache_success(key: tuple[int, str], quote: dict) -> dict:
+    safe = {name: quote.get(name) for name in ("symbol", "price", "volume", "quote_known_at", "retrieved_at", "timestamp_source", "source", "environment", "status", "market_status", "halt_status", "management_status") if name in quote}
+    with _quote_cache_lock:
+        _purge_quote_cache(monotonic_time.monotonic())
+        while len(_quote_cache) >= QUOTE_CACHE_MAX_ENTRIES:
+            del _quote_cache[next(iter(_quote_cache))]
+        _quote_cache[key] = (monotonic_time.monotonic(), safe)
+    return dict(safe)
 
 def _quote_provider():
     global _default_kis_client
@@ -128,24 +184,23 @@ def _quote_provider():
 def _cached_kis_quote(symbol: str) -> dict:
     provider = _quote_provider()
     key = (id(getattr(provider, "__self__", provider)), symbol)
-    current = monotonic_time.monotonic()
-    with _quote_cache_lock:
-        cached = _quote_cache.get(key)
-        if cached and current - cached[0] <= QUOTE_CACHE_TTL_SECONDS:
-            return dict(cached[1])
-    quote = provider(symbol)
-    # Cache only a safe successful projection, never raw provider output or failure.
-    if quote.get("status") == "ok":
-        safe = {name: quote.get(name) for name in ("symbol", "price", "volume", "quote_known_at", "retrieved_at", "timestamp_source", "source", "environment", "status", "market_status", "halt_status", "management_status") if name in quote}
-        with _quote_cache_lock:
-            _quote_cache[key] = (monotonic_time.monotonic(), safe)
-        return dict(safe)
-    return quote
+    cached = _cache_get(key, monotonic_time.monotonic())
+    if cached is not None:
+        return cached
+    # The provider runs outside cache metadata guards.  The keyed lock makes a
+    # simultaneous miss single-flight, then every waiter consumes one projection.
+    with _registered_lock(_quote_locks, _quote_locks_guard, key):
+        cached = _cache_get(key, monotonic_time.monotonic())
+        if cached is not None:
+            return cached
+        quote = provider(symbol)
+        if quote.get("status") == "ok":
+            return _cache_success(key, quote)
+        return quote
 
-def _dry_run_lock(plan_id: int, user_id: int, key: str) -> threading.Lock:
-    identity = (plan_id, user_id, key)
-    with _dry_run_locks_guard:
-        return _dry_run_locks.setdefault(identity, threading.Lock())
+
+def _dry_run_lock(plan_id: int, user_id: int, key: str):
+    return _registered_lock(_dry_run_locks, _dry_run_locks_guard, (plan_id, user_id, key))
 
 
 app = FastAPI(title="Giraffe — Paper Only")

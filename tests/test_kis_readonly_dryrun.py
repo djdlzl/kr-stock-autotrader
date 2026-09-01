@@ -1,4 +1,6 @@
 import os
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import pytest
@@ -82,3 +84,91 @@ def test_successful_quote_cache_is_bounded_and_safe(monkeypatch):
     assert 'raw_secret' not in api._cached_kis_quote('005930')
     assert api.LiveDryRunIn(dry_run_key='safe_key-1').dry_run_key == 'safe_key-1'
     with pytest.raises(Exception): api.LiveDryRunIn(dry_run_key='bad key')
+
+
+def test_quote_single_flight_and_cache_and_lock_registries_are_bounded(monkeypatch):
+    from kr_stock_autotrader import api
+    calls = []
+
+    def provider(symbol):
+        calls.append(symbol)
+        return {**quote(symbol=symbol), 'raw_secret': 'must-not-cache'}
+
+    monkeypatch.setattr(api.app.state, 'kis_quote_provider', provider, raising=False)
+    api._quote_cache.clear()
+    api._quote_locks.clear()
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(api._cached_kis_quote, ['005930'] * 3))
+    assert calls == ['005930']
+    assert results == [results[0]] * 3
+    assert 'raw_secret' not in results[0]
+    assert api._quote_locks == {}
+
+    for number in range(api.QUOTE_CACHE_MAX_ENTRIES + 100):
+        api._cached_kis_quote(f'{number:06d}')
+    assert len(api._quote_cache) <= api.QUOTE_CACHE_MAX_ENTRIES
+    assert api._quote_locks == {}
+
+    api._dry_run_locks.clear()
+    def use_unique_lock(number):
+        with api._dry_run_lock(number, 1, f'key-{number:03d}'):
+            pass
+    with ThreadPoolExecutor(max_workers=24) as pool:
+        list(pool.map(use_unique_lock, range(400)))
+    assert api._dry_run_locks == {}
+
+
+def test_readiness_requires_structurally_valid_presence_only_aliases(monkeypatch):
+    for name in ('KIS_ACCOUNT_NO', 'R_ACCOUNT_NUMBER', 'KIS_ACCOUNT_PRODUCT_CODE', 'LS_ACCOUNT'):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv('LS_ACCOUNT', '12345678')
+    monkeypatch.setenv('KIS_ACCOUNT_PRODUCT_CODE', '01')
+    assert KISReadOnlyClient.readiness()['account_readiness'] == 'blocked_missing_account_env'
+    for account in ('not-an-account', '1234567', '123456789'):
+        monkeypatch.setenv('KIS_ACCOUNT_NO', account)
+        assert KISReadOnlyClient.readiness()['account_readiness'] == 'blocked_missing_account_env'
+    monkeypatch.setenv('KIS_ACCOUNT_NO', '12345678')
+    for product in ('x', '001', ' 1'):
+        monkeypatch.setenv('KIS_ACCOUNT_PRODUCT_CODE', product)
+        assert KISReadOnlyClient.readiness()['account_readiness'] == 'blocked_missing_account_env'
+    monkeypatch.setenv('KIS_ACCOUNT_PRODUCT_CODE', '01')
+    assert KISReadOnlyClient.readiness()['account_readiness'] == 'ready'
+
+
+def test_concurrent_dry_run_has_one_provider_call_and_one_receipt(monkeypatch):
+    from fastapi.testclient import TestClient
+    from kr_stock_autotrader import api, db as dbmod
+    from kr_stock_autotrader.auth import issue_session
+    from tests.test_decision_card_invariants import make_plan
+
+    path = tempfile.mktemp(suffix='.db')
+    monkeypatch.setattr(dbmod, 'DATABASE_PATH', path)
+    db = dbmod.connect()
+    _, plan_id = make_plan(db)
+    db.close()
+    calls = []
+
+    def provider(symbol):
+        calls.append(symbol)
+        return {**quote(symbol=symbol), 'raw_secret': 'must-not-persist'}
+
+    monkeypatch.setattr(api.app.state, 'kis_quote_provider', provider, raising=False)
+    api._quote_cache.clear()
+    api._dry_run_locks.clear()
+    key = 'same-key-123'
+
+    def request_once(_):
+        client = TestClient(api.app)
+        client.cookies.set('session', issue_session(1))
+        return client.post(f'/api/order-plans/{plan_id}/live-dry-run', json={'dry_run_key': key})
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        responses = list(pool.map(request_once, range(3)))
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    assert calls == ['005930']
+    check = dbmod.connect()
+    try:
+        assert check.execute('SELECT count(*) AS total FROM live_dry_run_receipts').fetchone()['total'] == 1
+    finally:
+        check.close()
+    assert api._dry_run_locks == {}

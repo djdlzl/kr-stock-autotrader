@@ -60,10 +60,15 @@ class KISReadOnlyClient:
 
     @staticmethod
     def readiness() -> dict:
-        account = bool(os.getenv("KIS_ACCOUNT_NO") or os.getenv("R_ACCOUNT_NUMBER")) and bool(os.getenv("KIS_ACCOUNT_PRODUCT_CODE"))
+        # Presence-only signals still require account/product-shaped values; no
+        # account endpoint is called and LS_ACCOUNT is deliberately ignored.
+        account = os.getenv("KIS_ACCOUNT_NO") or os.getenv("R_ACCOUNT_NUMBER")
+        product = os.getenv("KIS_ACCOUNT_PRODUCT_CODE")
+        account_ready = bool(re.fullmatch(r"\d{8}", account or ""))
+        product_ready = bool(re.fullmatch(r"\d{2}", product or ""))
         key_present, secret_present = bool(os.getenv("KIS_APP_KEY")), bool(os.getenv("KIS_APP_SECRET"))
         return {"app_credentials": "present" if key_present and secret_present else "missing", "app_key_present": key_present, "app_secret_present": secret_present,
-                "account_readiness": "ready" if account else "blocked_missing_account_env", "live_trading": False, "broker_mode": "read_only_dry_run", "order_endpoint_compiled": False,
+                "account_readiness": "ready" if account_ready and product_ready else "blocked_missing_account_env", "live_trading": False, "broker_mode": "read_only_dry_run", "order_endpoint_compiled": False,
                 "network_order_calls": 0, "environment": "production"}
 
     def _request(self, method: str, path: str, **kwargs):

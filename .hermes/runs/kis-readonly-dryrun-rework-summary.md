@@ -13,11 +13,13 @@ Critically, that current-price response has no `stck_cntg_hour` and no current b
 - Host is literal-pinned to `https://openapi.koreainvestment.com:9443` (only a trailing slash normalizes); injected transports cannot change it.
 - OAuth and quote require successful HTTP status. Tokens and bounded expiries remain process-memory-only; a recognized expired-auth quote/401 clears the token and permits exactly one OAuth+quote retry.
 - Safe quote output derives `quote_known_at` at network retrieval completion with `timestamp_source=network_retrieved_at`, never an exchange trade-time claim. Dry-run requires that source, freshness, market session/calendar, and safe optional status checks.
-- Receipt lookup occurs before provider/OAuth work. Single-process key locks serialize concurrent same-key work; duplicate insert conflict rereads the receipt. Successful safe quotes use a two-second local cache; failures are not cached.
-- `dry_run_key` is restricted to `[A-Za-z0-9_-]{8,64}`.
+- Receipt lookup occurs before provider/OAuth work. Ref-counted keyed locks serialize concurrent same-key work, include queued waiters, and remove their registry entry after the last exit; duplicate insert conflict rereads the receipt. Successful safe quotes use a two-second per-symbol single-flight cache; stale entries are purged, insertion order is deterministically capped at 256 entries, and failures are not cached.
+- Account readiness is presence-only but structural: canonical `KIS_ACCOUNT_NO` or legacy `R_ACCOUNT_NUMBER` must be exactly 8 digits and `KIS_ACCOUNT_PRODUCT_CODE` exactly 2 digits; `LS_ACCOUNT` remains ignored and no account endpoint is called.
+- `dry_run_key` is restricted to `[A-Za-z0-9_-]{8,64}`. Receipts are durable SQLite audit records; the UI cache/cooldown is not authorization for a network burst, and no new durable-rate infrastructure was added.
 
 ## Verification
 
-- Focused KIS tests: `4 passed`.
-- Full pytest: `80 passed`.
+- Focused KIS tests: `8 passed` (including concurrent same-symbol/same-key and hundreds-of-keys cleanup regressions).
+- Full pytest: `84 passed`.
+- `python -m compileall -q kr_stock_autotrader tests`: passed.
 - No live probe, deploy, push, merge, account call, allocation, or order was performed by this implementation lane.
