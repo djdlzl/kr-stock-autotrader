@@ -155,10 +155,24 @@ def user_card_view(db, ident, user_id):
     result["user_state"]={"decision":dict(decision) if decision else None,"order_plan":plan_view,"draft":({**dict(draft),"snapshot":json.loads(draft["snapshot_json"])} if draft else None)}
     return result
 
-def list_cards(db, missing=False):
+def list_cards(db, missing=False, date=None):
+    """History detail is append-only; date always means evidence.known_at KST day."""
+    params = []
+    date_clause = ""
+    if date:
+        date_clause = " AND substr(known_at,1,10)=?"
+        params.append(date)
     if missing:
-        return [evidence_detail(db,x["id"]) for x in db.execute("SELECT id FROM material_evidence WHERE status != 'invalidated' AND NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.evidence_id=material_evidence.id) ORDER BY id DESC")]
-    return [card_detail(db,x["id"]) for x in db.execute("SELECT id FROM decision_cards ORDER BY id DESC")]
+        query = """SELECT id FROM material_evidence
+          WHERE status != 'invalidated' AND NOT EXISTS (
+            SELECT 1 FROM decision_cards c WHERE c.evidence_id=material_evidence.id
+          )""" + date_clause + " ORDER BY id DESC"
+        return [evidence_detail(db, item["id"]) for item in db.execute(query, params)]
+    query = """SELECT c.id FROM decision_cards c
+      JOIN material_evidence e ON e.id=c.evidence_id WHERE 1=1"""
+    if date:
+        query += " AND substr(e.known_at,1,10)=?"
+    return [card_detail(db, item["id"]) for item in db.execute(query + " ORDER BY c.id DESC", params)]
 def _positive(value): return isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and value>0
 def _valid_plan(card):
     x=card["card"]; window=x.get("window") or {}

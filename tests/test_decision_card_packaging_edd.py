@@ -111,7 +111,7 @@ def test_full_api_db_paper_lifecycle_edd(monkeypatch, tmp_path):
 
     assert client.post("/api/signup", json={"email": "edd@example.test", "password": "password-for-edd"}).status_code == 200
     assert "결정 카드 운영" in client.get("/app").text
-    visible = client.get("/api/cards")
+    visible = client.get("/api/cards?date=2026-08-31")
     assert {row["id"] for row in visible.json()} >= {primary["id"], fail_card["id"]}
     assert client.get(f"/api/cards/{primary['id']}").json()["prompt_hash"] == prompt_hash()
     assert client.post(f"/api/cards/{fail_card['id']}/order-plan-draft", json={}).status_code == 409

@@ -1,5 +1,7 @@
 """FastAPI boundary for Giraffe's paper-only trading planner."""
 import sqlite3
+import re
+from datetime import datetime, time, timedelta
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -356,17 +358,29 @@ def internal_card_detail(card_id: int, _: None = Depends(require_internal_api_ke
     try:return card_detail(db,card_id)
     finally:db.close()
 
-@app.get('/api/cards/summary')
+def _business_date(date: str | None) -> str:
+    """Validate the only accepted user-facing day form (KST evidence day)."""
+    if date is None:
+        return now_kst().date().isoformat()
+    if not isinstance(date, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        raise HTTPException(422, "기준일은 YYYY-MM-DD 형식입니다")
+    try:
+        return datetime.strptime(date, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        raise HTTPException(422, "기준일은 YYYY-MM-DD 형식입니다")
+
+
+@ app.get('/api/cards/summary')
 def user_cards_summary(request: Request, date: str | None = None):
-    """Current-user, date-scoped dashboard aggregate; intentionally no raw inputs."""
-    from datetime import datetime, time, timedelta
+    """Current-user metrics, grouped by material_evidence.known_at KST day.
+
+    Dashboard card/filter counts use one current item: latest active card per
+    lineage and latest filter per active evidence. Detail endpoints retain all
+    append-only versions.
+    """
     uid = current_user(request)
     current = now_kst()
-    try:
-        requested = datetime.strptime(date, "%Y-%m-%d").date() if date else current.date()
-    except (TypeError, ValueError):
-        raise HTTPException(422, "기준일은 YYYY-MM-DD 형식입니다")
-    day = requested.isoformat()
+    day = _business_date(date)
     def next_run(hour):
         candidate = datetime.combine(current.date(), time(hour), tzinfo=current.tzinfo)
         if candidate <= current: candidate += timedelta(days=1)
@@ -374,48 +388,45 @@ def user_cards_summary(request: Request, date: str | None = None):
     db=connect()
     try:
         evidence_count=db.execute("SELECT count(*) n FROM material_evidence WHERE substr(known_at,1,10)=?",(day,)).fetchone()["n"]
-        pass_count=db.execute("SELECT count(*) n FROM deterministic_filter_results WHERE substr(as_of,1,10)=? AND verdict='PASS'",(day,)).fetchone()["n"]
-        cards=db.execute("SELECT verdict,count(*) n FROM decision_cards WHERE substr(generated_at,1,10)=? GROUP BY verdict",(day,)).fetchall()
+        active_cards = """SELECT c.* FROM decision_cards c JOIN material_evidence e ON e.id=c.evidence_id
+          WHERE substr(e.known_at,1,10)=? AND c.invalidated_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM decision_cards newer WHERE newer.lineage_key=c.lineage_key AND newer.version>c.version)"""
+        cards=db.execute("SELECT verdict,count(*) n FROM (" + active_cards + ") GROUP BY verdict",(day,)).fetchall()
         by_verdict={x["verdict"]:x["n"] for x in cards}
-        decisions=db.execute("SELECT decision,count(*) n FROM user_decisions WHERE user_id=? AND substr(decided_at,1,10)=? GROUP BY decision",(uid,day)).fetchall()
+        filters=db.execute("""SELECT f.verdict,count(*) n FROM deterministic_filter_results f
+          JOIN material_evidence e ON e.id=f.evidence_id WHERE substr(e.known_at,1,10)=?
+          AND e.status != 'invalidated' AND f.id=(SELECT MAX(f2.id) FROM deterministic_filter_results f2 WHERE f2.evidence_id=f.evidence_id)
+          GROUP BY f.verdict""",(day,)).fetchall()
+        by_filter={x["verdict"]:x["n"] for x in filters}
+        decisions=db.execute("SELECT d.decision,count(*) n FROM user_decisions d JOIN (" + active_cards + ") c ON c.id=d.card_id WHERE d.user_id=? GROUP BY d.decision",(day,uid)).fetchall()
         by_decision={x["decision"]:x["n"] for x in decisions}
         missing=db.execute("SELECT count(*) n FROM material_evidence e WHERE substr(e.known_at,1,10)=? AND e.status!='invalidated' AND NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id)",(day,)).fetchone()["n"]
-        # Operationally unresolved evidence is a union: an explicit collection
-        # error or an active evidence item with no generated card. Keep it as
-        # one evidence-ID denominator so an error without a card is not doubled.
-        failures=db.execute("""SELECT count(*) n FROM material_evidence e
-            WHERE substr(e.known_at,1,10)=? AND (
-              e.status='error' OR (e.status!='invalidated' AND NOT EXISTS
-                (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id))
-            )""",(day,)).fetchone()["n"]
+        statuses={name: db.execute("SELECT count(*) n FROM material_evidence WHERE substr(known_at,1,10)=? AND status=?",(day,name)).fetchone()["n"] for name in ("error","invalidated","decision_pending")}
+        failures=db.execute("""SELECT count(*) n FROM material_evidence e WHERE substr(e.known_at,1,10)=?
+          AND (e.status='error' OR (e.status!='invalidated' AND NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id)))""", (day,)).fetchone()["n"]
         scheduler=[]
         for kind, label in (("research","리서치"),("card","카드")):
             run=db.execute("SELECT status,started_at,finished_at,detail FROM scheduler_runs WHERE kind=? ORDER BY id DESC LIMIT 1",(kind,)).fetchone()
             import json
             detail=json.loads(run["detail"] or "{}") if run else {}
             scheduler.append({"종류":label,"상태":run["status"] if run else "미실행","건수":int(detail.get("count",0) or 0),"실패":bool(run and run["status"] in {"error","failed"}),"시각":(run["finished_at"] or run["started_at"]) if run else None})
-        return {"기준일":day,"전체 근거":evidence_count,"필터 PASS":pass_count,"카드 생성":sum(by_verdict.values()),"카드 미생성":missing,"판단 보류":by_verdict.get("판단 보류",0),"매수 검토 가능":by_verdict.get("매수 검토 가능",0),"관찰":by_verdict.get("관찰",0),"제외":by_verdict.get("제외",0),"승인":by_decision.get("approve",0),"보류":by_decision.get("hold",0),"거절":by_decision.get("reject",0),"실패·근거 부족":failures,"최근 실행":{"07:00":scheduler[0],"08:00":scheduler[1]},"스케줄러":scheduler,"다음 실행":{"07:00 KST":next_run(7),"08:00 KST":next_run(8)}}
+        return {"기준일":day,"전체 근거":evidence_count,"필터 PASS":by_filter.get("PASS",0),"필터 FAIL":by_filter.get("FAIL",0),"카드 생성":sum(by_verdict.values()),"카드 미생성":missing,"판단 보류":by_verdict.get("판단 보류",0),"매수 검토 가능":by_verdict.get("매수 검토 가능",0),"관찰":by_verdict.get("관찰",0),"제외":by_verdict.get("제외",0),"승인":by_decision.get("approve",0),"보류":by_decision.get("hold",0),"거절":by_decision.get("reject",0),"오류":statuses["error"],"무효화":statuses["invalidated"],"판단 대기":statuses["decision_pending"],"실패·근거 부족":failures,"최근 실행":{"07:00":scheduler[0],"08:00":scheduler[1]},"스케줄러":scheduler,"다음 실행":{"07:00 KST":next_run(7),"08:00 KST":next_run(8)}}
     finally: db.close()
 
 
 @app.get('/api/cards')
-def user_cards(request: Request):
-    uid=current_user(request); db=connect()
-    try:return [user_card_view(db, item["id"], uid) for item in db.execute("SELECT id FROM decision_cards ORDER BY id DESC")]
+def user_cards(request: Request, date: str | None = None):
+    uid=current_user(request); day=_business_date(date); db=connect()
+    try:return [user_card_view(db, item["id"], uid) for item in list_cards(db, date=day)]
     finally:db.close()
+
 
 @app.get('/api/cards/missing')
 def user_missing_cards(request: Request, date: str | None = None):
-    """Authenticated evidence rows for the 카드 미생성 tab."""
-    current_user(request)
-    if date:
-        try: __import__('datetime').datetime.strptime(date, "%Y-%m-%d")
-        except ValueError: raise HTTPException(422, "기준일은 YYYY-MM-DD 형식입니다")
-    db=connect()
-    try:
-        rows=list_cards(db, missing=True)
-        return [x for x in rows if not date or x.get("known_at", "")[:10] == date]
-    finally: db.close()
+    """Authenticated, server-filtered actionable evidence rows only."""
+    current_user(request); day=_business_date(date); db=connect()
+    try:return list_cards(db, missing=True, date=day)
+    finally:db.close()
 
 @app.get('/api/cards/{card_id}')
 def user_card(card_id: int, request: Request):
