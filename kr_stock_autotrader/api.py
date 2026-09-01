@@ -157,11 +157,24 @@ def _purge_quote_cache(now: float) -> None:
             del _quote_cache[key]
 
 
-def _cache_get(key: tuple[int, str], now: float) -> dict | None:
+def _cache_get_validated(key: tuple[int, str], symbol: str, now: float) -> dict | None:
+    """Return a safe cached quote, evicting a malformed hit while holding the lock.
+
+    A non-``None`` result always represents a cache hit: valid hits project to
+    ``ok`` and tampered hits project to the closed unavailable schema.  The
+    latter must not fall through to the provider in this request.
+    """
     with _quote_cache_lock:
         _purge_quote_cache(now)
         cached = _quote_cache.get(key)
-        return dict(cached[1]) if cached else None
+        if cached is None:
+            return None
+        safe = _safe_kis_quote(symbol, dict(cached[1]))
+        if safe["status"] != "ok":
+            # The entry cannot be replaced between validation and this delete:
+            # both operations are protected by the same cache lock.
+            del _quote_cache[key]
+        return safe
 
 
 _KIS_OPTIONAL_STATUS_FIELDS = ("market_status", "halt_status", "management_status")
@@ -268,15 +281,15 @@ def _quote_provider():
 def _cached_kis_quote(symbol: str) -> dict:
     provider = _quote_provider()
     key = (id(getattr(provider, "__self__", provider)), symbol)
-    cached = _cache_get(key, monotonic_time.monotonic())
+    cached = _cache_get_validated(key, symbol, monotonic_time.monotonic())
     if cached is not None:
-        return _safe_kis_quote(symbol, cached)
+        return cached
     # The provider runs outside cache metadata guards.  The keyed lock makes a
     # simultaneous miss single-flight, then every waiter consumes one projection.
     with _registered_lock(_quote_locks, _quote_locks_guard, key):
-        cached = _cache_get(key, monotonic_time.monotonic())
+        cached = _cache_get_validated(key, symbol, monotonic_time.monotonic())
         if cached is not None:
-            return _safe_kis_quote(symbol, cached)
+            return cached
         try:
             quote = _safe_kis_quote(symbol, provider(symbol))
         except Exception:

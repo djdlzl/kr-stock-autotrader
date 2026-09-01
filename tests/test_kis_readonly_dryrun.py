@@ -171,10 +171,18 @@ def test_malformed_success_is_closed_typed_unavailable_not_cached_or_leaked(monk
     assert secret not in str(quote_response.json()) + str(dry_response.json()) + serialized_db + caplog.text
 
 
-def test_success_projection_normalizes_numbers_omits_statuses_and_revalidates_cache(monkeypatch):
+@pytest.mark.parametrize("tamper", [
+    {"price": {"nested": "KIS-TYPED-PROJECTION-SECRET"}},
+    {"price": -1},
+    {"retrieved_at": "2099-01-01T10:00:00+09:00"},
+    {"status": "unavailable"},
+    {"symbol": "000001"},
+])
+def test_tampered_cache_hit_is_evicted_without_provider_fallback(monkeypatch, tamper):
     from kr_stock_autotrader import api
     monkeypatch.setattr(api, "now_kst", lambda: NOW)
     api._quote_cache.clear()
+    api._quote_locks.clear()
     calls = []
 
     def provider(symbol):
@@ -186,9 +194,15 @@ def test_success_projection_normalizes_numbers_omits_statuses_and_revalidates_ca
     assert result["status"] == "ok" and result["price"] == 70000.0 and result["volume"] == 1234.0
     assert not {"market_status", "halt_status", "management_status"} & set(result)
     key = next(iter(api._quote_cache))
-    api._quote_cache[key] = (api.monotonic_time.monotonic(), {**result, "price": {"nested": "KIS-TYPED-PROJECTION-SECRET"}})
-    assert api._cached_kis_quote("005930")["status"] == "unavailable"
-    assert calls == ["005930"]
+    api._quote_cache[key] = (api.monotonic_time.monotonic(), {**result, **tamper})
+
+    unavailable = api._cached_kis_quote("005930")
+    assert unavailable["status"] == "unavailable"
+    assert "KIS-TYPED-PROJECTION-SECRET" not in str(unavailable)
+    assert api._quote_cache == {} and api._quote_locks == {} and calls == ["005930"]
+
+    assert api._cached_kis_quote("005930")["status"] == "ok"
+    assert calls == ["005930", "005930"] and len(api._quote_cache) == 1
 
 
 def test_quote_single_flight_and_cache_and_lock_registries_are_bounded(monkeypatch):
