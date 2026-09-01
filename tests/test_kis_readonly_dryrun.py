@@ -71,8 +71,42 @@ def test_readiness_legacy_account_alias_is_presence_only(monkeypatch):
     monkeypatch.setenv('R_ACCOUNT_NUMBER','12345678');monkeypatch.setenv('KIS_ACCOUNT_PRODUCT_CODE','01')
     assert KISReadOnlyClient.readiness()['account_readiness']=='ready'
 
+@pytest.mark.parametrize("timestamp_overrides", [
+    {"quote_known_at": "2099-01-01T10:00:00+09:00", "retrieved_at": "2099-01-01T10:00:00+09:00"},
+    {"quote_known_at": (NOW + timedelta(days=1)).isoformat(), "retrieved_at": (NOW + timedelta(days=1)).isoformat()},
+    {"quote_known_at": (NOW - timedelta(minutes=5, seconds=1)).isoformat(), "retrieved_at": (NOW - timedelta(minutes=5, seconds=1)).isoformat()},
+    {"quote_known_at": NOW.isoformat(), "retrieved_at": (NOW - timedelta(seconds=1)).isoformat()},
+])
+def test_timestamp_invalid_success_is_unavailable_and_never_cached(monkeypatch, timestamp_overrides):
+    from kr_stock_autotrader import api
+
+    calls = []
+    def provider(symbol):
+        calls.append(symbol)
+        return quote(symbol=symbol, **timestamp_overrides)
+
+    monkeypatch.setattr(api, "now_kst", lambda: NOW)
+    monkeypatch.setattr(api.app.state, "kis_quote_provider", provider, raising=False)
+    api._quote_cache.clear()
+    assert api._cached_kis_quote("005930")["status"] == "unavailable"
+    assert api._quote_cache == {}
+    assert api._cached_kis_quote("005930")["status"] == "unavailable"
+    assert calls == ["005930", "005930"]
+
+
+def test_current_coherent_quote_is_cached(monkeypatch):
+    from kr_stock_autotrader import api
+
+    monkeypatch.setattr(api, "now_kst", lambda: NOW)
+    monkeypatch.setattr(api.app.state, "kis_quote_provider", lambda symbol: quote(symbol=symbol), raising=False)
+    api._quote_cache.clear()
+    assert api._cached_kis_quote("005930")["status"] == "ok"
+    assert len(api._quote_cache) == 1
+
+
 def test_successful_quote_cache_is_bounded_and_safe(monkeypatch):
     from kr_stock_autotrader import api
+    monkeypatch.setattr(api, "now_kst", lambda: NOW)
     calls=[]
     def provider(symbol):
         calls.append(symbol)
@@ -139,6 +173,7 @@ def test_malformed_success_is_closed_typed_unavailable_not_cached_or_leaked(monk
 
 def test_success_projection_normalizes_numbers_omits_statuses_and_revalidates_cache(monkeypatch):
     from kr_stock_autotrader import api
+    monkeypatch.setattr(api, "now_kst", lambda: NOW)
     api._quote_cache.clear()
     calls = []
 
@@ -158,6 +193,7 @@ def test_success_projection_normalizes_numbers_omits_statuses_and_revalidates_ca
 
 def test_quote_single_flight_and_cache_and_lock_registries_are_bounded(monkeypatch):
     from kr_stock_autotrader import api
+    monkeypatch.setattr(api, "now_kst", lambda: NOW)
     calls = []
 
     def provider(symbol):

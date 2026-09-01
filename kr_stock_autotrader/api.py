@@ -178,6 +178,22 @@ def _valid_kis_retrieved_at(value: object) -> str | None:
     return value if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
 
 
+def _kis_timestamp_pair_is_current(retrieved_at: str, quote_known_at: str) -> bool:
+    """Accept only coherent, current network-observation timestamps.
+
+    The KIS client stamps both fields with the same retrieval-completion instant.
+    Re-parse the accepted text so alternate ISO offset formatting for that instant
+    remains valid while arbitrary provider times never reach the cache.
+    """
+    try:
+        retrieved = datetime.fromisoformat(retrieved_at.replace("Z", "+00:00"))
+        known = datetime.fromisoformat(quote_known_at.replace("Z", "+00:00"))
+        age = now_kst() - retrieved
+    except (TypeError, ValueError):
+        return False
+    return known == retrieved and timedelta(0) <= age <= timedelta(minutes=5)
+
+
 def _valid_kis_number(value: object, *, minimum: float) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -213,6 +229,7 @@ def _safe_kis_quote(symbol: str, outcome: object) -> dict:
         or price is None or price <= 0
         or volume is None
         or retrieved_at is None or quote_known_at is None
+        or not _kis_timestamp_pair_is_current(retrieved_at, quote_known_at)
         or timestamp_source != "network_retrieved_at"
         or any(field in outcome and not _valid_omitted_kis_status(outcome[field]) for field in _KIS_OPTIONAL_STATUS_FIELDS)
     ):
