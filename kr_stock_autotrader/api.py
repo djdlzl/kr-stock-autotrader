@@ -163,8 +163,40 @@ def _cache_get(key: tuple[int, str], now: float) -> dict | None:
         return dict(cached[1]) if cached else None
 
 
+_KIS_SUCCESS_FIELDS = ("symbol", "price", "volume", "quote_known_at", "retrieved_at", "timestamp_source", "market_status", "halt_status", "management_status")
+_KIS_APPROVED_TIMESTAMP_SOURCES = {"network_retrieved_at"}
+
+
+def _valid_kis_retrieved_at(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value if parsed.tzinfo is not None else None
+
+
+def _safe_kis_quote(symbol: str, outcome: object) -> dict:
+    """Project every provider outcome onto a schema that cannot carry raw KIS data."""
+    unavailable = {"symbol": symbol, "status": "unavailable", "source": "KIS", "environment": "production"}
+    if not isinstance(outcome, dict):
+        return unavailable
+    retrieved_at = _valid_kis_retrieved_at(outcome.get("retrieved_at"))
+    timestamp_source = outcome.get("timestamp_source")
+    if outcome.get("status") != "ok":
+        if retrieved_at is not None:
+            unavailable["retrieved_at"] = retrieved_at
+        if timestamp_source in _KIS_APPROVED_TIMESTAMP_SOURCES:
+            unavailable["timestamp_source"] = timestamp_source
+        return unavailable
+    safe = {name: outcome[name] for name in _KIS_SUCCESS_FIELDS if name in outcome}
+    safe.update({"status": "ok", "source": "KIS", "environment": "production"})
+    return safe
+
+
 def _cache_success(key: tuple[int, str], quote: dict) -> dict:
-    safe = {name: quote.get(name) for name in ("symbol", "price", "volume", "quote_known_at", "retrieved_at", "timestamp_source", "source", "environment", "status", "market_status", "halt_status", "management_status") if name in quote}
+    safe = dict(quote)
     with _quote_cache_lock:
         _purge_quote_cache(monotonic_time.monotonic())
         while len(_quote_cache) >= QUOTE_CACHE_MAX_ENTRIES:
@@ -186,15 +218,18 @@ def _cached_kis_quote(symbol: str) -> dict:
     key = (id(getattr(provider, "__self__", provider)), symbol)
     cached = _cache_get(key, monotonic_time.monotonic())
     if cached is not None:
-        return cached
+        return _safe_kis_quote(symbol, cached)
     # The provider runs outside cache metadata guards.  The keyed lock makes a
     # simultaneous miss single-flight, then every waiter consumes one projection.
     with _registered_lock(_quote_locks, _quote_locks_guard, key):
         cached = _cache_get(key, monotonic_time.monotonic())
         if cached is not None:
-            return cached
-        quote = provider(symbol)
-        if quote.get("status") == "ok":
+            return _safe_kis_quote(symbol, cached)
+        try:
+            quote = _safe_kis_quote(symbol, provider(symbol))
+        except Exception:
+            quote = _safe_kis_quote(symbol, None)
+        if quote["status"] == "ok":
             return _cache_success(key, quote)
         return quote
 

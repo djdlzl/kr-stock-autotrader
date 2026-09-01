@@ -92,7 +92,7 @@ IMAGE_TAG="$(git rev-parse --short HEAD)" docker compose -f compose.prod.yml up 
 
 ## KIS 읽기전용·실전주문 사전점검
 
-KIS 연결은 **읽기전용**입니다. `KISReadOnlyClient`가 허용하는 외부 경로는 pinned production host `https://openapi.koreainvestment.com:9443`의 `POST /oauth2/tokenP` 및 국내주식 현재가 `GET /uapi/domestic-stock/v1/quotations/inquire-price`(TR ID `FHKST01010100`) 두 개뿐입니다. `KIS_BASE_URL`은 이 literal host(마지막 `/`만 정규화) 외에는 거부합니다. 토큰은 process memory에서 official expiry 또는 bounded `expires_in`까지 쓰고 refresh-skew 전에 갱신합니다. API, 로그, SQLite receipt에 키·비밀·토큰·Authorization header·원문 응답을 반환하거나 저장하지 않습니다.
+KIS 연결은 **읽기전용**입니다. `KISReadOnlyClient`가 허용하는 외부 경로는 pinned production host `https://openapi.koreainvestment.com:9443`의 `POST /oauth2/tokenP` 및 국내주식 현재가 `GET /uapi/domestic-stock/v1/quotations/inquire-price`(TR ID `FHKST01010100`) 두 개뿐입니다. `KIS_BASE_URL`은 이 literal host(마지막 `/`만 정규화) 외에는 거부합니다. 토큰은 process memory에서 official expiry 또는 bounded `expires_in`까지 쓰고 refresh-skew 전에 갱신합니다. API, 로그, SQLite receipt에 키·비밀·토큰·Authorization header·원문 응답을 반환하거나 저장하지 않습니다. 모든 provider 결과는 API/cache/dry-run 경계에서 safe projection을 거치며, unavailable/error는 고정된 unavailable schema만 반환합니다.
 
 로그인 사용자는 `/api/kis/status`, `/api/kis/quote/{six-digit-symbol}`을 이용할 수 있습니다. `KIS_ACCOUNT_NO` 또는 verified legacy `R_ACCOUNT_NUMBER`은 값 노출 없이 정확히 8자리 숫자여야 하며, `KIS_ACCOUNT_PRODUCT_CODE`은 정확히 2자리 숫자여야 하는 presence-only readiness 신호입니다. `LS_ACCOUNT`은 사용하지 않습니다. 이 구조 검증을 통과하지 않으면 `blocked_missing_account_env`이고 잔고/계좌 endpoint는 호출하지 않습니다.
 

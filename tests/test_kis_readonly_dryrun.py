@@ -172,3 +172,55 @@ def test_concurrent_dry_run_has_one_provider_call_and_one_receipt(monkeypatch):
     finally:
         check.close()
     assert api._dry_run_locks == {}
+
+
+@pytest.mark.parametrize("outcome", [
+    lambda secret: {"status": "unavailable", "retrieved_at": NOW.isoformat(), "timestamp_source": "network_retrieved_at", "app_secret": secret, "authorization": secret, "cookie": secret, "token": secret, "raw": {"nested": secret}},
+    lambda secret: {"status": "not-a-status", "retrieved_at": "not-a-timestamp", "timestamp_source": "unapproved", "app_secret": secret, "authorization": secret, "cookie": secret, "token": secret, "raw": {"nested": secret}},
+    lambda secret: [secret, {"raw": secret}],
+    lambda secret: RuntimeError(f"provider failure {secret}"),
+])
+def test_failure_provider_outcomes_are_sanitized_at_quote_and_dry_run_boundaries(monkeypatch, caplog, outcome):
+    from fastapi.testclient import TestClient
+    from kr_stock_autotrader import api, db as dbmod
+    from kr_stock_autotrader.auth import issue_session
+    from tests.test_decision_card_invariants import make_plan
+
+    secret = "KIS-LEAK-MARKER-DO-NOT-RETURN"
+    path = tempfile.mktemp(suffix=".db")
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", path)
+    db = dbmod.connect()
+    _, plan_id = make_plan(db)
+    db.execute("UPDATE order_plans SET valid_until=?, expires_at=? WHERE id=?", ("2099-12-31T23:59:00+09:00", "2099-12-31T23:59:00+09:00", plan_id))
+    db.commit()
+    db.close()
+    calls = []
+
+    def provider(symbol):
+        calls.append(symbol)
+        result = outcome(secret)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(api.app.state, "kis_quote_provider", provider, raising=False)
+    api._quote_cache.clear()
+    client = TestClient(api.app)
+    client.cookies.set("session", issue_session(1))
+    quote_response = client.get("/api/kis/quote/005930")
+    dry_response = client.post(f"/api/order-plans/{plan_id}/live-dry-run", json={"dry_run_key": "failure-safe-key"})
+    assert quote_response.status_code == dry_response.status_code == 200
+    safe_quote = quote_response.json()
+    assert safe_quote["symbol"] == "005930"
+    assert safe_quote["status"] == "unavailable"
+    assert safe_quote["source"] == "KIS" and safe_quote["environment"] == "production"
+    assert set(safe_quote) <= {"symbol", "status", "retrieved_at", "timestamp_source", "source", "environment"}
+    assert dry_response.json()["result"] == "WOULD_WAIT"
+    assert dry_response.json()["network_order_calls"] == 0
+    assert calls == ["005930", "005930"]  # failures are sanitized but never cached
+    check = dbmod.connect()
+    try:
+        serialized_db = " ".join(str(value) for row in check.execute("SELECT * FROM live_dry_run_receipts") for value in row)
+    finally:
+        check.close()
+    assert secret not in str(quote_response.json()) + str(dry_response.json()) + serialized_db + caplog.text
