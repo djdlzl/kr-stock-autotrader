@@ -19,9 +19,14 @@ def evaluate_live_dry_run(plan: dict, card_invalidated: bool, quote: dict, *, se
     except (KeyError, TypeError, ValueError): codes.append("expired")
     try:
         if quote.get("status") != "ok" or quote.get("symbol") != plan["symbol"]: raise ValueError
+        # KIS current-price has no exchange trade timestamp: only our retrieval completion is safe.
+        if quote.get("timestamp_source") != "network_retrieved_at": raise ValueError
         known=parse_kst(quote["quote_known_at"]); price=float(quote["price"])
         if not fresh_quote(type("Q", (), {"known_at": known})(), now): codes.append("stale_or_future_quote")
         if price <= 0: raise ValueError
+        # Optional KIS fields can only tighten the dry-run gate; unknown fields never assert tradability.
+        safe_status = " ".join(str(quote.get(key, "")) for key in ("market_status", "halt_status", "management_status")).lower()
+        if any(token in safe_status for token in ("halt", "suspend", "관리", "거래정지")): codes.append("quote_unavailable")
     except (KeyError, TypeError, ValueError):
         codes.append("quote_unavailable"); known=None; price=None
     if quote.get("status") == "ok" and quote.get("symbol") != plan.get("symbol"): codes.append("symbol_mismatch")
@@ -35,10 +40,19 @@ def evaluate_live_dry_run(plan: dict, card_invalidated: bool, quote: dict, *, se
     result = "WOULD_WAIT" if codes and set(codes) <= {"market_or_window_closed", "stale_or_future_quote", "quote_unavailable"} else ("WOULD_REJECT" if codes else "WOULD_SUBMIT")
     return {"result":result,"reasons":[_reason(c) for c in codes] or ["모든 사전점검 조건을 통과했습니다"],"reason_codes":codes,"plan_id":plan["id"],"card_id":plan["card_id"],"card_version":plan["card_version"],"plan_version":plan["version_hash"],"quote_price":price,"quote_known_at":known.isoformat() if known else None,"quote_retrieved_at":quote.get("retrieved_at"),"at":now.isoformat(),"broker_mode":BROKER_MODE,"network_order_calls":0}
 
+def existing_live_dry_run_receipt(db, plan_id: int, user_id: int, dry_run_key: str) -> dict | None:
+    existing = db.execute("SELECT * FROM live_dry_run_receipts WHERE order_plan_id=? AND user_id=? AND dry_run_key=?", (plan_id, user_id, dry_run_key)).fetchone()
+    if not existing:
+        return None
+    result = dict(existing)
+    result["reasons"] = json.loads(result.pop("reasons_json"))
+    result["idempotent"] = True
+    return result
+
 def persist_live_dry_run(db, plan: dict, user_id: int, dry_run_key: str, quote: dict, *, server_now=None, trusted_conflicting_disclosure=False) -> dict:
-    existing=db.execute("SELECT * FROM live_dry_run_receipts WHERE order_plan_id=? AND user_id=? AND dry_run_key=?",(plan["id"],user_id,dry_run_key)).fetchone()
+    existing = existing_live_dry_run_receipt(db, plan["id"], user_id, dry_run_key)
     if existing:
-        result=dict(existing); result["reasons"]=json.loads(result.pop("reasons_json")); result["idempotent"]=True; return result
+        return existing
     card=db.execute("SELECT invalidated_at FROM decision_cards WHERE id=?",(plan["card_id"],)).fetchone()
     result=evaluate_live_dry_run(plan, bool(card and card["invalidated_at"]), quote, server_now=server_now, trusted_conflicting_disclosure=trusted_conflicting_disclosure)
     db.execute("INSERT INTO live_dry_run_receipts(order_plan_id,user_id,dry_run_key,result,reasons_json,plan_version,card_id,card_version,quote_price,quote_known_at,quote_retrieved_at,evaluated_at,broker_mode,network_order_calls) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(plan["id"],user_id,dry_run_key,result["result"],json.dumps(result["reasons"],ensure_ascii=False),result["plan_version"],result["card_id"],result["card_version"],result["quote_price"],result["quote_known_at"],result["quote_retrieved_at"],result["at"],BROKER_MODE,0))

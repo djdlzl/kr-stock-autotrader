@@ -1,6 +1,8 @@
 """FastAPI boundary for Giraffe's paper-only trading planner."""
 import sqlite3
 import re
+import threading
+import time as monotonic_time
 from datetime import datetime, time, timedelta
 from typing import Literal
 
@@ -16,7 +18,7 @@ from .decision_cards import (require_internal_api_key, create_evidence, list_evi
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML
 from .kis_readonly import KISReadOnlyClient
-from .live_dry_run import persist_live_dry_run
+from .live_dry_run import existing_live_dry_run_receipt, persist_live_dry_run
 
 
 class AuthIn(BaseModel):
@@ -103,7 +105,47 @@ class PaperSettingsIn(BaseModel):
 
 
 class LiveDryRunIn(BaseModel):
-    dry_run_key: str = Field(min_length=1, max_length=200)
+    dry_run_key: str = Field(pattern=r"^[A-Za-z0-9_-]{8,64}$")
+
+
+# Single-process contract: key locks serialize receipt check → quote → receipt commit.
+_dry_run_locks: dict[tuple[int, int, str], threading.Lock] = {}
+_dry_run_locks_guard = threading.Lock()
+_quote_cache: dict[tuple[int, str], tuple[float, dict]] = {}
+_quote_cache_lock = threading.Lock()
+QUOTE_CACHE_TTL_SECONDS = 2.0
+_default_kis_client: KISReadOnlyClient | None = None
+
+def _quote_provider():
+    global _default_kis_client
+    provider = getattr(app.state, "kis_quote_provider", None)
+    if provider:
+        return provider
+    if _default_kis_client is None:
+        _default_kis_client = KISReadOnlyClient()
+    return _default_kis_client.current_price
+
+def _cached_kis_quote(symbol: str) -> dict:
+    provider = _quote_provider()
+    key = (id(getattr(provider, "__self__", provider)), symbol)
+    current = monotonic_time.monotonic()
+    with _quote_cache_lock:
+        cached = _quote_cache.get(key)
+        if cached and current - cached[0] <= QUOTE_CACHE_TTL_SECONDS:
+            return dict(cached[1])
+    quote = provider(symbol)
+    # Cache only a safe successful projection, never raw provider output or failure.
+    if quote.get("status") == "ok":
+        safe = {name: quote.get(name) for name in ("symbol", "price", "volume", "quote_known_at", "retrieved_at", "timestamp_source", "source", "environment", "status", "market_status", "halt_status", "management_status") if name in quote}
+        with _quote_cache_lock:
+            _quote_cache[key] = (monotonic_time.monotonic(), safe)
+        return dict(safe)
+    return quote
+
+def _dry_run_lock(plan_id: int, user_id: int, key: str) -> threading.Lock:
+    identity = (plan_id, user_id, key)
+    with _dry_run_locks_guard:
+        return _dry_run_locks.setdefault(identity, threading.Lock())
 
 
 app = FastAPI(title="Giraffe — Paper Only")
@@ -191,8 +233,7 @@ def kis_quote(symbol: str, request: Request):
     current_user(request)
     if not re.fullmatch(r"\d{6}", symbol):
         raise HTTPException(422, "종목코드는 6자리 숫자입니다")
-    provider = getattr(app.state, "kis_quote_provider", None)
-    return provider(symbol) if provider else KISReadOnlyClient().current_price(symbol)
+    return _cached_kis_quote(symbol)
 
 
 @app.post("/api/order-plans/{plan_id}/live-dry-run")
@@ -206,9 +247,25 @@ def live_dry_run(plan_id: int, data: LiveDryRunIn, request: Request):
             raise HTTPException(404, "order plan not found")
         if plan["status"] != "approved":
             raise HTTPException(409, "승인된 현재 계획만 사전점검할 수 있습니다")
-        provider = getattr(app.state, "kis_quote_provider", None)
-        quote = provider(plan["symbol"]) if provider else KISReadOnlyClient().current_price(plan["symbol"])
-        return persist_live_dry_run(db, dict(plan), uid, data.dry_run_key, quote)
+        # Receipt lookup is deliberately before provider/OAuth work.
+        existing = existing_live_dry_run_receipt(db, plan_id, uid, data.dry_run_key)
+        if existing:
+            return existing
+        lock = _dry_run_lock(plan_id, uid, data.dry_run_key)
+        with lock:
+            # A concurrent first request may have completed while we waited.
+            existing = existing_live_dry_run_receipt(db, plan_id, uid, data.dry_run_key)
+            if existing:
+                return existing
+            quote = _cached_kis_quote(plan["symbol"])
+            try:
+                return persist_live_dry_run(db, dict(plan), uid, data.dry_run_key, quote)
+            except sqlite3.IntegrityError:
+                db.rollback()
+                existing = existing_live_dry_run_receipt(db, plan_id, uid, data.dry_run_key)
+                if existing:
+                    return existing
+                raise
     finally:
         db.close()
 
