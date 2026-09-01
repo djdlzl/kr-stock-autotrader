@@ -63,6 +63,15 @@ def connect() -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS exit_lineage (id INTEGER PRIMARY KEY, order_plan_id INTEGER NOT NULL REFERENCES order_plans(id), fill_id INTEGER NOT NULL REFERENCES order_fills(id), rule TEXT NOT NULL, quote_known_at TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS scheduler_runs (id INTEGER PRIMARY KEY, run_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, detail TEXT NOT NULL DEFAULT '{}');
     CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, detail TEXT NOT NULL, at TEXT NOT NULL);
+    -- Safe receipt only: no credentials, account data, headers, raw KIS payload, or order effects.
+    CREATE TABLE IF NOT EXISTS live_dry_run_receipts (
+      id INTEGER PRIMARY KEY, order_plan_id INTEGER NOT NULL REFERENCES order_plans(id), user_id INTEGER NOT NULL REFERENCES users(id),
+      dry_run_key TEXT NOT NULL, result TEXT NOT NULL CHECK(result IN ('WOULD_SUBMIT','WOULD_WAIT','WOULD_REJECT')),
+      reasons_json TEXT NOT NULL, plan_version TEXT NOT NULL, card_id INTEGER NOT NULL REFERENCES decision_cards(id), card_version INTEGER NOT NULL,
+      quote_price REAL, quote_known_at TEXT, quote_retrieved_at TEXT, evaluated_at TEXT NOT NULL,
+      broker_mode TEXT NOT NULL CHECK(broker_mode='read_only_dry_run'), network_order_calls INTEGER NOT NULL CHECK(network_order_calls=0),
+      UNIQUE(order_plan_id,user_id,dry_run_key)
+    );
     """)
     # Existing local databases predate cumulative-notional accounting.
     if "bought_amount" not in {col["name"] for col in db.execute("PRAGMA table_info(order_plans)")}:

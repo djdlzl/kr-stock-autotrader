@@ -89,3 +89,11 @@ IMAGE_TAG="$(git rev-parse --short HEAD)" docker compose -f compose.prod.yml up 
 - `SESSION_SECRET`는 `.env`에만 두고 Git에 커밋하지 않습니다.
 - 내부 수집/카드/평가 API에는 `INTERNAL_API_KEY`를 `.env`에 설정하고 호출 시 `X-Internal-API-Key`로 전달합니다. 값은 이미지·문서·Git에 넣지 않습니다.
 - 증권사/live adapter는 없으며 이 배포도 paper-only입니다.
+
+## KIS 읽기전용·실전주문 사전점검
+
+KIS 연결은 **읽기전용**입니다. `KISReadOnlyClient`가 허용하는 외부 경로는 production `POST /oauth2/tokenP` 및 국내주식 현재가 `GET /uapi/domestic-stock/v1/quotations/inquire-price`(TR ID `FHKST01010100`) 두 개뿐입니다. 토큰은 프로세스 메모리에서만 사용하며 API, 로그, SQLite receipt에 키·비밀·토큰·Authorization header·원문 응답을 반환하거나 저장하지 않습니다. 기본 URL은 `https://openapi.koreainvestment.com:9443`이고, 필요할 때만 `KIS_BASE_URL`을 설정할 수 있습니다.
+
+로그인 사용자는 `/api/kis/status`, `/api/kis/quote/{six-digit-symbol}`을 이용할 수 있습니다. `KIS_ACCOUNT_NO`와 `KIS_ACCOUNT_PRODUCT_CODE`은 presence-only readiness용이며, verified legacy `R_ACCOUNT_NUMBER`도 account-number presence로만 인정합니다. `LS_ACCOUNT`은 사용하지 않습니다. 둘 중 account env가 없으면 `blocked_missing_account_env`이고 잔고/계좌 endpoint는 호출하지 않습니다.
+
+승인된 자기 order plan에서 `POST /api/order-plans/{plan_id}/live-dry-run`에 `dry_run_key`를 보내면 server-side KIS quote로 `WOULD_SUBMIT`, `WOULD_WAIT`, 또는 `WOULD_REJECT` receipt만 남깁니다. 같은 `(plan,user,dry_run_key)`는 idempotent입니다. 이 경로는 PaperBroker/order engine을 호출하지 않고 plan, fills, positions, order evaluations/events를 변경하지 않으며 항상 `LIVE_TRADING=false`, `broker_mode=read_only_dry_run`, `network_order_calls=0`입니다. **실전 주문은 아직 비활성화**입니다.

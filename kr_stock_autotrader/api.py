@@ -15,6 +15,8 @@ from .domain import Quote, parse_kst, now_kst
 from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML
+from .kis_readonly import KISReadOnlyClient
+from .live_dry_run import persist_live_dry_run
 
 
 class AuthIn(BaseModel):
@@ -100,6 +102,10 @@ class PaperSettingsIn(BaseModel):
     default_paper_amount: StrictInt = Field(ge=10_000, le=1_000_000_000)
 
 
+class LiveDryRunIn(BaseModel):
+    dry_run_key: str = Field(min_length=1, max_length=200)
+
+
 app = FastAPI(title="Giraffe — Paper Only")
 
 
@@ -172,6 +178,39 @@ def logout(request: Request, response: Response):
     csrf_origin_ok(request)
     response.delete_cookie("session", httponly=True, samesite="lax", secure=COOKIE_SECURE)
     return {"ok": True}
+
+
+@app.get("/api/kis/status")
+def kis_status(request: Request):
+    current_user(request)
+    return KISReadOnlyClient.readiness()
+
+
+@app.get("/api/kis/quote/{symbol}")
+def kis_quote(symbol: str, request: Request):
+    current_user(request)
+    if not re.fullmatch(r"\d{6}", symbol):
+        raise HTTPException(422, "종목코드는 6자리 숫자입니다")
+    provider = getattr(app.state, "kis_quote_provider", None)
+    return provider(symbol) if provider else KISReadOnlyClient().current_price(symbol)
+
+
+@app.post("/api/order-plans/{plan_id}/live-dry-run")
+def live_dry_run(plan_id: int, data: LiveDryRunIn, request: Request):
+    csrf_origin_ok(request)
+    uid = current_user(request)
+    db = connect()
+    try:
+        plan = db.execute("SELECT * FROM order_plans WHERE id=? AND user_id=?", (plan_id, uid)).fetchone()
+        if not plan:
+            raise HTTPException(404, "order plan not found")
+        if plan["status"] != "approved":
+            raise HTTPException(409, "승인된 현재 계획만 사전점검할 수 있습니다")
+        provider = getattr(app.state, "kis_quote_provider", None)
+        quote = provider(plan["symbol"]) if provider else KISReadOnlyClient().current_price(plan["symbol"])
+        return persist_live_dry_run(db, dict(plan), uid, data.dry_run_key, quote)
+    finally:
+        db.close()
 
 
 @app.get("/api/settings/paper")
