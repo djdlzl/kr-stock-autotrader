@@ -13,6 +13,12 @@ services:
       SIGNUP_ENABLED: ${SIGNUP_ENABLED:-false}
       KR_HOLIDAYS: ${KR_HOLIDAYS:-}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY is required}
+      LIVE_TRADING: "false"
+      KIS_APP_KEY: ${KIS_APP_KEY:?KIS_APP_KEY is required}
+      KIS_APP_SECRET: ${KIS_APP_SECRET:?KIS_APP_SECRET is required}
+      KIS_ACCOUNT_NO: ${KIS_ACCOUNT_NO:?KIS_ACCOUNT_NO is required}
+      KIS_ACCOUNT_PRODUCT_CODE: ${KIS_ACCOUNT_PRODUCT_CODE:-01}
+      KIS_BASE_URL: https://openapi.koreainvestment.com:9443
     volumes:
       - ./data:/data
     networks:
