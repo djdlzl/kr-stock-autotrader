@@ -91,9 +91,9 @@ def test_evaluator_uses_server_now_caps_and_frozen_exit_rules(db):
     for name, bad in [("stale",tick("s",server_now="2026-08-31T10:06:00+09:00")),("future",tick("f",known_at="2026-08-31T10:04:00+09:00",server_now="2026-08-31T10:03:00+09:00")),("price",tick("p",price=101)),("gap",tick("g",gap_pct=11)),("liquidity",tick("l",liquidity=0)),("conflict",tick("c",conflicting_disclosure=True))]:
         assert evaluate_order_plan(db,plan,bad)['fills']==[], name
     first=evaluate_order_plan(db,plan,tick("b1",fill_qty=1)); assert first['fills'][0]['side']=="buy"
-    second=evaluate_order_plan(db,plan,tick("b2",fill_qty=2)); assert second['fills'][0]['side']=="buy" and second['fills'][0]['qty']==1
+    second=evaluate_order_plan(db,plan,tick("b2",fill_qty=2)); assert second['fills'][0]['side']=="buy" and second['fills'][0]['qty']==2
     assert evaluate_order_plan(db,plan,tick("x",exit=True,fill_qty=3))['fills']==[]
-    sold=evaluate_order_plan(db,plan,tick("sell",price=79,fill_qty=9)); assert sold['fills'][0]=={'side':'sell','qty':2,'price':79}
+    sold=evaluate_order_plan(db,plan,tick("sell",price=79,fill_qty=9)); assert sold['fills'][0]=={'side':'sell','qty':3,'price':79}
     assert evaluate_order_plan(db,plan,tick("sell",price=79))['idempotent']
     assert db.execute("SELECT count(*) n FROM exit_lineage").fetchone()['n']==1
 

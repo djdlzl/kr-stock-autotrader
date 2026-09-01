@@ -49,6 +49,8 @@ def test_fill_timestamp_and_dropdown_filter_ui_contract_is_present():
         "매도완료", "미체결", "카드 미생성", "&&", "$('#date').onchange=load",
         "holding_until", "review_at", "valid_until", "expires", "name=\"order_type\"",
         "expires:isoKst(a.get('expires'))", "@media(max-width:390px)", "grid-template-columns:1fr", "overflow-x:hidden",
+        "기본 모의투자 금액", "기본 금액 저장", "이 카드에 적용할 금액", "default-paper-amount",
+        "loadPaperSetting", "savePaperSetting", "toLocaleString('ko-KR')", "min=\"10000\"", "step=\"1\"",
     ):
         assert text in APP_HTML
     # Green presentation is exclusively keyed to a real current-user buy fill.

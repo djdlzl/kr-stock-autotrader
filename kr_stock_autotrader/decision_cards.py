@@ -225,8 +225,23 @@ def _valid_plan(card):
     except (KeyError, ValueError, TypeError): raise HTTPException(422,"nonempty KST window and exit times required")
     if start>=end: raise HTTPException(422,"window start must precede end")
     return x,window,valid_until
-def _snapshot(card, override=None):
+def _plan_snapshot(plan):
+    """Rebuild an immutable plan's user-editable snapshot without raw DB fields."""
+    max_amount = plan["max_amount"]
+    # SQLite REAL round-trips an exact KRW amount as 500000.0; preserve canonical hash identity.
+    if isinstance(max_amount, float) and max_amount.is_integer():
+        max_amount = int(max_amount)
+    return {"symbol":plan["symbol"], "window":{"start":plan["window_start"],"end":plan["window_end"]}, "price_cap":plan["price_cap"], "max_amount":max_amount, "max_qty":plan["max_qty"], "split":json.loads(plan["split_json"]), "order_type":plan["order_type"], "stop_loss":plan["stop_loss"], "take_profit":json.loads(plan["take_profit_json"]), "evidence_invalidation":json.loads(plan["evidence_invalidation"]), "holding_until":plan["holding_until"], "review_at":plan["review_at"], "valid_until":plan["valid_until"], "expires":plan["expires_at"]}
+
+def _default_paper_amount(db, user_id):
+    """Legacy users have no row and therefore safely retain the exact fallback."""
+    setting = db.execute("SELECT default_paper_amount FROM user_settings WHERE user_id=?", (user_id,)).fetchone()
+    return int(setting["default_paper_amount"]) if setting else 500000
+
+def _snapshot(card, override=None, default_amount=None):
     x = dict(card["card"])
+    if default_amount is not None:
+        x["max_amount"] = default_amount
     x.update(override or {})
     frozen = dict(card); frozen["card"] = x
     _valid_plan(frozen)
@@ -241,7 +256,12 @@ def edit_draft(db, card_id, user_id, override):
     if c["invalidated_at"]: raise HTTPException(409,"card invalidated")
     if c["card"]["filter_verdict"] != "PASS" or c["verdict"] != "매수 검토 가능": raise HTTPException(409,"non-PASS card cannot create draft")
     _validate_override(override)
-    x=_snapshot(c,override)
+    existing = db.execute("SELECT * FROM order_plans WHERE card_id=? AND user_id=? ORDER BY id DESC LIMIT 1", (card_id, user_id)).fetchone()
+    # A card's pre-existing lineage is authoritative; otherwise freeze today's user default in its first draft.
+    base = _plan_snapshot(existing) if existing else None
+    x=_snapshot(c, base, None if base else _default_paper_amount(db, user_id))
+    x.update(override or {})
+    _snapshot(c, x)
     db.execute("INSERT INTO order_plan_drafts(card_id,user_id,snapshot_json,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(card_id,user_id,status) DO UPDATE SET snapshot_json=excluded.snapshot_json,updated_at=excluded.updated_at",(card_id,user_id,canon(x),now(),now()))
     db.commit(); return {"card_id":card_id,"status":"draft","draft":x}
 
@@ -270,7 +290,16 @@ def user_decision(db,card_id,user_id,decision,note=""):
     if c["invalidated_at"]: raise HTTPException(409,"card invalidated; regenerate and reapprove")
     if c["card"]["filter_verdict"] != "PASS" or c["verdict"] != "매수 검토 가능": raise HTTPException(409,"only PASS buy-review card is approvable")
     draft=db.execute("SELECT * FROM order_plan_drafts WHERE card_id=? AND user_id=? AND status='draft'",(card_id,user_id)).fetchone()
-    x=_snapshot(c,json.loads(draft["snapshot_json"]) if draft else None); window=x["window"]
+    latest_plan = db.execute("SELECT * FROM order_plans WHERE card_id=? AND user_id=? ORDER BY id DESC LIMIT 1", (card_id, user_id)).fetchone()
+    if draft:
+        x = _snapshot(c, json.loads(draft["snapshot_json"]))
+    elif latest_plan:
+        # Reapprovals without a draft retain this card's last frozen plan, not a later global setting.
+        x = _snapshot(c, _plan_snapshot(latest_plan))
+    else:
+        # Approval is server-side: never depend on a browser prefill to freeze the user's budget.
+        x = _snapshot(c, default_amount=_default_paper_amount(db, user_id))
+    window=x["window"]
     valid_until, expires = parse_kst(x["valid_until"]), parse_kst(x["expires"])
     snapshot=canon(x); base_hash=hashlib.sha256(canon({"card":c["id"],"user":user_id,"snapshot":snapshot}).encode()).hexdigest()
     existing=db.execute("SELECT id,version_hash FROM order_plans WHERE card_id=? AND user_id=? AND version_hash LIKE ? AND status IN ('approved','execution_wait','partial_or_filled') ORDER BY id DESC LIMIT 1",(c["id"],user_id,base_hash+":%")).fetchone()

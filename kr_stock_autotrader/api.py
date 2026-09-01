@@ -6,7 +6,7 @@ from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictInt, ValidationError, field_validator, model_validator
 
 from .auth import csrf_origin_ok, current_user, hash_password, issue_session, verify_password
 from .config import COOKIE_SECURE, LIVE_TRADING, SIGNUP_ENABLED
@@ -95,6 +95,11 @@ class TickIn(BaseModel):
         return value
 
 
+class PaperSettingsIn(BaseModel):
+    # Strict integer prevents bool, floats, numeric strings, and non-finite values.
+    default_paper_amount: StrictInt = Field(ge=10_000, le=1_000_000_000)
+
+
 app = FastAPI(title="Giraffe — Paper Only")
 
 
@@ -167,6 +172,30 @@ def logout(request: Request, response: Response):
     csrf_origin_ok(request)
     response.delete_cookie("session", httponly=True, samesite="lax", secure=COOKIE_SECURE)
     return {"ok": True}
+
+
+@app.get("/api/settings/paper")
+def get_paper_settings(request: Request):
+    uid = current_user(request)
+    db = connect()
+    try:
+        row = db.execute("SELECT default_paper_amount FROM user_settings WHERE user_id=?", (uid,)).fetchone()
+        return {"default_paper_amount": int(row["default_paper_amount"]) if row else 500000}
+    finally:
+        db.close()
+
+
+@app.patch("/api/settings/paper")
+def update_paper_settings(data: PaperSettingsIn, request: Request):
+    csrf_origin_ok(request)
+    uid = current_user(request)
+    db = connect()
+    try:
+        db.execute("INSERT INTO user_settings(user_id,default_paper_amount) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET default_paper_amount=excluded.default_paper_amount", (uid, data.default_paper_amount))
+        db.commit()
+        return {"default_paper_amount": data.default_paper_amount}
+    finally:
+        db.close()
 
 
 @app.post("/api/plans")
