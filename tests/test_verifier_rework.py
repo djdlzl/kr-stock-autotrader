@@ -176,9 +176,15 @@ def test_authenticated_approval_detail_edit_and_reapproval_api_journey(monkeypat
     assert detail.status_code == 200
     snapshot = detail.json()["user_state"]["order_plan"]["snapshot"]
     assert snapshot["window"] == {"start":"2026-08-31T09:00:00+09:00", "end":"2026-08-31T15:00:00+09:00"}
-    changed = client.post(f"/api/order-plans/{old_plan}/edit", json={"price_cap": 91})
+    payload = {"price_cap": 91, "max_amount": 180, "max_qty": 2, "order_type": "market",
+               "holding_until": "2026-09-02T10:00:00+09:00", "review_at": "2026-09-02T09:00:00+09:00",
+               "valid_until": "2026-09-02T11:00:00+09:00", "expires": "2026-09-02T12:00:00+09:00"}
+    changed = client.post(f"/api/order-plans/{old_plan}/edit", json=payload)
     assert changed.status_code == 200 and changed.json()["status"] == "entry_invalidated"
-    assert client.post(f"/api/cards/{created['id']}/decisions", json={"decision":"approve"}).json()["order_plan_id"] != old_plan
+    replacement = client.post(f"/api/cards/{created['id']}/decisions", json={"decision":"approve"})
+    assert replacement.json()["order_plan_id"] != old_plan
+    frozen = client.get(f"/api/cards/{created['id']}").json()["user_state"]["order_plan"]["snapshot"]
+    assert {key: frozen[key] for key in payload} == payload
 
 
 def test_cli_pending_cards_uses_missing_query_without_printing_secret(tmp_path):

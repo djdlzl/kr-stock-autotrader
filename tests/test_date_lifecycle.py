@@ -175,3 +175,36 @@ def test_card_fill_summary_is_user_scoped_across_all_plan_generations(monkeypatc
     complete = user_card_view(db, card_row["id"], 1)["fill_summary"]
     assert complete == {"first_buy_at": "2026-08-31T10:01:00+09:00", "last_full_sell_at": "2026-08-31T12:00:00+09:00", "fill_state": "sold_complete"}
     assert set(user_card_view(db, card_row["id"], 1)["fill_summary"]) == {"first_buy_at", "last_full_sell_at", "fill_state"}
+
+
+def test_fill_summary_replays_chronological_state_and_ignores_oversells(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "fill-replay.db"))
+    db = dbmod.connect()
+    _, card_row = _seed(db, "fill-replay", "2026-08-31T10:00:00+09:00")
+    db.executemany("INSERT INTO users(email,password) VALUES(?,?)", [("owner@test", "p"), ("other@test", "p")])
+    values = (card_row["id"], 1, 1, "2026-08-31T09:00:00+09:00", "2026-09-01T10:00:00+09:00", "005930", 100, 1000, 10, "[]", "limit", 80, "[]", "{}", "2026-09-01T10:00:00+09:00")
+    plans = []
+    for suffix in ("one", "two"):
+        plans.append(db.execute("""INSERT INTO order_plans(card_id,card_version,user_id,approved_at,valid_until,symbol,price_cap,max_amount,max_qty,split_json,order_type,stop_loss,take_profit_json,evidence_invalidation,expires_at,status,version_hash)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'closed',?) RETURNING id""", values + (suffix,)).fetchone()["id"])
+    other_values = (card_row["id"], 1, 2) + values[3:]
+    other = db.execute("""INSERT INTO order_plans(card_id,card_version,user_id,approved_at,valid_until,symbol,price_cap,max_amount,max_qty,split_json,order_type,stop_loss,take_profit_json,evidence_invalidation,expires_at,status,version_hash)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'closed',?) RETURNING id""", other_values + ("other",)).fetchone()["id"]
+    # IDs are deliberately not chronological: the replay must use filled_at then id.
+    fills = [
+        (plans[1], "late-buy", "buy", 2, "2026-08-31T12:00:00+09:00"),
+        (plans[0], "first-buy", "buy", 3, "2026-08-31T10:00:00+09:00"),
+        (plans[0], "close-first", "sell", 9, "2026-08-31T11:00:00+09:00"),
+        (plans[1], "close-second", "sell", 2, "2026-08-31T13:00:00+09:00"),
+        (plans[1], "oversell-after-close", "sell", 8, "2026-08-31T14:00:00+09:00"),
+        (other, "other-user", "buy", 99, "2026-08-31T09:00:00+09:00"),
+    ]
+    db.executemany("INSERT INTO order_fills(order_plan_id,event_key,side,qty,price,filled_at) VALUES(?,?,?, ?,1,?)", fills)
+    db.commit()
+    from kr_stock_autotrader.decision_cards import user_card_view
+    assert user_card_view(db, card_row["id"], 1)["fill_summary"] == {
+        "first_buy_at": "2026-08-31T10:00:00+09:00", "last_full_sell_at": "2026-08-31T13:00:00+09:00", "fill_state": "sold_complete"
+    }
+    assert user_card_view(db, card_row["id"], 2)["fill_summary"] == {
+        "first_buy_at": "2026-08-31T09:00:00+09:00", "last_full_sell_at": None, "fill_state": "bought"
+    }

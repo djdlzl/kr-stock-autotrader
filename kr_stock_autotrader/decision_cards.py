@@ -145,19 +145,31 @@ def user_fill_summary(db, card_id, user_id):
     fills instead of trusting plan status or the newest generation, and scope
     the join through the owning user's plans before exposing any result.
     """
-    totals = db.execute("""SELECT
-      MIN(CASE WHEN f.side='buy' THEN f.filled_at END) AS first_buy_at,
-      MAX(CASE WHEN f.side='sell' THEN f.filled_at END) AS latest_sell_at,
-      COALESCE(SUM(CASE WHEN f.side='buy' THEN f.qty ELSE 0 END), 0) AS buy_qty,
-      COALESCE(SUM(CASE WHEN f.side='sell' THEN f.qty ELSE 0 END), 0) AS sell_qty
-      FROM order_plans p LEFT JOIN order_fills f ON f.order_plan_id=p.id
-      WHERE p.card_id=? AND p.user_id=?""", (card_id, user_id)).fetchone()
-    bought, sold = totals["buy_qty"], totals["sell_qty"]
-    if not bought:
+    fills = db.execute("""SELECT f.id, f.side, f.qty, f.filled_at
+      FROM order_plans p JOIN order_fills f ON f.order_plan_id=p.id
+      WHERE p.card_id=? AND p.user_id=?
+      ORDER BY f.filled_at, f.id""", (card_id, user_id))
+    first_buy_at = None
+    last_full_sell_at = None
+    remaining = 0
+    for fill in fills:
+        qty = max(0, fill["qty"])
+        if fill["side"] == "buy":
+            first_buy_at = first_buy_at or fill["filled_at"]
+            remaining += qty
+            # A new buy reopens the card-level position after any earlier exit.
+            if qty:
+                last_full_sell_at = None
+        elif fill["side"] == "sell" and remaining > 0:
+            before = remaining
+            remaining = max(0, remaining - qty)
+            if before > 0 and remaining == 0:
+                last_full_sell_at = fill["filled_at"]
+    if first_buy_at is None:
         return {"first_buy_at": None, "last_full_sell_at": None, "fill_state": "unfilled"}
-    if sold >= bought:
-        return {"first_buy_at": totals["first_buy_at"], "last_full_sell_at": totals["latest_sell_at"], "fill_state": "sold_complete"}
-    return {"first_buy_at": totals["first_buy_at"], "last_full_sell_at": None, "fill_state": "bought"}
+    if remaining > 0:
+        return {"first_buy_at": first_buy_at, "last_full_sell_at": None, "fill_state": "bought"}
+    return {"first_buy_at": first_buy_at, "last_full_sell_at": last_full_sell_at, "fill_state": "sold_complete"}
 def user_card_view(db, ident, user_id):
     """Safe read model for the owner-facing UI; never expose internal raw input."""
     result=card_detail(db,ident)
@@ -239,7 +251,7 @@ def edit_order_plan(db, plan_id, user_id, override):
     if p["user_id"] != user_id: raise HTTPException(404, "order plan not found")
     _validate_override(override)
     c = card_detail(db, p["card_id"])
-    base = {"symbol":p["symbol"], "window":{"start":p["window_start"],"end":p["window_end"]}, "price_cap":p["price_cap"], "max_amount":p["max_amount"], "max_qty":p["max_qty"], "order_type":p["order_type"], "stop_loss":p["stop_loss"], "take_profit":json.loads(p["take_profit_json"]), "evidence_invalidation":json.loads(p["evidence_invalidation"]), "holding_until":p["holding_until"], "review_at":p["review_at"], "valid_until":p["valid_until"]}
+    base = {"symbol":p["symbol"], "window":{"start":p["window_start"],"end":p["window_end"]}, "price_cap":p["price_cap"], "max_amount":p["max_amount"], "max_qty":p["max_qty"], "split":json.loads(p["split_json"]), "order_type":p["order_type"], "stop_loss":p["stop_loss"], "take_profit":json.loads(p["take_profit_json"]), "evidence_invalidation":json.loads(p["evidence_invalidation"]), "holding_until":p["holding_until"], "review_at":p["review_at"], "valid_until":p["valid_until"], "expires":p["expires_at"]}
     base.update(override or {}); _snapshot(c, base)
     db.execute("INSERT INTO order_plan_drafts(card_id,user_id,snapshot_json,supersedes_plan_id,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(card_id,user_id,status) DO UPDATE SET snapshot_json=excluded.snapshot_json,supersedes_plan_id=excluded.supersedes_plan_id,updated_at=excluded.updated_at", (c["id"],user_id,canon(base),plan_id,now(),now()))
     position = db.execute("SELECT qty FROM positions WHERE order_plan_id=?", (plan_id,)).fetchone()
@@ -258,14 +270,15 @@ def user_decision(db,card_id,user_id,decision,note=""):
     if c["invalidated_at"]: raise HTTPException(409,"card invalidated; regenerate and reapprove")
     if c["card"]["filter_verdict"] != "PASS" or c["verdict"] != "매수 검토 가능": raise HTTPException(409,"only PASS buy-review card is approvable")
     draft=db.execute("SELECT * FROM order_plan_drafts WHERE card_id=? AND user_id=? AND status='draft'",(card_id,user_id)).fetchone()
-    x=_snapshot(c,json.loads(draft["snapshot_json"]) if draft else None); window=x["window"]; expiry=parse_kst(x.get("valid_until") or x["holding_until"])
+    x=_snapshot(c,json.loads(draft["snapshot_json"]) if draft else None); window=x["window"]
+    valid_until, expires = parse_kst(x["valid_until"]), parse_kst(x["expires"])
     snapshot=canon(x); base_hash=hashlib.sha256(canon({"card":c["id"],"user":user_id,"snapshot":snapshot}).encode()).hexdigest()
     existing=db.execute("SELECT id,version_hash FROM order_plans WHERE card_id=? AND user_id=? AND version_hash LIKE ? AND status IN ('approved','execution_wait','partial_or_filled') ORDER BY id DESC LIMIT 1",(c["id"],user_id,base_hash+":%")).fetchone()
     if existing: return {"decision":"approve","order_plan_hash":existing["version_hash"],"idempotent":True,"order_plan_id":existing["id"]}
     generation=db.execute("SELECT COALESCE(MAX(approval_generation),0)+1 n FROM order_plans WHERE card_id=? AND user_id=?",(c["id"],user_id)).fetchone()["n"]
     vh=f"{base_hash}:{generation}"
     db.execute("INSERT INTO user_decisions(card_id,user_id,decision,decided_at,note) VALUES(?,?,?,?,?) ON CONFLICT(card_id,user_id) DO UPDATE SET decision=excluded.decision,decided_at=excluded.decided_at,note=excluded.note",(card_id,user_id,"approve",now(),note))
-    p=db.execute("INSERT INTO order_plans(card_id,card_version,user_id,approved_at,valid_until,symbol,window_start,window_end,price_cap,max_amount,max_qty,split_json,order_type,stop_loss,take_profit_json,evidence_invalidation,holding_until,review_at,expires_at,status,version_hash,approval_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",(c["id"],c["version"],user_id,now(),expiry.isoformat(),x["symbol"],window["start"],window["end"],x["price_cap"],x["max_amount"],x["max_qty"],canon(x.get("split",[])),x.get("order_type","limit"),x["stop_loss"],canon(x["take_profit"]),canon(x["evidence_invalidation"]),x.get("holding_until"),x.get("review_at"),expiry.isoformat(),"approved",vh,generation)).fetchone()
+    p=db.execute("INSERT INTO order_plans(card_id,card_version,user_id,approved_at,valid_until,symbol,window_start,window_end,price_cap,max_amount,max_qty,split_json,order_type,stop_loss,take_profit_json,evidence_invalidation,holding_until,review_at,expires_at,status,version_hash,approval_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",(c["id"],c["version"],user_id,now(),valid_until.isoformat(),x["symbol"],window["start"],window["end"],x["price_cap"],x["max_amount"],x["max_qty"],canon(x.get("split",[])),x.get("order_type","limit"),x["stop_loss"],canon(x["take_profit"]),canon(x["evidence_invalidation"]),x.get("holding_until"),x.get("review_at"),expires.isoformat(),"approved",vh,generation)).fetchone()
     if draft: db.execute("UPDATE order_plan_drafts SET status='approved' WHERE id=?",(draft["id"],))
     audit(db,str(user_id),"approve","decision_card",card_id);db.commit();return {"decision":"approve","order_plan_hash":vh,"order_plan_id":p["id"],"idempotent":False}
 

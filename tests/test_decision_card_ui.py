@@ -47,7 +47,8 @@ def test_fill_timestamp_and_dropdown_filter_ui_contract_is_present():
         "판단<select", "내 결정<select", "체결<select", "카드 상태<select", "필터 초기화",
         "매수 검토 가능", "관찰", "제외", "판단 보류", "승인", "보류", "거절", "미판단",
         "매도완료", "미체결", "카드 미생성", "&&", "$('#date').onchange=load",
-        "@media(max-width:390px)", "grid-template-columns:1fr", "overflow-x:hidden",
+        "holding_until", "review_at", "valid_until", "expires", "name=\"order_type\"",
+        "expires:isoKst(a.get('expires'))", "@media(max-width:390px)", "grid-template-columns:1fr", "overflow-x:hidden",
     ):
         assert text in APP_HTML
     # Green presentation is exclusively keyed to a real current-user buy fill.
