@@ -42,7 +42,7 @@ def connect() -> sqlite3.Connection:
     -- Additive per-user setting. Missing legacy rows deliberately read as 500,000.
     CREATE TABLE IF NOT EXISTS user_settings (
       user_id INTEGER PRIMARY KEY REFERENCES users(id),
-      default_paper_amount INTEGER NOT NULL CHECK(default_paper_amount BETWEEN 10000 AND 1000000000)
+      default_paper_amount INTEGER NOT NULL CHECK(typeof(default_paper_amount)='integer' AND default_paper_amount BETWEEN 10000 AND 1000000000)
     );
     CREATE TABLE IF NOT EXISTS order_plans (
       id INTEGER PRIMARY KEY, card_id INTEGER NOT NULL REFERENCES decision_cards(id), card_version INTEGER NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id),

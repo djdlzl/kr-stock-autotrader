@@ -1,4 +1,5 @@
 """Decision-card UI/API regression coverage."""
+import json
 import os
 import re
 import subprocess
@@ -73,3 +74,22 @@ console.log(JSON.stringify([filterCards(cards,all).length,filterCards(cards,{ver
 """
     output = subprocess.check_output(["node", "-e", script], text=True, env=os.environ).strip()
     assert output == "[3,1,1,0]"
+
+
+def test_fresh_buy_form_uses_safe_server_default_not_card_amount(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "ui-default.db"))
+    from app import app
+    client = TestClient(app)
+    assert client.post("/api/signup", json={"email": "ui-default@test.com", "password": "long-password"}).status_code == 200
+    assert client.patch("/api/settings/paper", json={"default_paper_amount": 700000}).status_code == 200
+    db = dbmod.connect()
+    ev = create_evidence(db, {"symbol":"005930","name":"삼성전자","kind":"공시","title":"실적","summary":"호재","source":"DART","source_url":"https://example.test/e","snapshot":{"safe":True},"dedupe_key":"ui-default","known_at":"2026-08-31T09:00:00+09:00"})
+    passed = save_filter(db, ev["id"], raw(), AS_OF, "2026-08-31T09:00:00+09:00")
+    created = save_card(db, card(ev["id"], passed["id"], max_amount=250))
+    db.close()
+    detail = client.get(f"/api/cards/{created['id']}").json()
+    assert detail["card"]["max_amount"] == 250
+    assert detail["user_state"]["default_paper_amount"] == 700000
+    helper = next(line for line in __import__("kr_stock_autotrader.ui", fromlist=["APP_HTML"]).APP_HTML.splitlines() if line.startswith("function draftValues"))
+    output = subprocess.check_output(["node", "-e", helper + ";console.log(draftValues(" + json.dumps(detail) + ").max_amount)"], text=True).strip()
+    assert output == "700000"

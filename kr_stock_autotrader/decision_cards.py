@@ -191,7 +191,7 @@ def user_card_view(db, ident, user_id):
         plan_view["events"]=[dict(x) for x in db.execute("SELECT event,reason,at FROM order_events WHERE order_plan_id=? ORDER BY id",(plan["id"],))]
         plan_view["position"]=dict(db.execute("SELECT symbol,qty,avg_price,status FROM positions WHERE order_plan_id=?",(plan["id"],)).fetchone() or {})
         plan_view["exit_lineage"]=[dict(x) for x in db.execute("SELECT rule,quote_known_at,created_at FROM exit_lineage WHERE order_plan_id=? ORDER BY id",(plan["id"],))]
-    result["user_state"]={"decision":dict(decision) if decision else None,"order_plan":plan_view,"draft":({**dict(draft),"snapshot":json.loads(draft["snapshot_json"])} if draft else None)}
+    result["user_state"]={"decision":dict(decision) if decision else None,"order_plan":plan_view,"draft":({**dict(draft),"snapshot":json.loads(draft["snapshot_json"])} if draft else None),"default_paper_amount":_default_paper_amount(db, user_id)}
     return result
 
 def list_cards(db, missing=False, date=None):
@@ -256,11 +256,12 @@ def edit_draft(db, card_id, user_id, override):
     if c["invalidated_at"]: raise HTTPException(409,"card invalidated")
     if c["card"]["filter_verdict"] != "PASS" or c["verdict"] != "매수 검토 가능": raise HTTPException(409,"non-PASS card cannot create draft")
     _validate_override(override)
+    draft = db.execute("SELECT * FROM order_plan_drafts WHERE card_id=? AND user_id=? AND status='draft'", (card_id, user_id)).fetchone()
     existing = db.execute("SELECT * FROM order_plans WHERE card_id=? AND user_id=? ORDER BY id DESC LIMIT 1", (card_id, user_id)).fetchone()
-    # A card's pre-existing lineage is authoritative; otherwise freeze today's user default in its first draft.
-    base = _plan_snapshot(existing) if existing else None
-    x=_snapshot(c, base, None if base else _default_paper_amount(db, user_id))
-    x.update(override or {})
+    # Omitted fields always inherit the immutable active draft first, then plan lineage, then today's default.
+    base = json.loads(draft["snapshot_json"]) if draft else (_plan_snapshot(existing) if existing else _snapshot(c, default_amount=_default_paper_amount(db, user_id)))
+    x = dict(base)
+    x.update(override)
     _snapshot(c, x)
     db.execute("INSERT INTO order_plan_drafts(card_id,user_id,snapshot_json,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(card_id,user_id,status) DO UPDATE SET snapshot_json=excluded.snapshot_json,updated_at=excluded.updated_at",(card_id,user_id,canon(x),now(),now()))
     db.commit(); return {"card_id":card_id,"status":"draft","draft":x}
@@ -271,8 +272,12 @@ def edit_order_plan(db, plan_id, user_id, override):
     if p["user_id"] != user_id: raise HTTPException(404, "order plan not found")
     _validate_override(override)
     c = card_detail(db, p["card_id"])
-    base = {"symbol":p["symbol"], "window":{"start":p["window_start"],"end":p["window_end"]}, "price_cap":p["price_cap"], "max_amount":p["max_amount"], "max_qty":p["max_qty"], "split":json.loads(p["split_json"]), "order_type":p["order_type"], "stop_loss":p["stop_loss"], "take_profit":json.loads(p["take_profit_json"]), "evidence_invalidation":json.loads(p["evidence_invalidation"]), "holding_until":p["holding_until"], "review_at":p["review_at"], "valid_until":p["valid_until"], "expires":p["expires_at"]}
-    base.update(override or {}); _snapshot(c, base)
+    draft = db.execute("SELECT * FROM order_plan_drafts WHERE card_id=? AND user_id=? AND status='draft'", (p["card_id"], user_id)).fetchone()
+    if draft and draft["supersedes_plan_id"] != plan_id:
+        raise HTTPException(409, "draft belongs to a different order plan")
+    base = json.loads(draft["snapshot_json"]) if draft else _plan_snapshot(p)
+    base = dict(base)
+    base.update(override); _snapshot(c, base)
     db.execute("INSERT INTO order_plan_drafts(card_id,user_id,snapshot_json,supersedes_plan_id,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(card_id,user_id,status) DO UPDATE SET snapshot_json=excluded.snapshot_json,supersedes_plan_id=excluded.supersedes_plan_id,updated_at=excluded.updated_at", (c["id"],user_id,canon(base),plan_id,now(),now()))
     position = db.execute("SELECT qty FROM positions WHERE order_plan_id=?", (plan_id,)).fetchone()
     status = "review_required" if position and position["qty"] > 0 else "entry_invalidated"
@@ -308,7 +313,11 @@ def user_decision(db,card_id,user_id,decision,note=""):
     vh=f"{base_hash}:{generation}"
     db.execute("INSERT INTO user_decisions(card_id,user_id,decision,decided_at,note) VALUES(?,?,?,?,?) ON CONFLICT(card_id,user_id) DO UPDATE SET decision=excluded.decision,decided_at=excluded.decided_at,note=excluded.note",(card_id,user_id,"approve",now(),note))
     p=db.execute("INSERT INTO order_plans(card_id,card_version,user_id,approved_at,valid_until,symbol,window_start,window_end,price_cap,max_amount,max_qty,split_json,order_type,stop_loss,take_profit_json,evidence_invalidation,holding_until,review_at,expires_at,status,version_hash,approval_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",(c["id"],c["version"],user_id,now(),valid_until.isoformat(),x["symbol"],window["start"],window["end"],x["price_cap"],x["max_amount"],x["max_qty"],canon(x.get("split",[])),x.get("order_type","limit"),x["stop_loss"],canon(x["take_profit"]),canon(x["evidence_invalidation"]),x.get("holding_until"),x.get("review_at"),expires.isoformat(),"approved",vh,generation)).fetchone()
-    if draft: db.execute("UPDATE order_plan_drafts SET status='approved' WHERE id=?",(draft["id"],))
+    if draft:
+        # The partial unique key permits one draft and one approved snapshot per card/user.
+        # Preserve prior approved drafts as lineage before freezing this reapproval snapshot.
+        db.execute("UPDATE order_plan_drafts SET status='superseded' WHERE card_id=? AND user_id=? AND status='approved'", (card_id, user_id))
+        db.execute("UPDATE order_plan_drafts SET status='approved' WHERE id=?",(draft["id"],))
     audit(db,str(user_id),"approve","decision_card",card_id);db.commit();return {"decision":"approve","order_plan_hash":vh,"order_plan_id":p["id"],"idempotent":False}
 
 def evaluate_order_plan(db,plan_id,tick,server_now=None):
