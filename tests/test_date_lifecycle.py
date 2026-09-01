@@ -146,3 +146,32 @@ def test_historical_summary_uses_only_selected_business_day_scheduler_runs(monke
     historical = client.get("/api/cards/summary?date=2026-08-31").json()
     assert historical["최근 실행"]["07:00"]["상태"] == "success"
     assert historical["최근 실행"]["08:00"]["상태"] == "success"
+
+
+def test_card_fill_summary_is_user_scoped_across_all_plan_generations(monkeypatch, tmp_path):
+    """Only actual fills for this card and this user define the display state."""
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "fill-summary.db"))
+    db = dbmod.connect()
+    _, card_row = _seed(db, "fills", "2026-08-31T10:00:00+09:00")
+    db.executemany("INSERT INTO users(email,password) VALUES(?,?)", [("one@test", "p"), ("two@test", "p")])
+    base = (card_row["id"], 1, "2026-08-31T09:00:00+09:00", "2026-09-01T10:00:00+09:00", "005930", 100, 1000, 10, "[]", "limit", 80, "[]", "{}", "2026-09-01T10:00:00+09:00", "hash")
+    # Two user-one generations prove aggregation isn't limited to the newest plan.
+    for user_id, suffix in ((1, "old"), (1, "new"), (2, "other")):
+        db.execute("""INSERT INTO order_plans(card_id,card_version,user_id,approved_at,valid_until,symbol,price_cap,max_amount,max_qty,split_json,order_type,stop_loss,take_profit_json,evidence_invalidation,expires_at,status,version_hash)
+          VALUES(?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?, 'closed',?)""", base[:2] + (user_id,) + base[2:-1] + (base[-1] + suffix,))
+    plans = [row["id"] for row in db.execute("SELECT id FROM order_plans ORDER BY id")]
+    db.commit()
+    from kr_stock_autotrader.decision_cards import user_card_view
+    assert user_card_view(db, card_row["id"], 1)["fill_summary"] == {"first_buy_at": None, "last_full_sell_at": None, "fill_state": "unfilled"}
+    db.execute("INSERT INTO order_fills(order_plan_id,event_key,side,qty,price,filled_at) VALUES(?,?,?,?,?,?)", (plans[0], "buy-old", "buy", 2, 90, "2026-08-31T10:01:00+09:00"))
+    db.execute("INSERT INTO order_fills(order_plan_id,event_key,side,qty,price,filled_at) VALUES(?,?,?,?,?,?)", (plans[1], "buy-new", "buy", 3, 91, "2026-08-31T10:02:00+09:00"))
+    db.execute("INSERT INTO order_fills(order_plan_id,event_key,side,qty,price,filled_at) VALUES(?,?,?,?,?,?)", (plans[1], "partial", "sell", 4, 95, "2026-08-31T11:00:00+09:00"))
+    db.execute("INSERT INTO order_fills(order_plan_id,event_key,side,qty,price,filled_at) VALUES(?,?,?,?,?,?)", (plans[2], "other-buy", "buy", 9, 90, "2026-08-31T09:00:00+09:00"))
+    db.commit()
+    partial = user_card_view(db, card_row["id"], 1)["fill_summary"]
+    assert partial == {"first_buy_at": "2026-08-31T10:01:00+09:00", "last_full_sell_at": None, "fill_state": "bought"}
+    assert user_card_view(db, card_row["id"], 2)["fill_summary"] == {"first_buy_at": "2026-08-31T09:00:00+09:00", "last_full_sell_at": None, "fill_state": "bought"}
+    db.execute("INSERT INTO order_fills(order_plan_id,event_key,side,qty,price,filled_at) VALUES(?,?,?,?,?,?)", (plans[1], "final", "sell", 1, 96, "2026-08-31T12:00:00+09:00")); db.commit()
+    complete = user_card_view(db, card_row["id"], 1)["fill_summary"]
+    assert complete == {"first_buy_at": "2026-08-31T10:01:00+09:00", "last_full_sell_at": "2026-08-31T12:00:00+09:00", "fill_state": "sold_complete"}
+    assert set(user_card_view(db, card_row["id"], 1)["fill_summary"]) == {"first_buy_at", "last_full_sell_at", "fill_state"}

@@ -1,4 +1,7 @@
 """Decision-card UI/API regression coverage."""
+import os
+import re
+import subprocess
 import tempfile
 from fastapi.testclient import TestClient
 from kr_stock_autotrader import db as dbmod
@@ -33,3 +36,37 @@ def test_authenticated_card_summary_and_safe_detail(monkeypatch, tmp_path):
     assert "새 매수 계획" not in html
     assert client.get("/api/cards/missing").status_code == 200
     assert client.get("/api/cards/summary?date=2026-99-99").status_code == 422
+
+
+def test_fill_timestamp_and_dropdown_filter_ui_contract_is_present():
+    """Keep the client-side display/filter contract deterministic and auditable."""
+    from kr_stock_autotrader.ui import APP_HTML
+    for text in (
+        "매수일시", "매도일시", "fill_summary?.first_buy_at", "fill_summary?.last_full_sell_at",
+        "card ${bought?'purchased':''}", "first_buy_at", "last_full_sell_at", "fill_state",
+        "판단<select", "내 결정<select", "체결<select", "카드 상태<select", "필터 초기화",
+        "매수 검토 가능", "관찰", "제외", "판단 보류", "승인", "보류", "거절", "미판단",
+        "매도완료", "미체결", "카드 미생성", "&&", "$('#date').onchange=load",
+        "@media(max-width:390px)", "grid-template-columns:1fr", "overflow-x:hidden",
+    ):
+        assert text in APP_HTML
+    # Green presentation is exclusively keyed to a real current-user buy fill.
+    assert "const bought=Boolean(c.fill_summary?.first_buy_at)" in APP_HTML
+    assert "last_full_sell_at" in APP_HTML and "kst(summary?.last_full_sell_at)" in APP_HTML
+
+
+def test_dropdown_predicate_uses_and_semantics_for_card_and_missing_rows():
+    from kr_stock_autotrader.ui import APP_HTML
+    helpers = re.search(r"function decision.*?function selected\(id\)\{[^}]*\}", APP_HTML, re.S).group(0)
+    predicate = re.search(r"function filterCards.*?(?=function matches)", APP_HTML, re.S).group(0)
+    script = helpers + predicate + """
+const cards=[
+ {card:{},verdict:'매수 검토 가능',user_state:{decision:{decision:'approve'}},fill_summary:{fill_state:'bought'}},
+ {card:{},verdict:'관찰',user_state:{decision:{decision:'hold'}},fill_summary:{fill_state:'sold_complete'},invalidated_at:'x'},
+ {symbol:'005930'}
+];
+const all={verdict:'전체',decision:'전체',fill:'전체',status:'전체'};
+console.log(JSON.stringify([filterCards(cards,all).length,filterCards(cards,{verdict:'매수 검토 가능',decision:'approve',fill:'bought',status:'current'}).length,filterCards(cards,{verdict:'전체',decision:'undecided',fill:'unfilled',status:'missing'}).length,filterCards(cards,{verdict:'매수 검토 가능',decision:'hold',fill:'bought',status:'current'}).length]));
+"""
+    output = subprocess.check_output(["node", "-e", script], text=True, env=os.environ).strip()
+    assert output == "[3,1,1,0]"

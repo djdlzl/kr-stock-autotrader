@@ -138,6 +138,26 @@ def save_card(db,data):
     audit(db,"internal","save","decision_card",r["id"]);db.commit();return card_detail(db,r["id"])
 def card_detail(db,ident):
     d=dict(row(db,"decision_cards",ident));d["card"]=json.loads(d.pop("card_json"));return d
+def user_fill_summary(db, card_id, user_id):
+    """Safe, card-wide paper-fill display state for one authenticated user.
+
+    A card can have several approval generations.  Aggregate their actual
+    fills instead of trusting plan status or the newest generation, and scope
+    the join through the owning user's plans before exposing any result.
+    """
+    totals = db.execute("""SELECT
+      MIN(CASE WHEN f.side='buy' THEN f.filled_at END) AS first_buy_at,
+      MAX(CASE WHEN f.side='sell' THEN f.filled_at END) AS latest_sell_at,
+      COALESCE(SUM(CASE WHEN f.side='buy' THEN f.qty ELSE 0 END), 0) AS buy_qty,
+      COALESCE(SUM(CASE WHEN f.side='sell' THEN f.qty ELSE 0 END), 0) AS sell_qty
+      FROM order_plans p LEFT JOIN order_fills f ON f.order_plan_id=p.id
+      WHERE p.card_id=? AND p.user_id=?""", (card_id, user_id)).fetchone()
+    bought, sold = totals["buy_qty"], totals["sell_qty"]
+    if not bought:
+        return {"first_buy_at": None, "last_full_sell_at": None, "fill_state": "unfilled"}
+    if sold >= bought:
+        return {"first_buy_at": totals["first_buy_at"], "last_full_sell_at": totals["latest_sell_at"], "fill_state": "sold_complete"}
+    return {"first_buy_at": totals["first_buy_at"], "last_full_sell_at": None, "fill_state": "bought"}
 def user_card_view(db, ident, user_id):
     """Safe read model for the owner-facing UI; never expose internal raw input."""
     result=card_detail(db,ident)
@@ -147,6 +167,7 @@ def user_card_view(db, ident, user_id):
     filter_result=filter_detail(db,result["filter_id"])
     result["filter"]={k:filter_result.get(k) for k in ("id","verdict","reasons","as_of","known_at")}
     result["filter"]["computed"]=filter_result.get("computed_outputs",{}).get("computed",{})
+    result["fill_summary"] = user_fill_summary(db, ident, user_id)
     decision=db.execute("SELECT decision,decided_at,note FROM user_decisions WHERE card_id=? AND user_id=?",(ident,user_id)).fetchone()
     plan=db.execute("SELECT * FROM order_plans WHERE card_id=? AND user_id=? ORDER BY id DESC LIMIT 1",(ident,user_id)).fetchone()
     draft=db.execute("SELECT snapshot_json,status,updated_at,supersedes_plan_id FROM order_plan_drafts WHERE card_id=? AND user_id=? AND status='draft'",(ident,user_id)).fetchone()
