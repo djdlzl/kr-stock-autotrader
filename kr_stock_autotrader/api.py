@@ -1,4 +1,5 @@
 """FastAPI boundary for Giraffe's paper-only trading planner."""
+import math
 import sqlite3
 import re
 import threading
@@ -163,22 +164,34 @@ def _cache_get(key: tuple[int, str], now: float) -> dict | None:
         return dict(cached[1]) if cached else None
 
 
-_KIS_SUCCESS_FIELDS = ("symbol", "price", "volume", "quote_known_at", "retrieved_at", "timestamp_source", "market_status", "halt_status", "management_status")
+_KIS_OPTIONAL_STATUS_FIELDS = ("market_status", "halt_status", "management_status")
 _KIS_APPROVED_TIMESTAMP_SOURCES = {"network_retrieved_at"}
 
 
 def _valid_kis_retrieved_at(value: object) -> str | None:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or any(ord(char) < 32 or ord(char) == 127 for char in value):
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return value if parsed.tzinfo is not None else None
+    return value if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+
+
+def _valid_kis_number(value: object, *, minimum: float) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    normalized = float(value)
+    return normalized if math.isfinite(normalized) and normalized >= minimum else None
+
+
+def _valid_omitted_kis_status(value: object) -> bool:
+    """Validate supplied optional statuses even though no status is projected yet."""
+    return isinstance(value, str) and len(value) <= 64 and not any(ord(char) < 32 or ord(char) == 127 for char in value)
 
 
 def _safe_kis_quote(symbol: str, outcome: object) -> dict:
-    """Project every provider outcome onto a schema that cannot carry raw KIS data."""
+    """Project provider outcomes onto a closed schema that cannot carry raw KIS data."""
     unavailable = {"symbol": symbol, "status": "unavailable", "source": "KIS", "environment": "production"}
     if not isinstance(outcome, dict):
         return unavailable
@@ -190,9 +203,31 @@ def _safe_kis_quote(symbol: str, outcome: object) -> dict:
         if timestamp_source in _KIS_APPROVED_TIMESTAMP_SOURCES:
             unavailable["timestamp_source"] = timestamp_source
         return unavailable
-    safe = {name: outcome[name] for name in _KIS_SUCCESS_FIELDS if name in outcome}
-    safe.update({"status": "ok", "source": "KIS", "environment": "production"})
-    return safe
+    quote_known_at = _valid_kis_retrieved_at(outcome.get("quote_known_at"))
+    price = _valid_kis_number(outcome.get("price"), minimum=0.0)
+    volume = _valid_kis_number(outcome.get("volume"), minimum=0.0)
+    if (
+        not isinstance(symbol, str)
+        or re.fullmatch(r"\d{6}", symbol) is None
+        or outcome.get("symbol") != symbol
+        or price is None or price <= 0
+        or volume is None
+        or retrieved_at is None or quote_known_at is None
+        or timestamp_source != "network_retrieved_at"
+        or any(field in outcome and not _valid_omitted_kis_status(outcome[field]) for field in _KIS_OPTIONAL_STATUS_FIELDS)
+    ):
+        return unavailable
+    return {
+        "symbol": symbol,
+        "price": price,
+        "volume": volume,
+        "quote_known_at": quote_known_at,
+        "retrieved_at": retrieved_at,
+        "timestamp_source": "network_retrieved_at",
+        "source": "KIS",
+        "environment": "production",
+        "status": "ok",
+    }
 
 
 def _cache_success(key: tuple[int, str], quote: dict) -> dict:

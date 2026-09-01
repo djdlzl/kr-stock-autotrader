@@ -23,6 +23,13 @@ No credential-bearing or authenticated external call was made.
 - `live_dry_run_receipts` is additive and safe-field-only, unique on `(order_plan_id,user_id,dry_run_key)`. The pure evaluator never imports/calls PaperBroker or the order evaluator and does not mutate plans/fills/positions/order evaluations/events.
 - UI adds read-only KIS status/current quote and an approved-plan `실전주문 사전점검` action. It explicitly says `실전 주문은 아직 비활성화`; no live order/toggle was added.
 
+## Closed typed success-projection repair
+
+- Success results now require the requested exact six-digit symbol, finite non-boolean numeric `price > 0` and `volume >= 0`, aware/control-free ISO `quote_known_at` and `retrieved_at`, and exactly `timestamp_source=network_retrieved_at`.
+- The API constructs its own minimal projection: normalized finite floats plus constant `source=KIS` and `environment=production`; it never forwards provider source/environment/raw fields. Optional KIS statuses are intentionally not exposed until officially mapped. If supplied, they must be bounded control-free strings; nested/object/list values fail closed.
+- Malformed `status=ok` data produces the fixed unavailable projection, is never cached, and cached values pass through the same validator again before use.
+- RED→GREEN regression tests cover nested secret payloads for each formerly allowlisted field, wrong symbol, booleans, NaN/infinity/negative values, naive/control timestamps, timestamp-source mismatch, API/DB/log non-leakage, no failure caching/`WOULD_WAIT`, valid-cache operation, and cache revalidation. Final verification: focused `tests/test_kis_readonly_dryrun.py` 34 passed; full `python -m pytest -q` 110 passed; `python -m compileall -q kr_stock_autotrader tests`; `git diff --check`; changed-code secret scan.
+
 ## Limitations / handoff
 
 - No KIS live probe was run; manager gate should do at most OAuth + `005930` quote with controlled credentials.

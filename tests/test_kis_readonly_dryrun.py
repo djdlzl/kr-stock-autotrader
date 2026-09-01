@@ -52,7 +52,7 @@ def plan(**overrides):
     x={'id':1,'card_id':2,'card_version':1,'version_hash':'frozen','status':'approved','symbol':'005930','valid_until':'2026-08-28T12:00:00+09:00','expires_at':'2026-08-28T12:00:00+09:00','window_start':'2026-08-28T09:00:00+09:00','window_end':'2026-08-28T15:00:00+09:00','price_cap':71000,'max_qty':2,'max_amount':140000,'bought_qty':0,'bought_amount':0}
     x.update(overrides); return x
 def quote(**overrides):
-    x={'status':'ok','symbol':'005930','price':70000,'quote_known_at':NOW.isoformat(),'retrieved_at':NOW.isoformat(),'timestamp_source':'network_retrieved_at'};x.update(overrides);return x
+    x={'status':'ok','symbol':'005930','price':70000,'volume':1234,'quote_known_at':NOW.isoformat(),'retrieved_at':NOW.isoformat(),'timestamp_source':'network_retrieved_at'};x.update(overrides);return x
 
 def test_dry_run_uses_network_observation_not_exchange_trade_time():
     assert evaluate_live_dry_run(plan(),False,quote(),server_now=NOW)['result']=='WOULD_SUBMIT'
@@ -84,6 +84,76 @@ def test_successful_quote_cache_is_bounded_and_safe(monkeypatch):
     assert 'raw_secret' not in api._cached_kis_quote('005930')
     assert api.LiveDryRunIn(dry_run_key='safe_key-1').dry_run_key == 'safe_key-1'
     with pytest.raises(Exception): api.LiveDryRunIn(dry_run_key='bad key')
+
+
+@pytest.mark.parametrize("field,bad_value", [
+    ("symbol", {"nested": "KIS-TYPED-PROJECTION-SECRET"}),
+    ("price", {"nested": "KIS-TYPED-PROJECTION-SECRET"}),
+    ("volume", {"nested": "KIS-TYPED-PROJECTION-SECRET"}),
+    ("quote_known_at", {"nested": "KIS-TYPED-PROJECTION-SECRET"}),
+    ("retrieved_at", {"nested": "KIS-TYPED-PROJECTION-SECRET"}),
+    ("timestamp_source", {"nested": "KIS-TYPED-PROJECTION-SECRET"}),
+    ("market_status", {"nested": "KIS-TYPED-PROJECTION-SECRET"}),
+    ("halt_status", {"nested": "KIS-TYPED-PROJECTION-SECRET"}),
+    ("management_status", {"nested": "KIS-TYPED-PROJECTION-SECRET"}),
+    ("symbol", "000001"), ("price", True), ("volume", False),
+    ("price", float("nan")), ("price", float("inf")), ("volume", float("-inf")),
+    ("price", -1), ("volume", -1), ("quote_known_at", "2026-08-28T10:00:00"),
+    ("retrieved_at", "2026-08-28T10:00:00"), ("timestamp_source", "exchange_trade_time"),
+    ("quote_known_at", "2026-08-28T10:00:00+09:00\x00KIS-TYPED-PROJECTION-SECRET"),
+])
+def test_malformed_success_is_closed_typed_unavailable_not_cached_or_leaked(monkeypatch, caplog, field, bad_value):
+    from fastapi.testclient import TestClient
+    from kr_stock_autotrader import api, db as dbmod
+    from kr_stock_autotrader.auth import issue_session
+    from tests.test_decision_card_invariants import make_plan
+
+    secret = "KIS-TYPED-PROJECTION-SECRET"
+    path = tempfile.mktemp(suffix=".db")
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", path)
+    db = dbmod.connect()
+    _, plan_id = make_plan(db)
+    db.execute("UPDATE order_plans SET valid_until=?, expires_at=? WHERE id=?", ("2099-12-31T23:59:00+09:00", "2099-12-31T23:59:00+09:00", plan_id))
+    db.commit(); db.close()
+    calls = []
+
+    def provider(symbol):
+        calls.append(symbol)
+        return {**quote(symbol=symbol), field: bad_value, "source": secret, "environment": secret}
+
+    monkeypatch.setattr(api.app.state, "kis_quote_provider", provider, raising=False)
+    api._quote_cache.clear()
+    client = TestClient(api.app); client.cookies.set("session", issue_session(1))
+    quote_response = client.get("/api/kis/quote/005930")
+    dry_response = client.post(f"/api/order-plans/{plan_id}/live-dry-run", json={"dry_run_key": "typed-projection-key"})
+    assert quote_response.json()["status"] == "unavailable"
+    assert dry_response.json()["result"] == "WOULD_WAIT"
+    assert api._quote_cache == {} and calls == ["005930", "005930"]
+    check = dbmod.connect()
+    try:
+        serialized_db = " ".join(str(value) for row in check.execute("SELECT * FROM live_dry_run_receipts") for value in row)
+    finally:
+        check.close()
+    assert secret not in str(quote_response.json()) + str(dry_response.json()) + serialized_db + caplog.text
+
+
+def test_success_projection_normalizes_numbers_omits_statuses_and_revalidates_cache(monkeypatch):
+    from kr_stock_autotrader import api
+    api._quote_cache.clear()
+    calls = []
+
+    def provider(symbol):
+        calls.append(symbol)
+        return {**quote(symbol=symbol, price=70000, volume=1234), "market_status": "normal", "halt_status": "none", "management_status": "none"}
+
+    monkeypatch.setattr(api.app.state, "kis_quote_provider", provider, raising=False)
+    result = api._cached_kis_quote("005930")
+    assert result["status"] == "ok" and result["price"] == 70000.0 and result["volume"] == 1234.0
+    assert not {"market_status", "halt_status", "management_status"} & set(result)
+    key = next(iter(api._quote_cache))
+    api._quote_cache[key] = (api.monotonic_time.monotonic(), {**result, "price": {"nested": "KIS-TYPED-PROJECTION-SECRET"}})
+    assert api._cached_kis_quote("005930")["status"] == "unavailable"
+    assert calls == ["005930"]
 
 
 def test_quote_single_flight_and_cache_and_lock_registries_are_bounded(monkeypatch):
