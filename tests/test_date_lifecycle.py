@@ -70,6 +70,47 @@ def test_date_scoped_lifecycle_api_uses_evidence_kst_day_and_latest_active_card(
     assert first.get("/api/cards/summary?date=2026-08-30").json()["전체 근거"] == 0
 
 
+def test_all_date_cards_show_only_current_active_versions_and_user_fill_states(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "all-date-cards.db"))
+    db = dbmod.connect()
+    day1, old = _seed(db, "lineage", "2026-08-31T10:00:00+09:00")
+    current = save_card(db, card(day1["id"], old["filter_id"]))
+    _, day2 = _seed(db, "day2", "2026-09-01T10:00:00+09:00")
+    db.close()
+
+    from app import app
+    owner, other = TestClient(app), TestClient(app)
+    assert owner.post("/api/signup", json={"email": "owner@test.com", "password": "long-password"}).status_code == 200
+    assert other.post("/api/signup", json={"email": "other@test.com", "password": "long-password"}).status_code == 200
+
+    db = dbmod.connect()
+    def plan_with_fills(card_row, fills):
+        plan_id = db.execute("""INSERT INTO order_plans(card_id,card_version,user_id,approved_at,valid_until,symbol,price_cap,max_amount,max_qty,split_json,order_type,stop_loss,take_profit_json,evidence_invalidation,expires_at,status,version_hash)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'closed',?) RETURNING id""", (
+            card_row["id"], card_row["version"], 1, "2026-08-31T09:00:00+09:00", "2026-09-02T10:00:00+09:00", "005930", 100, 1000, 10,
+            "[]", "limit", 80, "[]", "{}", "2026-09-02T10:00:00+09:00", card_row["id"],
+        )).fetchone()["id"]
+        db.executemany("INSERT INTO order_fills(order_plan_id,event_key,side,qty,price,filled_at) VALUES(?,?,?,?,?,?)", [
+            (plan_id, f"{plan_id}-{index}", side, qty, price, filled_at) for index, (side, qty, price, filled_at) in enumerate(fills)
+        ])
+
+    plan_with_fills(current, [("buy", 2, 90, "2026-08-31T10:00:00+09:00")])
+    plan_with_fills(day2, [("buy", 1, 91, "2026-09-01T10:00:00+09:00"), ("sell", 1, 95, "2026-09-01T11:00:00+09:00")])
+    db.commit(); db.close()
+
+    all_dates = owner.get("/api/cards")
+    assert all_dates.status_code == 200
+    visible = {item["id"]: item for item in all_dates.json()}
+    assert set(visible) == {current["id"], day2["id"]}
+    assert visible[current["id"]]["fill_summary"]["fill_state"] == "bought"
+    assert visible[day2["id"]]["fill_summary"]["fill_state"] == "sold_complete"
+    assert "snapshot" not in visible[current["id"]]["evidence"]
+    assert other.get("/api/cards").json()[0]["fill_summary"]["fill_state"] == "unfilled"
+    assert [item["id"] for item in owner.get("/api/cards?date=2026-08-31").json()] == [current["id"], old["id"]]
+    assert [item["id"] for item in owner.get("/api/cards?date=2026-09-01").json()] == [day2["id"]]
+    assert owner.get("/api/cards?date=not-a-date").status_code == 422
+
+
 def test_date_ui_has_server_date_picker_lifecycle_notice_and_mobile_constraints(monkeypatch, tmp_path):
     monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "ui.db"))
     from app import app
@@ -79,6 +120,8 @@ def test_date_ui_has_server_date_picker_lifecycle_notice_and_mobile_constraints(
     for text in ("재료 업무일", "카드 생성시각", "원문 발표시각", "카드 버전", "무효", "기준일", "type=\"date\"", "fresh quote/tick", "동결 조건 재검증", "overflow-x:hidden"):
         assert text in html
     assert "cards/summary'+q" in html and "cards/missing'+q" in html
+    assert "api('cards')" in html and "api('cards'+q)" not in html
+    assert "모든 기준일의 현재 카드" in html and "요약과 카드 미생성 목록에만 적용" in html
 
 
 def test_previous_business_day_is_timezone_independent():

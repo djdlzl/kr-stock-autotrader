@@ -241,8 +241,8 @@ def user_card_view(db, ident, user_id):
     result["user_state"]={"decision":dict(decision) if decision else None,"order_plan":plan_view,"draft":({**dict(draft),"snapshot":json.loads(draft["snapshot_json"])} if draft else None),"default_paper_amount":_default_paper_amount(db, user_id)}
     return result
 
-def list_cards(db, missing=False, date=None):
-    """History detail is append-only; date always means evidence.known_at KST day."""
+def list_cards(db, missing=False, date=None, current_only=False):
+    """Date-scoped requests retain history; current-only lists show active heads."""
     params = []
     date_clause = ""
     if date:
@@ -258,6 +258,11 @@ def list_cards(db, missing=False, date=None):
       JOIN material_evidence e ON e.id=c.evidence_id WHERE 1=1"""
     if date:
         query += " AND substr(e.known_at,1,10)=?"
+    if current_only:
+        query += """ AND c.invalidated_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM decision_cards newer
+            WHERE newer.lineage_key=c.lineage_key AND newer.version>c.version
+              AND newer.invalidated_at IS NULL)"""
     return [card_detail(db, item["id"]) for item in db.execute(query + " ORDER BY c.id DESC", params)]
 def _positive(value): return isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and value>0
 def _valid_plan(card):

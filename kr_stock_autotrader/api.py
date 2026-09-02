@@ -718,8 +718,8 @@ def user_cards_summary(request: Request, date: str | None = None):
 
 @app.get('/api/cards')
 def user_cards(request: Request, date: str | None = None):
-    uid=current_user(request); day=_business_date(date); db=connect()
-    try:return [user_card_view(db, item["id"], uid) for item in list_cards(db, date=day)]
+    uid=current_user(request); day=_business_date(date) if date is not None else None; db=connect()
+    try:return [user_card_view(db, item["id"], uid) for item in list_cards(db, date=day, current_only=date is None)]
     finally:db.close()
 
 
