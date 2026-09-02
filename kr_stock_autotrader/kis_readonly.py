@@ -150,8 +150,9 @@ class KISReadOnlyClient:
         if not isinstance(symbol, str) or not re.fullmatch(r"\d{6}", symbol) or as_of.tzinfo is None:
             raise ValueError("invalid daily-bar request")
         end = as_of.astimezone(KST).strftime("%Y%m%d")
-        # Request a short historical range; the projector rejects same-day/future bars.
-        start = (as_of.astimezone(KST) - timedelta(days=14)).strftime("%Y%m%d")
+        # At least 45 calendar days are needed for the declared 20-session
+        # denominator after holidays/mismatched trading calendars; use 60.
+        start = (as_of.astimezone(KST) - timedelta(days=60)).strftime("%Y%m%d")
         response = self._request("GET", DAILY_CHART_PATH, params={"FID_COND_MRKT_DIV_CODE":"J", "FID_INPUT_ISCD":symbol, "FID_INPUT_DATE_1":start, "FID_INPUT_DATE_2":end, "FID_PERIOD_DIV_CODE":"D", "FID_ORG_ADJ_PRC":"0"}, headers={"authorization":f"Bearer {self._token_value()}", "appkey":self._app_key, "appsecret":self._app_secret, "tr_id":DAILY_CHART_TR_ID})
         try:
             payload = response.json()

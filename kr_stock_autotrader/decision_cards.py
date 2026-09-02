@@ -89,10 +89,13 @@ def run_filter(inputs, as_of, known_at):
     observable=(inputs.get("observability") if isinstance(inputs.get("observability"),dict) else {})
     optional_premarket={key for key in ("current_volume","baseline_volume","gap_pct") if observable.get(key)=="not_yet_observable"}
     optional_sector=observable.get("sector_return_pct")=="unknown"
-    numbers={k:_num(inputs,k,reasons,positive=k in {"current_volume","baseline_volume","trading_value","market_cap"}) for k in ("stock_return_pct","benchmark_return_pct","sector_return_pct","current_volume","baseline_volume","trading_value","market_cap","recent_rise_pct","gap_pct","pre_announcement_return_pct") if k not in optional_premarket and not (k=="sector_return_pct" and optional_sector)}
-    for key in optional_premarket | ({"sector_return_pct"} if optional_sector else set()): numbers[key]=None
+    optional_pre_return=observable.get("pre_announcement_return_pct")=="unknown"
+    numbers={k:_num(inputs,k,reasons,positive=k in {"current_volume","baseline_volume","trading_value","market_cap"}) for k in ("stock_return_pct","benchmark_return_pct","sector_return_pct","current_volume","baseline_volume","trading_value","market_cap","recent_rise_pct","gap_pct","pre_announcement_return_pct") if k not in optional_premarket and not (k=="sector_return_pct" and optional_sector) and not (k=="pre_announcement_return_pct" and optional_pre_return)}
+    for key in optional_premarket | ({"sector_return_pct"} if optional_sector else set()) | ({"pre_announcement_return_pct"} if optional_pre_return else set()): numbers[key]=None
     for k in ("min_trading_value","min_market_cap","max_market_cap","max_recent_rise_pct","max_gap_pct","max_pre_return_pct"): _num(inputs,k,reasons,positive=k in {"min_trading_value","min_market_cap","max_market_cap"})
-    if inputs.get("trading_status")!="tradable": reasons.append("not tradable")
+    # KIS daily history has no authoritatively verified pre-market halt field.
+    # Only this exact explicit observability contract bypasses the tradability gate.
+    if not (inputs.get("trading_status")=="premarket_unverified" and observable.get("trading_status")=="premarket_unverified") and inputs.get("trading_status")!="tradable": reasons.append("not tradable")
     if numbers["trading_value"] is not None and numbers["trading_value"] < inputs.get("min_trading_value",float("inf")): reasons.append("trading value below minimum")
     if numbers["market_cap"] is not None and not (inputs.get("min_market_cap",float("inf")) <= numbers["market_cap"] <= inputs.get("max_market_cap",float("-inf"))): reasons.append("market cap outside range")
     for actual, limit, label in ((numbers["recent_rise_pct"],inputs.get("max_recent_rise_pct"),"recent rise"),(numbers["gap_pct"],inputs.get("max_gap_pct"),"gap"),(numbers["pre_announcement_return_pct"],inputs.get("max_pre_return_pct"),"pre-return")):
@@ -110,8 +113,16 @@ def save_filter(db,evidence_id,inputs,as_of,known_at):
         evidence_known, filter_known, filter_as_of = parse_kst(evidence["known_at"]), parse_kst(known_at), parse_kst(as_of)
     except (ValueError, TypeError):
         raise HTTPException(422, "evidence/filter timestamps must be KST ISO-8601")
-    if not evidence_known <= filter_known <= filter_as_of:
-        raise HTTPException(422, "evidence.known_at <= filter.known_at <= filter.as_of required")
+    try:
+        market_known = parse_kst(inputs.get("market_data_known_at"))
+    except (ValueError, TypeError):
+        raise HTTPException(422, "market_data_known_at must be KST ISO-8601")
+    if market_known > filter_known:
+        raise HTTPException(422, "market_data_known_at must be at or before filter.known_at")
+    if market_known > filter_as_of:
+        raise HTTPException(422, "market_data_known_at must be at or before as_of")
+    if not evidence_known <= market_known <= filter_known <= filter_as_of:
+        raise HTTPException(422, "evidence.known_at <= market_data_known_at <= filter.known_at <= filter.as_of required")
     out=run_filter(inputs,as_of,known_at)
     if out["verdict"] == "FAIL" and "market data known_at future of filter known_at" in out["reasons"]:
         raise HTTPException(422, "market_data_known_at must be at or before filter.known_at")

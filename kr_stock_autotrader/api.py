@@ -575,8 +575,9 @@ async def internal_market_snapshot(symbol: str, request: Request, _: None = Depe
         if _default_kis_client is None:
             _default_kis_client = KISReadOnlyClient()
         provider = _default_kis_client.daily_bars
-    snapshot = build_premarket_snapshot(symbol, as_of, provider)
-    return {"snapshot": snapshot, "filter_inputs": filter_inputs_from_snapshot(snapshot)}
+    announcement_at = data.get("announcement_at") if isinstance(data.get("announcement_at"), str) else None
+    snapshot = build_premarket_snapshot(symbol, as_of, provider, announcement_at)
+    return {'snapshot': snapshot, 'filter_inputs': filter_inputs_from_snapshot(snapshot)}
 
 
 @app.post('/api/internal/filters')

@@ -1,18 +1,22 @@
-"""Closed, pre-market KIS daily-bar projection and deterministic filter inputs.
+"""Fail-closed, pre-market KIS daily-bar projection and filter inputs.
 
-KIS contracts: domestic daily item chart (FHKST03010100) returns `output2`
-with `stck_bsop_date`, `stck_clpr`, `acml_vol`, `acml_tr_pbmn`, and `hts_avls`.
-`hts_avls` is in 100-million KRW units (KIS developer portal: 국내주식 일봉조회).
+The daily-chart projection uses only completed sessions.  A completed Korean
+cash-session close is conventionally recorded as 15:30 KST here; it is the
+``market_data_known_at`` for the latest included session, distinct from the
+actual network ``retrieved_at``.  This deliberately permits an honest later
+recovery of an 08:00 snapshot when all included sessions closed before as_of.
 """
 from __future__ import annotations
 import math
 import os
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from typing import Callable
-from .domain import KST, now_kst
+from .domain import KST, now_kst, parse_kst
 
 BENCHMARK_SYMBOL = "229200"
 MARKET_CAP_UNIT_KRW = 100_000_000.0
+RETURN_HORIZON_SESSIONS = 20
+KST_CASH_CLOSE = time(15, 30)
 
 
 def _number(value: object, *, positive: bool = False) -> float:
@@ -34,22 +38,53 @@ def _closed_bars(rows: object, as_of: datetime) -> list[dict]:
     if not isinstance(rows, list):
         raise ValueError("daily bars unavailable")
     result, seen = [], set()
+    as_of_day = as_of.astimezone(KST).date()
     for row in rows:
         if not isinstance(row, dict):
             raise ValueError("malformed daily bar")
         day = _date(row.get("stck_bsop_date"))
-        if day > as_of.astimezone(KST).date() or day in seen:
+        if day > as_of_day or day in seen:
             raise ValueError("future or duplicate daily bar")
-        # A same-calendar-day bar can be a live/partial provider row; it is not
-        # usable at 08:00 and is deliberately ignored rather than back-filled.
-        if day == as_of.astimezone(KST).date():
+        # A same-date row is partial/ambiguous before close and is never evidence.
+        if day == as_of_day:
             continue
         seen.add(day)
-        result.append({"day": day, "close": _number(row.get("stck_clpr"), positive=True), "volume": _number(row.get("acml_vol")), "value": _number(row.get("acml_tr_pbmn")), "market_cap": _number(row.get("hts_avls"), positive=True) * MARKET_CAP_UNIT_KRW})
+        result.append({"day": day, "close": _number(row.get("stck_clpr"), positive=True),
+                       "volume": _number(row.get("acml_vol")), "value": _number(row.get("acml_tr_pbmn")),
+                       "market_cap": _number(row.get("hts_avls"), positive=True) * MARKET_CAP_UNIT_KRW})
     result.sort(key=lambda item: item["day"], reverse=True)
-    if len(result) < 2:
-        raise ValueError("two completed bars required")
+    if len(result) < RETURN_HORIZON_SESSIONS + 1:
+        raise ValueError("insufficient completed daily bars for 20-session horizon")
     return result
+
+
+def _aligned(stock: list[dict], benchmark: list[dict]) -> list[tuple[dict, dict]]:
+    benchmark_by_day = {item["day"]: item for item in benchmark}
+    shared = [(item, benchmark_by_day[item["day"]]) for item in stock if item["day"] in benchmark_by_day]
+    if len(shared) < RETURN_HORIZON_SESSIONS + 1:
+        raise ValueError("insufficient aligned 20-session history")
+    return shared
+
+
+def _return(pair_rows: list[tuple[dict, dict]]) -> tuple[float, float]:
+    latest, prior = pair_rows[0], pair_rows[RETURN_HORIZON_SESSIONS]
+    return (round((latest[0]["close"] / prior[0]["close"] - 1) * 100, 8),
+            round((latest[1]["close"] / prior[1]["close"] - 1) * 100, 8))
+
+
+def _announcement_end(rows: list[tuple[dict, dict]], announcement_at: datetime) -> list[tuple[dict, dict]]:
+    announcement = announcement_at.astimezone(KST)
+    # After the 15:30 completed close, that date is permitted.  Before/during
+    # market announcement data must stop at the preceding completed session.
+    include_date = announcement.time() >= KST_CASH_CLOSE
+    eligible = [row for row in rows if row[0]["day"] <= announcement.date()] if include_date else [row for row in rows if row[0]["day"] < announcement.date()]
+    if len(eligible) < RETURN_HORIZON_SESSIONS + 1:
+        raise ValueError("insufficient announcement-boundary history")
+    return eligible
+
+
+def _known_at(day) -> datetime:
+    return datetime.combine(day, KST_CASH_CLOSE, tzinfo=KST)
 
 
 def _unavailable(symbol: str, reason: str, retrieved: datetime | None = None) -> dict:
@@ -59,27 +94,39 @@ def _unavailable(symbol: str, reason: str, retrieved: datetime | None = None) ->
     return out
 
 
-def build_premarket_snapshot(symbol: str, as_of: datetime, daily_bars: Callable[..., object]) -> dict:
-    """Build only from completed sessions strictly before `as_of` KST date."""
+def build_premarket_snapshot(symbol: str, as_of: datetime, daily_bars: Callable[..., object], announcement_at: str | None = None) -> dict:
+    """Build a 20-session, aligned snapshot from completed sessions only."""
     retrieved = now_kst()
     try:
         if not isinstance(symbol, str) or not (symbol.isdigit() and len(symbol) == 6) or as_of.tzinfo is None:
             raise ValueError("invalid request")
-        stock, benchmark = _closed_bars(daily_bars(symbol, as_of), as_of), _closed_bars(daily_bars(BENCHMARK_SYMBOL, as_of), as_of)
-        # Both latest completed bars must refer to the same trading session; otherwise do not compare returns.
-        if stock[0]["day"] != benchmark[0]["day"]:
-            raise ValueError("benchmark trading day mismatch")
-        stock_return = round((stock[0]["close"] / stock[1]["close"] - 1) * 100, 8)
-        benchmark_return = round((benchmark[0]["close"] / benchmark[1]["close"] - 1) * 100, 8)
-        known_at = retrieved.isoformat()
-        return {"symbol": symbol, "status": "ok", "source": "KIS", "environment": "production", "retrieved_at": known_at, "known_at": known_at,
-                "trading_day": stock[0]["day"].isoformat(), "stock_return_pct": stock_return, "benchmark_symbol": BENCHMARK_SYMBOL,
-                "benchmark_return_pct": benchmark_return, "trading_value_krw": stock[0]["value"], "market_cap_krw": stock[0]["market_cap"],
-                "recent_rise_pct": stock_return, "pre_announcement_return_pct": None, "trading_status": "unknown",
+        announcement = parse_kst(announcement_at) if announcement_at is not None else None
+        stock = _closed_bars(daily_bars(symbol, as_of), as_of)
+        benchmark = _closed_bars(daily_bars(BENCHMARK_SYMBOL, as_of), as_of)
+        aligned = _aligned(stock, benchmark)
+        market_known = _known_at(aligned[0][0]["day"])
+        if market_known > as_of.astimezone(KST):
+            raise ValueError("completed market data is not known at as_of")
+        stock_return, benchmark_return = _return(aligned)
+        pre_return = _return(_announcement_end(aligned, announcement))[0] if announcement else None
+        observability = {"gap_pct": "not_yet_observable", "current_volume": "not_yet_observable",
+                         "baseline_volume": "not_yet_observable", "sector_return_pct": "unknown",
+                         "trading_status": "premarket_unverified"}
+        if announcement is None:
+            observability["pre_announcement_return_pct"] = "unknown"
+        return {"symbol": symbol, "status": "ok", "source": "KIS", "environment": "production",
+                "retrieved_at": retrieved.isoformat(), "known_at": market_known.isoformat(),
+                "market_data_known_at": market_known.isoformat(), "trading_day": aligned[0][0]["day"].isoformat(),
+                "stock_return_pct": stock_return, "benchmark_symbol": BENCHMARK_SYMBOL,
+                "benchmark_return_pct": benchmark_return, "trading_value_krw": aligned[0][0]["value"],
+                "market_cap_krw": aligned[0][0]["market_cap"], "recent_rise_pct": stock_return,
+                "pre_announcement_return_pct": pre_return, "trading_status": "premarket_unverified",
                 "gap_pct": None, "current_volume": None, "baseline_volume": None, "sector_return_pct": None,
-                "observability": {"gap_pct": "not_yet_observable", "current_volume": "not_yet_observable", "baseline_volume": "not_yet_observable", "sector_return_pct": "unknown", "pre_announcement_return_pct": "unknown", "trading_status": "unknown"},
+                "observability": observability,
+                "horizons": {"stock_return_pct": "20 completed aligned sessions", "benchmark_return_pct": "20 completed aligned sessions", "recent_rise_pct": "20 completed aligned sessions", "pre_announcement_return_pct": "20 completed aligned sessions ending at announcement boundary"},
                 "units": {"returns": "percent", "trading_value_krw": "KRW", "market_cap_krw": "KRW (hts_avls x 100,000,000)"}}
-    except (TypeError, ValueError, KeyError):
+    except Exception:
+        # Provider/OAuth/HTTP/malformed responses are all intentionally collapsed.
         return _unavailable(symbol, "daily_bars_unavailable_or_invalid", retrieved)
 
 
@@ -95,14 +142,9 @@ def filter_inputs_from_snapshot(snapshot: object) -> dict:
     if not isinstance(snapshot, dict) or snapshot.get("status") != "ok":
         return {"market_data_status": "unavailable"}
     try:
-        thresholds = {"min_trading_value": _threshold("GIRAFFE_MIN_TRADING_VALUE_KRW"), "min_market_cap": _threshold("GIRAFFE_MIN_MARKET_CAP_KRW"), "max_market_cap": _threshold("GIRAFFE_MAX_MARKET_CAP_KRW"),
-                      "max_recent_rise_pct": _threshold("GIRAFFE_MAX_RECENT_RISE_PCT"), "max_gap_pct": _threshold("GIRAFFE_MAX_GAP_PCT"), "max_pre_return_pct": _threshold("GIRAFFE_MAX_PRE_RETURN_PCT")}
+        thresholds = {"min_trading_value": _threshold("GIRAFFE_MIN_TRADING_VALUE_KRW"), "min_market_cap": _threshold("GIRAFFE_MIN_MARKET_CAP_KRW"), "max_market_cap": _threshold("GIRAFFE_MAX_MARKET_CAP_KRW"), "max_recent_rise_pct": _threshold("GIRAFFE_MAX_RECENT_RISE_PCT"), "max_gap_pct": _threshold("GIRAFFE_MAX_GAP_PCT"), "max_pre_return_pct": _threshold("GIRAFFE_MAX_PRE_RETURN_PCT")}
         if thresholds["min_market_cap"] > thresholds["max_market_cap"]:
             raise ValueError("invalid market cap range")
-        out = {"market_data_known_at": snapshot["known_at"], "trading_status": snapshot["trading_status"], "trading_value": snapshot["trading_value_krw"], "market_cap": snapshot["market_cap_krw"],
-               "stock_return_pct": snapshot["stock_return_pct"], "benchmark_return_pct": snapshot["benchmark_return_pct"], "recent_rise_pct": snapshot["recent_rise_pct"], "pre_announcement_return_pct": snapshot["pre_announcement_return_pct"],
-               "gap_pct": snapshot.get("gap_pct"), "current_volume": snapshot.get("current_volume"), "baseline_volume": snapshot.get("baseline_volume"), "sector_return_pct": snapshot.get("sector_return_pct"),
-               "observability": snapshot.get("observability", {}), **thresholds}
-        return out
+        return {"market_data_known_at": snapshot["market_data_known_at"], "trading_status": snapshot["trading_status"], "trading_value": snapshot["trading_value_krw"], "market_cap": snapshot["market_cap_krw"], "stock_return_pct": snapshot["stock_return_pct"], "benchmark_return_pct": snapshot["benchmark_return_pct"], "recent_rise_pct": snapshot["recent_rise_pct"], "pre_announcement_return_pct": snapshot["pre_announcement_return_pct"], "gap_pct": snapshot.get("gap_pct"), "current_volume": snapshot.get("current_volume"), "baseline_volume": snapshot.get("baseline_volume"), "sector_return_pct": snapshot.get("sector_return_pct"), "observability": snapshot.get("observability", {}), **thresholds}
     except (KeyError, TypeError, ValueError):
         return {"market_data_status": "unavailable"}
