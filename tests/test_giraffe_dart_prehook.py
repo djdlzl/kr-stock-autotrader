@@ -77,7 +77,9 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             return {
                 "declared_total": 1, "declared_pages": 1, "pages_collected": 1,
                 "page_counts": [1], "unique_receipts": 1,
-                "material_candidate_count": 1, "complete": True, "date": date,
+                "material_candidate_count": 1,
+                "material_candidate_records": [{"rcp_no": "20260901000001", "row_text": "단일판매ㆍ공급계약체결"}],
+                "complete": True, "date": date,
             }
 
         with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "collect_manifest", fake_collect), patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "2026-08-31,20260901"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
@@ -86,6 +88,9 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(result["gate"], "GIRAFFE_DART_GATE_V1")
         self.assertTrue(result["complete"])
         self.assertEqual([item["date"] for item in result["dates"]], ["20260831", "20260901"])
+        for item in result["dates"]:
+            self.assertEqual(item["material_candidate_count"], len(item["material_candidate_records"]))
+            self.assertEqual(item["material_candidate_records"][0]["rcp_no"], "20260901000001")
 
     def test_gate_fails_nonzero_when_manifest_is_incomplete(self):
         with patch.object(self.gate, "collect_manifest", side_effect=self.gate.ManifestError("incomplete DART manifest")), contextlib.redirect_stdout(io.StringIO()) as output:

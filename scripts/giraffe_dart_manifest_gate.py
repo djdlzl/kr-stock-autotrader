@@ -44,6 +44,10 @@ def main() -> int:
                 "page_counts": manifest["page_counts"],
                 "unique_receipts": manifest["unique_receipts"],
                 "material_candidate_count": manifest["material_candidate_count"],
+                # Cron injects this stdout into the agent prompt.  Include the
+                # complete control list directly: a count/path-only summary
+                # cannot enforce exact-once review.
+                "material_candidate_records": manifest["material_candidate_records"],
                 "complete": manifest["complete"],
                 "manifest_path": str(output),
             })
