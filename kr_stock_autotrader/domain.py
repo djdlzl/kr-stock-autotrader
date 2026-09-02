@@ -1,6 +1,6 @@
 """Typed domain rules, all evaluated fail-closed."""
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from math import isclose
 from zoneinfo import ZoneInfo
 
@@ -38,9 +38,34 @@ def parse_kst(value: str) -> datetime:
     return parsed.replace(tzinfo=KST) if parsed.tzinfo is None else parsed.astimezone(KST)
 
 
+def is_krx_business_date(day: date) -> bool:
+    """KRX sessions configured for this runtime: weekdays excluding holidays."""
+    return day.weekday() < 5 and day.isoformat() not in KR_HOLIDAYS
+
+
+def previous_krx_business_date(day: date) -> date:
+    """Return the strictly preceding configured KRX business date."""
+    candidate = day - timedelta(days=1)
+    while not is_krx_business_date(candidate):
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def previous_krx_business_dates(day: date, count: int) -> list[date]:
+    """Return ``count`` KRX sessions ending strictly before ``day``, newest first."""
+    if count < 1:
+        raise ValueError("business-date count must be positive")
+    dates = []
+    for _ in range(count):
+        day = previous_krx_business_date(day)
+        dates.append(day)
+    return dates
+
+
 def market_open(at: datetime) -> bool:
     local = at.astimezone(KST)
-    return local.weekday() < 5 and local.date().isoformat() not in KR_HOLIDAYS and KRX_REGULAR_OPEN <= local.time() <= KRX_REGULAR_CLOSE
+    minute = (local.hour, local.minute)
+    return is_krx_business_date(local.date()) and (KRX_REGULAR_OPEN.hour, KRX_REGULAR_OPEN.minute) <= minute <= (KRX_REGULAR_CLOSE.hour, KRX_REGULAR_CLOSE.minute)
 
 
 def fresh_quote(quote: Quote, server_now: datetime) -> bool:

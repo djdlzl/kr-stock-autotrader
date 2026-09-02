@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
 import httpx
-from .domain import KST, now_kst
+from .domain import KST, now_kst, previous_krx_business_date
 
 PRODUCTION_BASE_URL = "https://openapi.koreainvestment.com:9443"
 OAUTH_PATH = "/oauth2/tokenP"
@@ -170,9 +170,9 @@ class KISReadOnlyClient:
         """Read the official output1 summary plus output2 bars as a closed object."""
         if not isinstance(symbol, str) or not re.fullmatch(r"\d{6}", symbol) or as_of.tzinfo is None:
             raise ValueError("invalid daily-bar request")
-        # A premarket request must ask only through yesterday; KIS may otherwise
-        # include a current-session row even before open.
-        end = (as_of.astimezone(KST).date() - timedelta(days=1)).strftime("%Y%m%d")
+        # A premarket request must ask only through the prior KRX business date;
+        # KIS may otherwise include a current-session row even before open.
+        end = previous_krx_business_date(as_of.astimezone(KST).date()).strftime("%Y%m%d")
         # At least 45 calendar days are needed for the declared 20-session
         # denominator after holidays/mismatched trading calendars; use 60.
         start = (as_of.astimezone(KST) - timedelta(days=60)).strftime("%Y%m%d")

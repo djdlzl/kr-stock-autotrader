@@ -1,7 +1,8 @@
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from app import Condition, Quote, evaluate_conditions, market_open
+from kr_stock_autotrader import domain
 
 KST = ZoneInfo("Asia/Seoul")
 NOW = datetime(2026, 8, 31, 10, 0, tzinfo=KST)
@@ -14,10 +15,18 @@ def q(**kw):
 
 
 def test_market_boundary_weekday_only():
-    assert market_open(datetime(2026, 8, 31, 9, 0, tzinfo=KST))
-    assert market_open(datetime(2026, 8, 31, 15, 30, tzinfo=KST))
+    assert market_open(datetime(2026, 8, 31, 9, 0, 0, tzinfo=KST))
+    assert market_open(datetime(2026, 8, 31, 15, 30, 59, tzinfo=KST))
+    assert not market_open(datetime(2026, 8, 31, 15, 31, 0, tzinfo=KST))
     assert not market_open(datetime(2026, 8, 31, 8, 59, tzinfo=KST))
     assert not market_open(datetime(2026, 8, 8, 10, 0, tzinfo=KST))
+
+
+def test_previous_krx_business_date_skips_weekends_and_configured_holiday_chain(monkeypatch):
+    assert domain.previous_krx_business_date(date(2026, 9, 7)) == date(2026, 9, 4)  # Monday
+    assert domain.previous_krx_business_date(date(2026, 9, 6)) == date(2026, 9, 4)  # Sunday
+    monkeypatch.setattr(domain, "KR_HOLIDAYS", frozenset({"2026-09-01", "2026-08-31"}))
+    assert domain.previous_krx_business_date(date(2026, 9, 2)) == date(2026, 8, 28)
 
 
 def test_conditions_units_and_fail_closed():

@@ -72,6 +72,30 @@ def test_daily_snapshot_uses_official_output1_summary_and_output2_bars():
     assert 'output1' not in repr(snapshot) and 'output2' not in repr(snapshot)
 
 
+@pytest.mark.parametrize(("as_of", "expected_end"), [
+    (datetime(2026, 9, 7, 8, tzinfo=KST), "20260904"),  # Monday
+    (datetime(2026, 9, 6, 8, tzinfo=KST), "20260904"),  # Sunday
+])
+def test_daily_snapshot_requests_previous_krx_business_date(as_of, expected_end):
+    transport = FakeTransport([
+        Response({'access_token':'x','expires_in':86400}),
+        Response({'rt_cd':'0', 'output1': {'hts_avls': '6503'}, 'output2': []}),
+    ])
+    KISReadOnlyClient('key', 'value', transport=transport).daily_snapshot('005930', as_of)
+    assert transport.calls[-1][2]['params']['FID_INPUT_DATE_2'] == expected_end
+
+
+def test_daily_snapshot_skips_configured_krx_holiday_chain(monkeypatch):
+    from kr_stock_autotrader import domain
+    monkeypatch.setattr(domain, "KR_HOLIDAYS", frozenset({"2026-09-01", "2026-08-31"}))
+    transport = FakeTransport([
+        Response({'access_token':'x','expires_in':86400}),
+        Response({'rt_cd':'0', 'output1': {'hts_avls': '6503'}, 'output2': []}),
+    ])
+    KISReadOnlyClient('key', 'value', transport=transport).daily_snapshot('005930', datetime(2026, 9, 2, 8, tzinfo=KST))
+    assert transport.calls[-1][2]['params']['FID_INPUT_DATE_2'] == '20260828'
+
+
 @pytest.mark.parametrize('output1', [{}, {'hts_avls': '0'}, {'hts_avls': True}, {'hts_avls': 'not-a-number'}])
 def test_daily_snapshot_rejects_missing_or_invalid_official_output1_market_cap(output1):
     transport = FakeTransport([Response({'access_token':'x','expires_in':86400}), Response({'rt_cd':'0', 'output1': output1, 'output2': []})])

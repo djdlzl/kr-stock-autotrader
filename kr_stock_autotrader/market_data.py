@@ -12,7 +12,7 @@ import math
 import os
 from datetime import datetime, time, timedelta
 from typing import Callable
-from .domain import KRX_REGULAR_OPEN, KST, now_kst, parse_kst
+from .domain import KRX_REGULAR_OPEN, KST, is_krx_business_date, now_kst, parse_kst, previous_krx_business_dates
 from .kis_readonly import DailySnapshot
 
 BENCHMARK_SYMBOL = "229200"
@@ -53,12 +53,18 @@ def _closed_bars(rows: object, as_of: datetime) -> list[dict]:
         # not a row we may silently discard.
         if day >= as_of_day or day in seen:
             raise ValueError("same-day, future, or duplicate daily bar")
+        if not is_krx_business_date(day):
+            raise ValueError("non-business daily bar")
         seen.add(day)
         result.append({"day": day, "close": _number(row.get("stck_clpr"), positive=True),
                        "volume": _number(row.get("acml_vol")), "value": _number(row.get("acml_tr_pbmn"))})
-    result.sort(key=lambda item: item["day"], reverse=True)
-    if len(result) < RETURN_HORIZON_SESSIONS + 1:
+    expected = previous_krx_business_dates(as_of.astimezone(KST).date(), RETURN_HORIZON_SESSIONS + 1)
+    by_day = {item["day"]: item for item in result}
+    if any(day not in by_day for day in expected):
         raise ValueError("insufficient completed daily bars for 20-session horizon")
+    # KIS may return more than the requested 21 rows.  Require every exact
+    # horizon date, but retain older validated sessions for announcement bounds.
+    result.sort(key=lambda item: item["day"], reverse=True)
     return result
 
 

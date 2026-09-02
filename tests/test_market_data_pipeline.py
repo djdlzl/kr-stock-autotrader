@@ -101,6 +101,28 @@ def test_same_day_bar_is_a_fail_closed_provider_error():
     assert result["reason"] == "daily_bars_unavailable_or_invalid"
 
 
+@pytest.mark.parametrize("missing_from", ["stock", "benchmark"])
+def test_missing_interior_required_business_session_fails_closed(missing_from):
+    from kr_stock_autotrader.market_data import build_premarket_snapshot
+    as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
+    rows = [row for row in history() if row["stck_bsop_date"] != "20260818"]
+    result = build_premarket_snapshot(
+        "005930", as_of,
+        lambda symbol, *_: official_snapshot(
+            rows if symbol == ("005930" if missing_from == "stock" else "229200") else history()))
+    assert result["status"] == "unavailable"
+
+
+def test_required_business_sessions_skip_configured_holiday(monkeypatch):
+    from kr_stock_autotrader import domain
+    from kr_stock_autotrader.market_data import build_premarket_snapshot
+    monkeypatch.setattr(domain, "KR_HOLIDAYS", frozenset({"2026-08-18"}))
+    as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
+    rows = [row for row in history() if row["stck_bsop_date"] != "20260818"]
+    result = build_premarket_snapshot("005930", as_of, lambda *_: official_snapshot(rows))
+    assert result["status"] == "ok"
+
+
 @pytest.mark.parametrize("failure", [
     lambda: RuntimeError("oauth secret"),
     lambda: RuntimeError("HTTP 503 secret"),
