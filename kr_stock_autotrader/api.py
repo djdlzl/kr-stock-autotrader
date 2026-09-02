@@ -569,12 +569,12 @@ async def internal_market_snapshot(symbol: str, request: Request, _: None = Depe
         as_of = parse_kst(data["as_of"])
     except (KeyError, TypeError, ValueError):
         raise HTTPException(422, "as_of must be KST ISO-8601")
-    provider = getattr(app.state, "kis_daily_bars_provider", None)
+    provider = getattr(app.state, "kis_daily_snapshot_provider", None)
     if provider is None:
         global _default_kis_client
         if _default_kis_client is None:
             _default_kis_client = KISReadOnlyClient()
-        provider = _default_kis_client.daily_bars
+        provider = _default_kis_client.daily_snapshot
     announcement_at = data.get("announcement_at") if isinstance(data.get("announcement_at"), str) else None
     snapshot = build_premarket_snapshot(symbol, as_of, provider, announcement_at)
     return {'snapshot': snapshot, 'filter_inputs': filter_inputs_from_snapshot(snapshot)}

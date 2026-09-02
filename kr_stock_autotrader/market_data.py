@@ -1,10 +1,9 @@
 """Fail-closed, pre-market KIS daily-bar projection and filter inputs.
 
-The daily-chart projection uses only completed sessions.  A completed Korean
-cash-session close is conventionally recorded as 15:30 KST here; it is the
-``market_data_known_at`` for the latest included session, distinct from the
-actual network ``retrieved_at``.  This deliberately permits an honest later
-recovery of an 08:00 snapshot when all included sessions closed before as_of.
+The daily-chart projection uses only completed sessions.  Daily bars are known
+at the completed 15:30 KST close, while KIS output1's market-cap summary is
+known only at network retrieval.  Since both are used, the overall snapshot is
+known no earlier than that retrieval and historical late replays fail closed.
 """
 from __future__ import annotations
 import math
@@ -12,6 +11,7 @@ import os
 from datetime import datetime, time, timedelta
 from typing import Callable
 from .domain import KST, now_kst, parse_kst
+from .kis_readonly import DailySnapshot
 
 BENCHMARK_SYMBOL = "229200"
 # KIS's official daily-chart sample has hts_avls=815363 for SK hynix alongside
@@ -53,8 +53,7 @@ def _closed_bars(rows: object, as_of: datetime) -> list[dict]:
             raise ValueError("same-day, future, or duplicate daily bar")
         seen.add(day)
         result.append({"day": day, "close": _number(row.get("stck_clpr"), positive=True),
-                       "volume": _number(row.get("acml_vol")), "value": _number(row.get("acml_tr_pbmn")),
-                       "market_cap": _number(row.get("hts_avls"), positive=True) * MARKET_CAP_UNIT_KRW})
+                       "volume": _number(row.get("acml_vol")), "value": _number(row.get("acml_tr_pbmn"))})
     result.sort(key=lambda item: item["day"], reverse=True)
     if len(result) < RETURN_HORIZON_SESSIONS + 1:
         raise ValueError("insufficient completed daily bars for 20-session horizon")
@@ -97,18 +96,27 @@ def _unavailable(symbol: str, reason: str, retrieved: datetime | None = None) ->
     return out
 
 
-def build_premarket_snapshot(symbol: str, as_of: datetime, daily_bars: Callable[..., object], announcement_at: str | None = None) -> dict:
+def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Callable[..., object], announcement_at: str | None = None) -> dict:
     """Build a 20-session, aligned snapshot from completed sessions only."""
     retrieved = now_kst()
     try:
         if not isinstance(symbol, str) or not (symbol.isdigit() and len(symbol) == 6) or as_of.tzinfo is None:
             raise ValueError("invalid request")
         announcement = parse_kst(announcement_at) if announcement_at is not None else None
-        stock = _closed_bars(daily_bars(symbol, as_of), as_of)
-        benchmark = _closed_bars(daily_bars(BENCHMARK_SYMBOL, as_of), as_of)
+        stock_source = daily_snapshot(symbol, as_of)
+        benchmark_source = daily_snapshot(BENCHMARK_SYMBOL, as_of)
+        if not isinstance(stock_source, DailySnapshot) or not isinstance(benchmark_source, DailySnapshot):
+            raise ValueError("daily snapshot contract invalid")
+        # Summary hts_avls is a retrieval-time observation, never a bar value.
+        retrieved = max(stock_source.retrieved_at, benchmark_source.retrieved_at)
+        if retrieved.tzinfo is None or retrieved > as_of.astimezone(KST):
+            raise ValueError("summary retrieval is after requested as_of")
+        market_cap = _number(stock_source.summary_market_cap_100m, positive=True) * MARKET_CAP_UNIT_KRW
+        stock = _closed_bars(list(stock_source.bars), as_of)
+        benchmark = _closed_bars(list(benchmark_source.bars), as_of)
         aligned = _aligned(stock, benchmark)
-        market_known = _known_at(aligned[0][0]["day"])
-        if market_known > as_of.astimezone(KST):
+        bars_known = _known_at(aligned[0][0]["day"])
+        if bars_known > as_of.astimezone(KST):
             raise ValueError("completed market data is not known at as_of")
         stock_return, benchmark_return = _return(aligned)
         pre_return = _return(_announcement_end(aligned, announcement))[0] if announcement else None
@@ -118,11 +126,12 @@ def build_premarket_snapshot(symbol: str, as_of: datetime, daily_bars: Callable[
         if announcement is None:
             observability["pre_announcement_return_pct"] = "unknown"
         return {"symbol": symbol, "status": "ok", "source": "KIS", "environment": "production",
-                "retrieved_at": retrieved.isoformat(), "known_at": market_known.isoformat(),
-                "market_data_known_at": market_known.isoformat(), "trading_day": aligned[0][0]["day"].isoformat(),
+                "retrieved_at": retrieved.isoformat(), "known_at": retrieved.isoformat(),
+                "daily_bars_known_at": bars_known.isoformat(), "summary_known_at": retrieved.isoformat(),
+                "market_data_known_at": retrieved.isoformat(), "trading_day": aligned[0][0]["day"].isoformat(),
                 "stock_return_pct": stock_return, "benchmark_symbol": BENCHMARK_SYMBOL,
                 "benchmark_return_pct": benchmark_return, "trading_value_krw": aligned[0][0]["value"],
-                "market_cap_krw": aligned[0][0]["market_cap"], "recent_rise_pct": stock_return,
+                "market_cap_krw": market_cap, "recent_rise_pct": stock_return,
                 "pre_announcement_return_pct": pre_return, "trading_status": "premarket_unverified",
                 "gap_pct": None, "current_volume": None, "baseline_volume": None, "sector_return_pct": None,
                 "observability": observability,

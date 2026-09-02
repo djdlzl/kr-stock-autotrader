@@ -57,6 +57,27 @@ def test_oauth_http_status_expiry_refresh_and_one_auth_retry():
     assert KISReadOnlyClient('key','value',transport=failed).current_price('005930')['status']=='unavailable'
     assert len(failed.calls)==1
 
+
+def test_daily_snapshot_uses_official_output1_summary_and_output2_bars():
+    rows = [{"stck_bsop_date": "20260901", "stck_clpr": "70000", "acml_vol": "1234", "acml_tr_pbmn": "80000000"}]
+    transport = FakeTransport([
+        Response({'access_token':'x','expires_in':86400}),
+        Response({'rt_cd':'0', 'output1': {'hts_avls': '6503', 'lstn_stcn': '1'}, 'output2': rows}),
+    ])
+    snapshot = KISReadOnlyClient('key', 'value', transport=transport).daily_snapshot('005930', datetime(2026, 9, 2, 8, tzinfo=KST))
+    assert snapshot.summary_market_cap_100m == 6503.0
+    assert snapshot.bars == tuple(rows)
+    assert snapshot.retrieved_at.tzinfo is not None
+    assert transport.calls[-1][2]['params']['FID_INPUT_DATE_2'] == '20260901'
+    assert 'output1' not in repr(snapshot) and 'output2' not in repr(snapshot)
+
+
+@pytest.mark.parametrize('output1', [{}, {'hts_avls': '0'}, {'hts_avls': True}, {'hts_avls': 'not-a-number'}])
+def test_daily_snapshot_rejects_missing_or_invalid_official_output1_market_cap(output1):
+    transport = FakeTransport([Response({'access_token':'x','expires_in':86400}), Response({'rt_cd':'0', 'output1': output1, 'output2': []})])
+    with pytest.raises(ValueError, match='daily snapshot unavailable'):
+        KISReadOnlyClient('key', 'value', transport=transport).daily_snapshot('005930', datetime(2026, 9, 2, 8, tzinfo=KST))
+
 def plan(**overrides):
     x={'id':1,'card_id':2,'card_version':1,'version_hash':'frozen','status':'approved','symbol':'005930','valid_until':'2026-08-28T12:00:00+09:00','expires_at':'2026-08-28T12:00:00+09:00','window_start':'2026-08-28T09:00:00+09:00','window_end':'2026-08-28T15:00:00+09:00','price_cap':71000,'max_qty':2,'max_amount':140000,'bought_qty':0,'bought_amount':0}
     x.update(overrides); return x

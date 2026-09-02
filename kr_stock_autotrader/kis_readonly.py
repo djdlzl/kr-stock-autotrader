@@ -2,6 +2,8 @@
 from __future__ import annotations
 import os
 import re
+import math
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
 import httpx
@@ -18,6 +20,23 @@ DAILY_CHART_TR_ID = "FHKST03010100"
 DAILY_CHART_OFFICIAL_REFERENCE = "https://apiportal.koreainvestment.com/api/apis/public/detail?accessUrl=/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
 TOKEN_REFRESH_SKEW = timedelta(seconds=30)
 MAX_TOKEN_LIFETIME = timedelta(hours=24)
+
+
+@dataclass(frozen=True, repr=False)
+class DailySnapshot:
+    """Closed internal KIS daily-chart contract; it is never an API payload."""
+    summary_market_cap_100m: float
+    bars: tuple[dict, ...]
+    retrieved_at: datetime
+
+
+def _positive_number(value: object) -> float:
+    if isinstance(value, bool):
+        raise ValueError("invalid KIS numeric field")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError("invalid KIS numeric field")
+    return number
 
 class Transport(Protocol):
     def request(self, method: str, url: str, **kwargs): ...
@@ -147,19 +166,26 @@ class KISReadOnlyClient:
             pass
         return {"symbol":symbol,"source":"KIS","environment":"production","status":"unavailable","retrieved_at":retrieved.isoformat(),"timestamp_source":"network_retrieved_at"}
 
-    def daily_bars(self, symbol: str, as_of: datetime) -> list[dict]:
-        """Return raw KIS bars only to the internal snapshot projector, never API output."""
+    def daily_snapshot(self, symbol: str, as_of: datetime) -> DailySnapshot:
+        """Read the official output1 summary plus output2 bars as a closed object."""
         if not isinstance(symbol, str) or not re.fullmatch(r"\d{6}", symbol) or as_of.tzinfo is None:
             raise ValueError("invalid daily-bar request")
-        end = as_of.astimezone(KST).strftime("%Y%m%d")
+        # A premarket request must ask only through yesterday; KIS may otherwise
+        # include a current-session row even before open.
+        end = (as_of.astimezone(KST).date() - timedelta(days=1)).strftime("%Y%m%d")
         # At least 45 calendar days are needed for the declared 20-session
         # denominator after holidays/mismatched trading calendars; use 60.
         start = (as_of.astimezone(KST) - timedelta(days=60)).strftime("%Y%m%d")
         response = self._request("GET", DAILY_CHART_PATH, params={"FID_COND_MRKT_DIV_CODE":"J", "FID_INPUT_ISCD":symbol, "FID_INPUT_DATE_1":start, "FID_INPUT_DATE_2":end, "FID_PERIOD_DIV_CODE":"D", "FID_ORG_ADJ_PRC":"0"}, headers={"authorization":f"Bearer {self._token_value()}", "appkey":self._app_key, "appsecret":self._app_secret, "tr_id":DAILY_CHART_TR_ID})
         try:
             payload = response.json()
-            if not _response_ok(response) or payload.get("rt_cd") != "0" or not isinstance(payload.get("output2"), list):
-                raise ValueError("KIS daily bars unavailable")
-            return payload["output2"]
+            output1, output2 = payload.get("output1"), payload.get("output2")
+            if not _response_ok(response) or payload.get("rt_cd") != "0" or not isinstance(output1, dict) or not isinstance(output2, list):
+                raise ValueError("KIS daily snapshot unavailable")
+            # KIS documents hts_avls in output1, not in daily output2 bars.
+            cap = _positive_number(output1.get("hts_avls"))
+            if not all(isinstance(row, dict) for row in output2):
+                raise ValueError("KIS daily snapshot unavailable")
+            return DailySnapshot(summary_market_cap_100m=cap, bars=tuple(output2), retrieved_at=now_kst())
         except (TypeError, ValueError, KeyError):
-            raise ValueError("KIS daily bars unavailable")
+            raise ValueError("KIS daily snapshot unavailable")
