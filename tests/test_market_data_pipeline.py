@@ -23,7 +23,7 @@ def history():
 def official_snapshot(rows=None, *, cap=25, retrieved_at=None):
     from kr_stock_autotrader.kis_readonly import DailySnapshot
     return DailySnapshot(summary_market_cap_100m=float(cap), bars=tuple(rows or history()),
-                         retrieved_at=retrieved_at or datetime(2026, 9, 2, 7, 59, tzinfo=KST))
+                         retrieved_at=retrieved_at or datetime(2026, 9, 2, 8, 0, 3, tzinfo=KST))
 
 
 def thresholds(monkeypatch):
@@ -31,7 +31,7 @@ def thresholds(monkeypatch):
         monkeypatch.setenv(name, value)
 
 
-def test_real_producer_output_passes_0800_filter_after_close(monkeypatch):
+def test_real_producer_output_passes_0800_filter_after_network_completion(monkeypatch):
     from kr_stock_autotrader.market_data import build_premarket_snapshot, filter_inputs_from_snapshot
     from kr_stock_autotrader.decision_cards import run_filter
     thresholds(monkeypatch)
@@ -41,9 +41,9 @@ def test_real_producer_output_passes_0800_filter_after_close(monkeypatch):
     assert snapshot["trading_status"] == "premarket_unverified"
     assert snapshot["pre_announcement_return_pct"] is not None
     assert snapshot["daily_bars_known_at"] == "2026-09-01T15:30:00+09:00"
-    assert snapshot["market_data_known_at"] == snapshot["retrieved_at"] == "2026-09-02T07:59:00+09:00"
+    assert snapshot["market_data_known_at"] == snapshot["retrieved_at"] == "2026-09-02T08:00:03+09:00"
     inputs = filter_inputs_from_snapshot(snapshot) | {"source":"dart", "announcement_at":"2026-08-31T17:15:00+09:00", "economic_terms":"verified"}
-    result = run_filter(inputs, as_of.isoformat(), as_of.isoformat())
+    result = run_filter(inputs, snapshot["retrieved_at"], snapshot["retrieved_at"])
     assert result["verdict"] == "PASS", result["reasons"]
 
 
@@ -57,12 +57,17 @@ def test_before_market_announcement_excludes_announcement_date():
     assert after["horizons"]["stock_return_pct"] == "20 completed aligned sessions"
 
 
-def test_historical_retrieval_after_requested_asof_fails_closed(monkeypatch):
+@pytest.mark.parametrize("retrieved_at", [
+    datetime(2026, 9, 3, 8, 0, 3, tzinfo=KST),
+    datetime(2026, 9, 2, 9, 0, tzinfo=KST),
+    datetime(2026, 9, 2, 11, 0, tzinfo=KST),
+])
+def test_historical_or_post_open_retrieval_fails_closed(retrieved_at):
     from kr_stock_autotrader import market_data
     as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
     snapshot = market_data.build_premarket_snapshot(
         "005930", as_of,
-        lambda *_: official_snapshot(retrieved_at=datetime(2026, 9, 3, 9, tzinfo=KST)),
+        lambda *_: official_snapshot(retrieved_at=retrieved_at),
         "2026-08-31T17:15:00+09:00")
     assert snapshot["status"] == "unavailable"
     assert market_data.filter_inputs_from_snapshot(snapshot)["market_data_status"] == "unavailable"
@@ -162,6 +167,7 @@ def test_material_3_after_close_0800_snapshot_filter_card_readback_persists(monk
     filtered = client.post("/api/internal/filters", headers=headers, json={"evidence_id":evidence["id"], "inputs":inputs, "as_of":filter_time, "known_at":filter_time})
     assert filtered.status_code == 200 and filtered.json()["verdict"] == "PASS"
     f = filtered.json()
+    assert f["known_at"] == f["as_of"] == "2026-09-02T08:00:03+09:00"
     card = {"schema_version":1,"symbol":"005930","headline":"관찰","conclusion":"판단 보류","change":"after close disclosure","source_evidence":[{"id":str(evidence["id"]),"source":"dart","url":"https://dart.fss.or.kr"}],"source_urls":["https://dart.fss.or.kr"],"business_value":"unknown","certainty":"unknown","priced_in":"unknown","filter_verdict":"PASS","price_cap":None,"window":None,"max_amount":None,"max_qty":None,"stop_loss":None,"take_profit":None,"evidence_invalidation":None,"holding_until":None,"review_at":None,"false_positive":"unknown","unknowns":"execution price unknown","verdict":"판단 보류","confidence":0.5,"valid_until":None,"order_type":None,"split":[],"expires":None}
     saved = client.post("/api/internal/cards/results", headers=headers, json={"evidence_id":evidence["id"], "filter_id":f["id"], "model":"deterministic-test", "provider":"none", "card":card})
     assert saved.status_code == 200
@@ -169,6 +175,8 @@ def test_material_3_after_close_0800_snapshot_filter_card_readback_persists(monk
     assert readback.status_code == 200 and readback.json()["filter_id"] == f["id"]
     db = dbmod.connect()
     try:
+        persisted = db.execute("SELECT as_of, known_at FROM deterministic_filter_results WHERE id=?", (f["id"],)).fetchone()
+        assert dict(persisted) == {"as_of":"2026-09-02T08:00:03+09:00", "known_at":"2026-09-02T08:00:03+09:00"}
         counts = {table: db.execute(f"SELECT COUNT(*) n FROM {table}").fetchone()["n"] for table in ("order_plans", "order_fills", "positions", "order_events")}
         assert counts == {"order_plans":0,"order_fills":0,"positions":0,"order_events":0}
         assert db.execute("SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name LIKE '%allocation%'").fetchone()["n"] == 0

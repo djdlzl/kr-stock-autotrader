@@ -3,14 +3,16 @@
 The daily-chart projection uses only completed sessions.  Daily bars are known
 at the completed 15:30 KST close, while KIS output1's market-cap summary is
 known only at network retrieval.  Since both are used, the overall snapshot is
-known no earlier than that retrieval and historical late replays fail closed.
+known no earlier than that retrieval.  A current premarket retrieval may finish
+after its scheduled request clock time, but historical and post-open replays
+fail closed.
 """
 from __future__ import annotations
 import math
 import os
 from datetime import datetime, time, timedelta
 from typing import Callable
-from .domain import KST, now_kst, parse_kst
+from .domain import KRX_REGULAR_OPEN, KST, now_kst, parse_kst
 from .kis_readonly import DailySnapshot
 
 BENCHMARK_SYMBOL = "229200"
@@ -96,6 +98,21 @@ def _unavailable(symbol: str, reason: str, retrieved: datetime | None = None) ->
     return out
 
 
+def _current_premarket_retrieval(retrieved: datetime, requested_as_of: datetime) -> bool:
+    """Accept only a same-KST-date network retrieval completed before open.
+
+    ``requested_as_of`` selects the scheduled business date and daily-bar
+    cutoff; it is not a claim that a network request finished before its own
+    request timestamp.  The returned retrieval timestamp remains the actual
+    market-data known-at value for the final filter.
+    """
+    if retrieved.tzinfo is None:
+        return False
+    retrieved_kst = retrieved.astimezone(KST)
+    requested_kst = requested_as_of.astimezone(KST)
+    return retrieved_kst.date() == requested_kst.date() and retrieved_kst.time() < KRX_REGULAR_OPEN
+
+
 def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Callable[..., object], announcement_at: str | None = None) -> dict:
     """Build a 20-session, aligned snapshot from completed sessions only."""
     retrieved = now_kst()
@@ -109,8 +126,8 @@ def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Calla
             raise ValueError("daily snapshot contract invalid")
         # Summary hts_avls is a retrieval-time observation, never a bar value.
         retrieved = max(stock_source.retrieved_at, benchmark_source.retrieved_at)
-        if retrieved.tzinfo is None or retrieved > as_of.astimezone(KST):
-            raise ValueError("summary retrieval is after requested as_of")
+        if not _current_premarket_retrieval(retrieved, as_of):
+            raise ValueError("summary retrieval is not current premarket data")
         market_cap = _number(stock_source.summary_market_cap_100m, positive=True) * MARKET_CAP_UNIT_KRW
         stock = _closed_bars(list(stock_source.bars), as_of)
         benchmark = _closed_bars(list(benchmark_source.bars), as_of)

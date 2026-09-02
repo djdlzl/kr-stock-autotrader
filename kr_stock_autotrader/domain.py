@@ -1,12 +1,14 @@
 """Typed domain rules, all evaluated fail-closed."""
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from math import isclose
 from zoneinfo import ZoneInfo
 
 from .config import KR_HOLIDAYS
 
 KST = ZoneInfo("Asia/Seoul")
+KRX_REGULAR_OPEN = time(9, 0)
+KRX_REGULAR_CLOSE = time(15, 30)
 CONDITION_KINDS = {"deadline", "absolute_price", "relative_pct", "volume", "relative_volume"}
 OPERATORS = {">=", "<="}
 
@@ -38,7 +40,7 @@ def parse_kst(value: str) -> datetime:
 
 def market_open(at: datetime) -> bool:
     local = at.astimezone(KST)
-    return local.weekday() < 5 and local.date().isoformat() not in KR_HOLIDAYS and (9, 0) <= (local.hour, local.minute) <= (15, 30)
+    return local.weekday() < 5 and local.date().isoformat() not in KR_HOLIDAYS and KRX_REGULAR_OPEN <= local.time() <= KRX_REGULAR_CLOSE
 
 
 def fresh_quote(quote: Quote, server_now: datetime) -> bool:
