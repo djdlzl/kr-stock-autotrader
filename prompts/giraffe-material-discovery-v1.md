@@ -23,6 +23,15 @@ Giraffe는 paper-only이고 `LIVE_TRADING=False`다. 이 작업은 주문·자�
 
 ## 실행 시작
 
+### DART 완전성 prehook 계약 (조사·저장 전에 강제)
+
+- 이 job은 먼저 repo-owned `giraffe_dart_manifest_gate.py` prehook의 stdout JSON을 주입받아야 한다. 정상 gate 식별자는 정확히 `GIRAFFE_DART_GATE_V1`이고 `complete=true`여야 한다.
+- gate가 없거나 JSON이 아니거나 `gate` 값이 다르거나 `complete!=true`이면 **조사·웹검색·저장 어느 것도 시작하지 않는다**. 이 경우 `scheduler-finish ... error`로 종료한다. 첫 페이지 DART 목록이나 일반 웹검색으로 대체하지 않는다.
+- gate는 전일+당일 KST DART manifest를 `/Users/jaewoo/.hermes/runs/giraffe-7923/dart-manifests/`에 남긴다. 각 date의 `declared_total`, `declared_pages`, `pages_collected`, `page_counts`, `unique_receipts`, `duplicates`, `material_candidate_count`, `complete`, `manifest_path`를 실행 receipt에 기록한다.
+- 각 complete manifest의 `material_candidate_records`가 DART 조사 제어 목록이다. 이 목록의 모든 `rcp_no`를 **정확히 한 번씩** 열어 원문을 검토하고, 일반 검색으로 이 목록을 건너뛰거나 중복 검토하지 않는다. 원문 접근 실패도 해당 receipt의 검토 결과로 기록한다.
+- 전일·당일 두 manifest를 합친 제어 목록에서 중복 receipt가 있으면 실패 처리한다. 검토 완료 receipt 수는 고유 제어 receipt 수와 정확히 일치해야 한다. 불일치·누락·중복 검토면 `scheduler-finish ... error`로 종료하며 저장 성공으로 보고하지 않는다.
+- 각 후보별 receipt에는 `rcp_no`, 검토 결과(`SAVED|REJECTED|INSUFFICIENT_EVIDENCE|ERROR`), 해당 시 material ID 또는 탈락/오류 사유를 기록한다. `reviewed receipt count`와 제어 목록 count를 최종 보고에 포함한다.
+
 - KST 실행일 `YYYY-MM-DD`와 `run_key=research-YYYY-MM-DD-0700-kst`를 만든다.
 - `python -m kr_stock_autotrader.cli scheduler-start "$run_key" research`를 호출한다.
 - 같은 `run_key`가 이미 완료됐다면 중복 실행으로 새 evidence를 만들지 말고 기존 결과를 readback한다.
