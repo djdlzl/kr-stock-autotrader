@@ -86,7 +86,11 @@ def run_filter(inputs, as_of, known_at):
         if market_known_at>kdt: reasons.append("market data known_at future of filter known_at")
     except (ValueError, TypeError):
         reasons.append("missing/invalid market_data_known_at")
-    numbers={k:_num(inputs,k,reasons,positive=k in {"current_volume","baseline_volume","trading_value","market_cap"}) for k in ("stock_return_pct","benchmark_return_pct","sector_return_pct","current_volume","baseline_volume","trading_value","market_cap","recent_rise_pct","gap_pct","pre_announcement_return_pct")}
+    observable=(inputs.get("observability") if isinstance(inputs.get("observability"),dict) else {})
+    optional_premarket={key for key in ("current_volume","baseline_volume","gap_pct") if observable.get(key)=="not_yet_observable"}
+    optional_sector=observable.get("sector_return_pct")=="unknown"
+    numbers={k:_num(inputs,k,reasons,positive=k in {"current_volume","baseline_volume","trading_value","market_cap"}) for k in ("stock_return_pct","benchmark_return_pct","sector_return_pct","current_volume","baseline_volume","trading_value","market_cap","recent_rise_pct","gap_pct","pre_announcement_return_pct") if k not in optional_premarket and not (k=="sector_return_pct" and optional_sector)}
+    for key in optional_premarket | ({"sector_return_pct"} if optional_sector else set()): numbers[key]=None
     for k in ("min_trading_value","min_market_cap","max_market_cap","max_recent_rise_pct","max_gap_pct","max_pre_return_pct"): _num(inputs,k,reasons,positive=k in {"min_trading_value","min_market_cap","max_market_cap"})
     if inputs.get("trading_status")!="tradable": reasons.append("not tradable")
     if numbers["trading_value"] is not None and numbers["trading_value"] < inputs.get("min_trading_value",float("inf")): reasons.append("trading value below minimum")

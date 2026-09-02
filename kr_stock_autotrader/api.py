@@ -20,6 +20,7 @@ from .decision_cards import (require_internal_api_key, create_evidence, list_evi
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML
 from .kis_readonly import KISReadOnlyClient
+from .market_data import build_premarket_snapshot, filter_inputs_from_snapshot
 from .live_dry_run import existing_live_dry_run_receipt, persist_live_dry_run
 
 
@@ -559,6 +560,24 @@ def internal_evidence_invalidate(evidence_id: int, _: None = Depends(require_int
     db = connect()
     try: return mutate_evidence(db, evidence_id, invalidate=True)
     finally: db.close()
+
+@app.post('/api/internal/market-snapshots/{symbol}')
+async def internal_market_snapshot(symbol: str, request: Request, _: None = Depends(require_internal_api_key)):
+    """Scheduler-only pre-market snapshot; returns safe data plus ready filter inputs."""
+    try:
+        data = await request.json()
+        as_of = parse_kst(data["as_of"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(422, "as_of must be KST ISO-8601")
+    provider = getattr(app.state, "kis_daily_bars_provider", None)
+    if provider is None:
+        global _default_kis_client
+        if _default_kis_client is None:
+            _default_kis_client = KISReadOnlyClient()
+        provider = _default_kis_client.daily_bars
+    snapshot = build_premarket_snapshot(symbol, as_of, provider)
+    return {"snapshot": snapshot, "filter_inputs": filter_inputs_from_snapshot(snapshot)}
+
 
 @app.post('/api/internal/filters')
 async def internal_filter(request: Request, _: None = Depends(require_internal_api_key)):
