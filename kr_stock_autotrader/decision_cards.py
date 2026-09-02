@@ -106,7 +106,7 @@ def run_filter(inputs, as_of, known_at):
     if not all(inputs.get(k) for k in ("source","announcement_at","economic_terms")): reasons.append("source/announcement/economic terms missing")
     volume_ratio=None if numbers["current_volume"] is None or numbers["baseline_volume"] is None else numbers["current_volume"]/numbers["baseline_volume"]
     computed={"stock_vs_benchmark_pct":None if numbers["stock_return_pct"] is None or numbers["benchmark_return_pct"] is None else numbers["stock_return_pct"]-numbers["benchmark_return_pct"],"stock_vs_sector_pct":None if numbers["stock_return_pct"] is None or numbers["sector_return_pct"] is None else numbers["stock_return_pct"]-numbers["sector_return_pct"],"volume_ratio":volume_ratio}
-    return {"verdict":"FAIL" if reasons else "PASS","reasons":reasons,"computed":computed,"units":{"stock_vs_benchmark_pct":"percent; stock_return_pct - benchmark_return_pct; positive means stock outperformed benchmark","stock_vs_sector_pct":"percent; stock_return_pct - sector_return_pct; positive means stock outperformed sector","volume_ratio":"ratio; current_volume / baseline_volume; baseline_volume > 0","as_of":"KST ISO-8601; evidence.known_at <= market_data_known_at <= filter.known_at <= filter.as_of"}}
+    return {"verdict":"FAIL" if reasons else "PASS","reasons":reasons,"computed":computed,"units":{"stock_vs_benchmark_pct":"percent; stock_return_pct - benchmark_return_pct; positive means stock outperformed benchmark","stock_vs_sector_pct":"percent; stock_return_pct - sector_return_pct; positive means stock outperformed sector","volume_ratio":"ratio; current_volume / baseline_volume; baseline_volume > 0","as_of":"KST ISO-8601; evidence.known_at and market_data_known_at must each be at or before filter.known_at <= filter.as_of"}}
 def save_filter(db,evidence_id,inputs,as_of,known_at):
     evidence=row(db,"material_evidence",evidence_id)
     try:
@@ -117,12 +117,17 @@ def save_filter(db,evidence_id,inputs,as_of,known_at):
         market_known = parse_kst(inputs.get("market_data_known_at"))
     except (ValueError, TypeError):
         raise HTTPException(422, "market_data_known_at must be KST ISO-8601")
+    if filter_known > filter_as_of:
+        raise HTTPException(422, "filter.known_at must be at or before as_of")
+    if evidence_known > filter_known:
+        raise HTTPException(422, "evidence.known_at must be at or before filter.known_at")
+    if evidence_known > filter_as_of:
+        raise HTTPException(422, "evidence.known_at must be at or before as_of")
     if market_known > filter_known:
         raise HTTPException(422, "market_data_known_at must be at or before filter.known_at")
     if market_known > filter_as_of:
         raise HTTPException(422, "market_data_known_at must be at or before as_of")
-    if not evidence_known <= market_known <= filter_known <= filter_as_of:
-        raise HTTPException(422, "evidence.known_at <= market_data_known_at <= filter.known_at <= filter.as_of required")
+
     out=run_filter(inputs,as_of,known_at)
     if out["verdict"] == "FAIL" and "market data known_at future of filter known_at" in out["reasons"]:
         raise HTTPException(422, "market_data_known_at must be at or before filter.known_at")

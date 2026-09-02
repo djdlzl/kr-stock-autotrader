@@ -94,14 +94,14 @@ def test_snapshot_api_missing_credentials_is_safe_unavailable(monkeypatch):
     assert "credentials" not in response.text.lower()
 
 
-def test_0800_snapshot_filter_card_readback_has_no_trading_side_effects(monkeypatch):
+def test_material_3_after_close_0800_snapshot_filter_card_readback_persists(monkeypatch):
     from fastapi.testclient import TestClient
     from kr_stock_autotrader import api, db as dbmod
     thresholds(monkeypatch); monkeypatch.setenv("INTERNAL_API_KEY", "test-key")
     path = tempfile.mktemp(suffix=".db"); monkeypatch.setattr(dbmod, "DATABASE_PATH", path)
     api.app.state.kis_daily_bars_provider = lambda *_: history()
     client = TestClient(api.app); headers={"X-Internal-API-Key":"test-key"}
-    evidence = client.post("/api/internal/evidence", headers=headers, json={"symbol":"005930", "kind":"disclosure", "title":"after close", "summary":"x", "source":"dart", "source_url":"https://dart.fss.or.kr", "announcement_at":"2026-08-31T17:15:00+09:00", "collected_at":"2026-09-02T07:00:00+09:00", "known_at":"2026-08-31T17:15:00+09:00", "snapshot":{}, "dedupe_key":"edd-after-close"}).json()
+    evidence = client.post("/api/internal/evidence", headers=headers, json={"symbol":"005930", "kind":"disclosure", "title":"Material 3 after close", "summary":"x", "source":"dart", "source_url":"https://dart.fss.or.kr", "announcement_at":"2026-09-01T17:15:00+09:00", "collected_at":"2026-09-02T07:00:00+09:00", "known_at":"2026-09-01T17:15:00+09:00", "snapshot":{}, "dedupe_key":"material-3-after-close"}).json()
     as_of="2026-09-02T08:00:00+09:00"
     snapshot_response = client.post("/api/internal/market-snapshots/005930", headers=headers, json={"as_of":as_of, "announcement_at":evidence["announcement_at"]})
     assert snapshot_response.status_code == 200

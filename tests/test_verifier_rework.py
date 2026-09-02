@@ -79,6 +79,24 @@ def test_filter_rejects_market_data_newer_than_filter_known_at(db):
         )
 
 
+@pytest.mark.parametrize(
+    ("evidence_known_at", "market_known_at", "message"),
+    [
+        ("2026-08-31T10:01:00+09:00", "2026-08-31T09:00:00+09:00", "evidence.known_at must be at or before filter.known_at"),
+        ("2026-08-31T09:00:00+09:00", "2026-08-31T10:01:00+09:00", "market_data_known_at must be at or before filter.known_at"),
+    ],
+)
+def test_filter_rejects_evidence_or_market_future_of_filter_and_as_of(db, evidence_known_at, market_known_at, message):
+    item = evidence(db)
+    db.execute("UPDATE material_evidence SET known_at=? WHERE id=?", (evidence_known_at, item["id"]))
+    db.commit()
+    with pytest.raises(HTTPException, match=message):
+        save_filter(
+            db, item["id"], raw(market_data_known_at=market_known_at),
+            "2026-08-31T10:00:00+09:00", "2026-08-31T09:00:00+09:00",
+        )
+
+
 def test_schema_rejects_malformed_cards_and_keeps_pass_nonbuy_valid(db):
     item = evidence(db)
     filt = save_filter(db, item["id"], raw(), AS_OF, "2026-08-31T09:00:00+09:00")

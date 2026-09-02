@@ -34,7 +34,7 @@
 
 - evidence 발표·수집·known-at 이후, filter `known_at`과 `as_of` 이전에 확인된 정보만 사용한다.
 - 08:00 이후 장중 가격·거래량·공시 수정·결과를 사용하지 않는다.
-- `evidence.known_at <= market_data_known_at <= filter.known_at <= filter.as_of`를 반드시 지킨다.
+- `evidence.known_at <= filter.known_at <= filter.as_of` 및 `market_data_known_at <= filter.known_at <= filter.as_of`를 각각 반드시 지킨다. evidence와 market data의 상대적 순서는 요구하지 않는다.
 - 시각은 모두 timezone이 포함된 KST ISO-8601로 기록한다.
 - 현재 시점에서 아직 알 수 없는 당일 시가·갭·거래량은 0으로 만들지 않는다. snapshot의 정확한 `not_yet_observable` 관측성 계약과 함께 `null`을 보존한다; 그 명시 계약만 08:00 filter에서 optional이며 다른 unknown은 FAIL-closed다.
 - 숫자 단위, 부호, 분모, 기준일을 filter 입력의 출처 메모와 함께 보존한다.
