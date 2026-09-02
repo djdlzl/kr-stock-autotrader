@@ -4,11 +4,20 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import pytest
-from kr_stock_autotrader.kis_readonly import KISReadOnlyClient, OAUTH_PATH, QUOTE_PATH, QUOTE_TR_ID, PRODUCTION_BASE_URL
+from kr_stock_autotrader.kis_readonly import KISReadOnlyClient, OAUTH_PATH, QUOTE_PATH, QUOTE_TR_ID, PRODUCTION_BASE_URL, DAILY_CHART_PATH, DAILY_CHART_TR_ID, DAILY_CHART_OFFICIAL_REFERENCE
 from kr_stock_autotrader.live_dry_run import evaluate_live_dry_run
 
 KST=ZoneInfo('Asia/Seoul')
 NOW=datetime(2026,8,28,10,0,tzinfo=KST)
+
+
+def test_official_kis_daily_chart_contract_fixture():
+    """Pinned from KIS's official public contract, retrieved 2026-09-02."""
+    assert DAILY_CHART_OFFICIAL_REFERENCE == "https://apiportal.koreainvestment.com/api/apis/public/detail?accessUrl=/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    assert (DAILY_CHART_PATH, DAILY_CHART_TR_ID) == ("/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice", "FHKST03010100")
+    # Official response sample: hts_avls=815363, price=112000,
+    # listed shares=728002365.  Rounded to the field's 100m-KRW unit, they agree.
+    assert round(728_002_365 * 112_000, -8) == 815_363 * 100_000_000
 
 class Response:
     def __init__(self,payload,status_code=200): self.payload,self.status_code=payload,status_code

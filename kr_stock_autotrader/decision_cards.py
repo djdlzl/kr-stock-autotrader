@@ -80,6 +80,19 @@ def run_filter(inputs, as_of, known_at):
     try: asdt,kdt=parse_kst(as_of),parse_kst(known_at)
     except (ValueError,TypeError): return {"verdict":"FAIL","reasons":["invalid timestamp"],"computed":{},"units":{}}
     if kdt>asdt or asdt-kdt>timedelta(days=1): reasons.append("known_at future or stale")
+    # An unavailable snapshot has only a retrieval-attempt provenance.  It is
+    # intentionally not a market observation and therefore has no
+    # market_data_known_at.  Keep this narrow so ordinary incomplete inputs
+    # remain fail-closed under the normal market-data contract.
+    if inputs.get("market_data_status") == "unavailable":
+        try:
+            attempted_at=parse_kst(inputs.get("market_data_attempted_at"))
+            if attempted_at > kdt: reasons.append("market data attempted_at future of filter known_at")
+            if attempted_at > asdt: reasons.append("market data attempted_at future of as_of")
+        except (ValueError, TypeError):
+            reasons.append("missing/invalid market_data_attempted_at")
+        reasons.append("market data unavailable")
+        return {"verdict":"FAIL","reasons":reasons,"computed":{},"units":{"as_of":"KST ISO-8601; unavailable snapshots use market_data_attempted_at <= filter.known_at <= filter.as_of and do not claim market_data_known_at"}}
     try:
         market_known_at=parse_kst(inputs.get("market_data_known_at"))
         if market_known_at>asdt: reasons.append("market data known_at future of as_of")
@@ -113,20 +126,34 @@ def save_filter(db,evidence_id,inputs,as_of,known_at):
         evidence_known, filter_known, filter_as_of = parse_kst(evidence["known_at"]), parse_kst(known_at), parse_kst(as_of)
     except (ValueError, TypeError):
         raise HTTPException(422, "evidence/filter timestamps must be KST ISO-8601")
-    try:
-        market_known = parse_kst(inputs.get("market_data_known_at"))
-    except (ValueError, TypeError):
-        raise HTTPException(422, "market_data_known_at must be KST ISO-8601")
+
     if filter_known > filter_as_of:
         raise HTTPException(422, "filter.known_at must be at or before as_of")
     if evidence_known > filter_known:
         raise HTTPException(422, "evidence.known_at must be at or before filter.known_at")
     if evidence_known > filter_as_of:
         raise HTTPException(422, "evidence.known_at must be at or before as_of")
-    if market_known > filter_known:
-        raise HTTPException(422, "market_data_known_at must be at or before filter.known_at")
-    if market_known > filter_as_of:
-        raise HTTPException(422, "market_data_known_at must be at or before as_of")
+    unavailable = inputs.get("market_data_status") == "unavailable"
+    if unavailable:
+        if "market_data_known_at" in inputs:
+            raise HTTPException(422, "unavailable market data must not claim market_data_known_at")
+        try:
+            attempted_at = parse_kst(inputs.get("market_data_attempted_at"))
+        except (ValueError, TypeError):
+            raise HTTPException(422, "market_data_attempted_at must be KST ISO-8601")
+        if attempted_at > filter_known:
+            raise HTTPException(422, "market_data_attempted_at must be at or before filter.known_at")
+        if attempted_at > filter_as_of:
+            raise HTTPException(422, "market_data_attempted_at must be at or before as_of")
+    else:
+        try:
+            market_known = parse_kst(inputs.get("market_data_known_at"))
+        except (ValueError, TypeError):
+            raise HTTPException(422, "market_data_known_at must be KST ISO-8601")
+        if market_known > filter_known:
+            raise HTTPException(422, "market_data_known_at must be at or before filter.known_at")
+        if market_known > filter_as_of:
+            raise HTTPException(422, "market_data_known_at must be at or before as_of")
 
     out=run_filter(inputs,as_of,known_at)
     if out["verdict"] == "FAIL" and "market data known_at future of filter known_at" in out["reasons"]:

@@ -11,9 +11,11 @@ PRODUCTION_BASE_URL = "https://openapi.koreainvestment.com:9443"
 OAUTH_PATH = "/oauth2/tokenP"
 QUOTE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
 QUOTE_TR_ID = "FHKST01010100"
-# KIS domestic-stock daily item chart: https://apiportal.koreainvestment.com/apiservice/apiservice-domestic-stock-quotations
+# Official KIS contract (endpoint, TR, output2 field catalogue and sample):
+# https://apiportal.koreainvestment.com/api/apis/public/detail?accessUrl=/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice
 DAILY_CHART_PATH = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
 DAILY_CHART_TR_ID = "FHKST03010100"
+DAILY_CHART_OFFICIAL_REFERENCE = "https://apiportal.koreainvestment.com/api/apis/public/detail?accessUrl=/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
 TOKEN_REFRESH_SKEW = timedelta(seconds=30)
 MAX_TOKEN_LIFETIME = timedelta(hours=24)
 

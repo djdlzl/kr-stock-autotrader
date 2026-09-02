@@ -79,6 +79,13 @@ def test_filter_rejects_market_data_newer_than_filter_known_at(db):
         )
 
 
+def test_unavailable_attempt_later_than_requested_as_of_is_rejected(db):
+    item = evidence(db)
+    unavailable = {"market_data_status":"unavailable", "market_data_attempted_at":"2026-08-31T09:01:00+09:00"}
+    with pytest.raises(HTTPException, match="market_data_attempted_at must be at or before filter.known_at"):
+        save_filter(db, item["id"], unavailable, AS_OF, "2026-08-31T09:00:00+09:00")
+
+
 @pytest.mark.parametrize(
     ("evidence_known_at", "market_known_at", "message"),
     [

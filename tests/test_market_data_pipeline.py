@@ -83,11 +83,56 @@ def test_snapshot_boundary_sanitizes_provider_failures(monkeypatch, provider):
     assert "secret" not in str(result)
 
 
+def test_same_day_bar_is_a_fail_closed_provider_error():
+    from kr_stock_autotrader.market_data import build_premarket_snapshot
+    as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
+    rows = [bar(as_of.date(), 130)] + history()
+    result = build_premarket_snapshot("005930", as_of, lambda *_: rows)
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "daily_bars_unavailable_or_invalid"
+
+
+@pytest.mark.parametrize("failure", [
+    lambda: RuntimeError("oauth secret"),
+    lambda: RuntimeError("HTTP 503 secret"),
+    lambda: ValueError("malformed secret"),
+])
+def test_unavailable_snapshot_persists_fail_hold_card_without_orders(monkeypatch, failure):
+    """EDD: provider failure must be an honest terminal, non-buy workflow."""
+    from fastapi.testclient import TestClient
+    from kr_stock_autotrader import api, db as dbmod, market_data
+    attempted = datetime(2026, 9, 2, 8, tzinfo=KST)
+    monkeypatch.setattr(market_data, "now_kst", lambda: attempted)
+    monkeypatch.setenv("INTERNAL_API_KEY", "test-key")
+    path = tempfile.mktemp(suffix=".db"); monkeypatch.setattr(dbmod, "DATABASE_PATH", path)
+    monkeypatch.setattr(api.app.state, "kis_daily_bars_provider", lambda *_: (_ for _ in ()).throw(failure()), raising=False)
+    client = TestClient(api.app); headers={"X-Internal-API-Key":"test-key"}
+    evidence = client.post("/api/internal/evidence", headers=headers, json={"symbol":"005930", "kind":"disclosure", "title":"unavailable", "summary":"x", "source":"dart", "source_url":"https://dart.fss.or.kr", "announcement_at":"2026-09-01T17:15:00+09:00", "known_at":"2026-09-01T17:15:00+09:00", "snapshot":{}, "dedupe_key":"unavailable-" + failure().__class__.__name__}).json()
+    market = client.post("/api/internal/market-snapshots/005930", headers=headers, json={"as_of":attempted.isoformat()}).json()
+    assert market["snapshot"]["status"] == "unavailable" and "secret" not in str(market)
+    assert market["filter_inputs"] == {"market_data_status":"unavailable", "market_data_attempted_at":attempted.isoformat()}
+    inputs = market["filter_inputs"] | {"source":"dart", "announcement_at":evidence["announcement_at"], "economic_terms":"verified"}
+    filtered = client.post("/api/internal/filters", headers=headers, json={"evidence_id":evidence["id"], "inputs":inputs, "as_of":attempted.isoformat(), "known_at":attempted.isoformat()})
+    assert filtered.status_code == 200 and filtered.json()["verdict"] == "FAIL"
+    assert filtered.json()["reasons"] == ["market data unavailable"]
+    card = {"schema_version":1,"symbol":"005930","headline":"hold","conclusion":"market unavailable","change":"x","source_evidence":[{"id":str(evidence["id"]),"source":"dart","url":"https://dart.fss.or.kr"}],"source_urls":["https://dart.fss.or.kr"],"business_value":"unknown","certainty":"unknown","priced_in":"unknown","filter_verdict":"FAIL","price_cap":None,"window":None,"max_amount":None,"max_qty":None,"stop_loss":None,"take_profit":None,"evidence_invalidation":None,"holding_until":None,"review_at":None,"false_positive":"unknown","unknowns":"market data unavailable","verdict":"판단 보류","confidence":0.5,"valid_until":None,"order_type":None,"split":[],"expires":None}
+    saved = client.post("/api/internal/cards/results", headers=headers, json={"evidence_id":evidence["id"], "filter_id":filtered.json()["id"], "model":"deterministic-test", "provider":"none", "card":card})
+    assert saved.status_code == 200
+    assert client.get("/api/internal/cards/"+str(saved.json()["id"]), headers=headers).json()["verdict"] == "판단 보류"
+    db = dbmod.connect()
+    try:
+        assert {table: db.execute(f"SELECT COUNT(*) n FROM {table}").fetchone()["n"] for table in ("order_plans", "order_fills", "positions", "order_events")} == {"order_plans":0,"order_fills":0,"positions":0,"order_events":0}
+        assert db.execute("SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name LIKE '%allocation%'").fetchone()["n"] == 0
+    finally:
+        db.close()
+
+
 def test_snapshot_api_missing_credentials_is_safe_unavailable(monkeypatch):
     from fastapi.testclient import TestClient
     from kr_stock_autotrader import api
     monkeypatch.setenv("INTERNAL_API_KEY", "test-key")
     monkeypatch.delenv("KIS_APP_KEY", raising=False); monkeypatch.delenv("KIS_APP_SECRET", raising=False)
+    monkeypatch.delattr(api.app.state, "kis_daily_bars_provider", raising=False)
     api._default_kis_client = None
     response = TestClient(api.app).post("/api/internal/market-snapshots/005930", headers={"X-Internal-API-Key":"test-key"}, json={"as_of":"2026-09-02T08:00:00+09:00"})
     assert response.status_code == 200 and response.json()["snapshot"]["status"] == "unavailable"
@@ -99,7 +144,7 @@ def test_material_3_after_close_0800_snapshot_filter_card_readback_persists(monk
     from kr_stock_autotrader import api, db as dbmod
     thresholds(monkeypatch); monkeypatch.setenv("INTERNAL_API_KEY", "test-key")
     path = tempfile.mktemp(suffix=".db"); monkeypatch.setattr(dbmod, "DATABASE_PATH", path)
-    api.app.state.kis_daily_bars_provider = lambda *_: history()
+    monkeypatch.setattr(api.app.state, "kis_daily_bars_provider", lambda *_: history(), raising=False)
     client = TestClient(api.app); headers={"X-Internal-API-Key":"test-key"}
     evidence = client.post("/api/internal/evidence", headers=headers, json={"symbol":"005930", "kind":"disclosure", "title":"Material 3 after close", "summary":"x", "source":"dart", "source_url":"https://dart.fss.or.kr", "announcement_at":"2026-09-01T17:15:00+09:00", "collected_at":"2026-09-02T07:00:00+09:00", "known_at":"2026-09-01T17:15:00+09:00", "snapshot":{}, "dedupe_key":"material-3-after-close"}).json()
     as_of="2026-09-02T08:00:00+09:00"

@@ -34,7 +34,7 @@
 
 - evidence 발표·수집·known-at 이후, filter `known_at`과 `as_of` 이전에 확인된 정보만 사용한다.
 - 08:00 이후 장중 가격·거래량·공시 수정·결과를 사용하지 않는다.
-- `evidence.known_at <= filter.known_at <= filter.as_of` 및 `market_data_known_at <= filter.known_at <= filter.as_of`를 각각 반드시 지킨다. evidence와 market data의 상대적 순서는 요구하지 않는다.
+- 정상 snapshot은 `evidence.known_at <= filter.known_at <= filter.as_of` 및 `market_data_known_at <= filter.known_at <= filter.as_of`를 각각 반드시 지킨다. unavailable snapshot은 market observation을 주장하지 않고 `market_data_attempted_at <= filter.known_at <= filter.as_of`만 사용한다. evidence와 시장 timestamp의 상대적 순서는 요구하지 않는다.
 - 시각은 모두 timezone이 포함된 KST ISO-8601로 기록한다.
 - 현재 시점에서 아직 알 수 없는 당일 시가·갭·거래량은 0으로 만들지 않는다. snapshot의 정확한 `not_yet_observable` 관측성 계약과 함께 `null`을 보존한다; 그 명시 계약만 08:00 filter에서 optional이며 다른 unknown은 FAIL-closed다.
 - 숫자 단위, 부호, 분모, 기준일을 filter 입력의 출처 메모와 함께 보존한다.
@@ -44,7 +44,7 @@
 각 eligible evidence마다 `announcement_at`를 포함해 아래 순서로 실제 API/CLI를 호출한다. snapshot의 `filter_inputs`에서 숫자/관측가능성 필드를 임의 변경하지 말고, evidence에서 확인된 `source`, `announcement_at`, `economic_terms`, 중복/상충 여부만 안전하게 merge한다.
 
 1. `market-snapshot SYMBOL AS_OF --announcement-at ANNOUNCEMENT_AT`를 호출한다.
-2. snapshot `status != ok` 또는 filter inputs `market_data_status=unavailable`이면 market-data unavailable filter 입력으로 `filter-run`을 실행하고, 비매수 `판단 보류` 카드만 저장한다. API 오류를 무시하거나 null/0을 만들어 PASS시키지 않는다.
+2. snapshot `status != ok` 또는 filter inputs `market_data_status=unavailable`이면 snapshot의 실제 `market_data_attempted_at`를 **filter `known_at`과 `as_of` 모두로 사용**해 market-data unavailable filter를 실행하고, 비매수 `판단 보류` 카드만 저장한다. requested historical as_of보다 attempt가 늦으면 422/error로 종료하며 과거 시장자료라고 backdate하지 않는다. API 오류를 무시하거나 null/0을 만들어 PASS시키지 않는다.
 3. 정상 snapshot은 merged JSON으로 `filter-run`을 실행하고 `filter-detail`로 filter ID, verdict, reasons, computed units를 readback한다.
 4. `card-request`로 immutable input package를 읽어 prompt에 따라 카드를 만들고 `card-save-result`로 저장한다. 항상 `card-detail` readback으로 lineage/filter/prompt hash를 확인한다.
 5. filter FAIL 또는 unavailable이면 card verdict는 `판단 보류`/`관찰`/`제외`만 가능하며 주문 필드는 null이다. 이 job은 order_plans, order_fills, positions, order_events, allocation을 생성하지 않는다.

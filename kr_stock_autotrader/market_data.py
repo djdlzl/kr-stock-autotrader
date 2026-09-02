@@ -14,6 +14,9 @@ from typing import Callable
 from .domain import KST, now_kst, parse_kst
 
 BENCHMARK_SYMBOL = "229200"
+# KIS's official daily-chart sample has hts_avls=815363 for SK hynix alongside
+# listed shares and price consistent with 81,536,300,000,000 KRW (100m KRW
+# units); see DAILY_CHART_OFFICIAL_REFERENCE in kis_readonly.py and its fixture.
 MARKET_CAP_UNIT_KRW = 100_000_000.0
 RETURN_HORIZON_SESSIONS = 20
 KST_CASH_CLOSE = time(15, 30)
@@ -43,11 +46,11 @@ def _closed_bars(rows: object, as_of: datetime) -> list[dict]:
         if not isinstance(row, dict):
             raise ValueError("malformed daily bar")
         day = _date(row.get("stck_bsop_date"))
-        if day > as_of_day or day in seen:
-            raise ValueError("future or duplicate daily bar")
-        # A same-date row is partial/ambiguous before close and is never evidence.
-        if day == as_of_day:
-            continue
+        # This producer is strictly the 08:00 KST path.  A current-date row is
+        # partial/ambiguous there, so its presence is a bad provider selection,
+        # not a row we may silently discard.
+        if day >= as_of_day or day in seen:
+            raise ValueError("same-day, future, or duplicate daily bar")
         seen.add(day)
         result.append({"day": day, "close": _number(row.get("stck_clpr"), positive=True),
                        "volume": _number(row.get("acml_vol")), "value": _number(row.get("acml_tr_pbmn")),
@@ -140,11 +143,22 @@ def _threshold(name: str) -> float:
 def filter_inputs_from_snapshot(snapshot: object) -> dict:
     """No defaults: strategy thresholds are mandatory canonical environment config."""
     if not isinstance(snapshot, dict) or snapshot.get("status") != "ok":
-        return {"market_data_status": "unavailable"}
+        # This is failure-attempt provenance, never a claim that market data was
+        # observed.  The snapshot owns retrieved_at, so provider errors cannot
+        # smuggle arbitrary timestamps into a persisted filter.
+        try:
+            attempted_at = parse_kst(snapshot.get("retrieved_at"))
+        except (ValueError, TypeError):
+            return {"market_data_status": "unavailable"}
+        return {"market_data_status": "unavailable", "market_data_attempted_at": attempted_at.isoformat()}
     try:
         thresholds = {"min_trading_value": _threshold("GIRAFFE_MIN_TRADING_VALUE_KRW"), "min_market_cap": _threshold("GIRAFFE_MIN_MARKET_CAP_KRW"), "max_market_cap": _threshold("GIRAFFE_MAX_MARKET_CAP_KRW"), "max_recent_rise_pct": _threshold("GIRAFFE_MAX_RECENT_RISE_PCT"), "max_gap_pct": _threshold("GIRAFFE_MAX_GAP_PCT"), "max_pre_return_pct": _threshold("GIRAFFE_MAX_PRE_RETURN_PCT")}
         if thresholds["min_market_cap"] > thresholds["max_market_cap"]:
             raise ValueError("invalid market cap range")
         return {"market_data_known_at": snapshot["market_data_known_at"], "trading_status": snapshot["trading_status"], "trading_value": snapshot["trading_value_krw"], "market_cap": snapshot["market_cap_krw"], "stock_return_pct": snapshot["stock_return_pct"], "benchmark_return_pct": snapshot["benchmark_return_pct"], "recent_rise_pct": snapshot["recent_rise_pct"], "pre_announcement_return_pct": snapshot["pre_announcement_return_pct"], "gap_pct": snapshot.get("gap_pct"), "current_volume": snapshot.get("current_volume"), "baseline_volume": snapshot.get("baseline_volume"), "sector_return_pct": snapshot.get("sector_return_pct"), "observability": snapshot.get("observability", {}), **thresholds}
     except (KeyError, TypeError, ValueError):
-        return {"market_data_status": "unavailable"}
+        try:
+            attempted_at = parse_kst(snapshot.get("retrieved_at"))
+        except (ValueError, TypeError):
+            return {"market_data_status": "unavailable"}
+        return {"market_data_status": "unavailable", "market_data_attempted_at": attempted_at.isoformat()}
