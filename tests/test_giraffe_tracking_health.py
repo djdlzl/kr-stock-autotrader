@@ -134,3 +134,47 @@ console.log(JSON.stringify({aGlow,bState:scenarioHealth.cardId==='C'?'switched':
     assert "확인 중" in state["cView"]
     assert "A-SOURCE" not in state["cView"] and "111" not in state["cView"]
     assert "active-scenario" not in state["cView"]
+
+
+def test_initial_detail_get_late_response_cannot_replace_newer_card_or_restart_its_polling():
+    """The initial detail request owns the same generation as scenario polling."""
+    from kr_stock_autotrader.ui import APP_HTML
+    helpers = re.search(r"let scenarioPoll=.*?(?=async function showDetail)", APP_HTML, re.S).group(0)
+    show_detail = "function approvalBlocked(){return ''}" + re.search(r"async function showDetail.*?(?=function draftForm)", APP_HTML, re.S).group(0)
+    script = """
+let resolveA, resolveB;
+const detail={hidden:true,innerHTML:''}, notice={textContent:''};
+const nodes={'#detail':detail,'#notice':notice};
+const $=selector=>nodes[selector]||(nodes[selector]={});
+let document={hidden:false,addEventListener:()=>{}};
+const clearInterval=()=>{}, setInterval=()=>({});
+const AbortController=class{constructor(){this.signal={};this.abort=()=>{}}};
+const esc=x=>String(x??''), details=(a,b)=>a+':'+b, kst=x=>x||'', shortTerm=()=>'', draftValues=()=>({});
+const api=path=>path==='cards/A'?new Promise(resolve=>resolveA=resolve):new Promise(resolve=>resolveB=resolve);
+""" + helpers + show_detail + """
+const card=id=>({card:{source_evidence:'',change:'',business_value:'',certainty:'',priced_in:'',price_cap:'',window:'',max_amount:0,max_qty:0,stop_loss:'',take_profit:'',evidence_invalidation:'',holding_until:'',review_at:'',false_positive:'',unknowns:'',confidence:''},user_state:{order_plan:null,draft:null},verdict:'관찰',filter:{verdict:'FAIL',reasons:[],as_of:'',known_at:'',computed:{}},event_scenarios:[{marker:id,tracking_state:'INACTIVE',scenarios:[]}],evidence:{name:id,status:'',known_at:''},fill_summary:{},generated_at:'',version:'',invalidated_at:null});
+(async()=>{const a=showDetail('A');const b=showDetail('B');resolveB(card('B'));await b;resolveA(card('A'));await a;console.log(JSON.stringify({owner:openScenarioCard,hidden:detail.hidden,html:detail.innerHTML,notice:notice.textContent}));})().catch(e=>{console.error(e);process.exit(1)});
+"""
+    state = json.loads(subprocess.check_output(["node", "-e", script], text=True, env=os.environ).strip())
+    assert state["owner"] == "B" and state["hidden"] is False
+    assert "<h2>B</h2>" in state["html"] and "<h2>A</h2>" not in state["html"]
+    assert state["notice"] == ""
+
+
+def test_initial_detail_get_late_response_is_invalidated_by_date_or_filter_stop():
+    from kr_stock_autotrader.ui import APP_HTML
+    helpers = re.search(r"let scenarioPoll=.*?(?=async function showDetail)", APP_HTML, re.S).group(0)
+    show_detail = "function approvalBlocked(){return ''}" + re.search(r"async function showDetail.*?(?=function draftForm)", APP_HTML, re.S).group(0)
+    script = """
+let resolveA;
+const detail={hidden:true,innerHTML:''}, notice={textContent:''}; const nodes={'#detail':detail,'#notice':notice};
+const $=selector=>nodes[selector]||(nodes[selector]={}); let document={hidden:false,addEventListener:()=>{}};
+const clearInterval=()=>{}, setInterval=()=>({}); const AbortController=class{constructor(){this.signal={};this.abort=()=>{}}};
+const esc=x=>String(x??''), details=(a,b)=>a+':'+b, kst=x=>x||'', shortTerm=()=>'', draftValues=()=>({});
+""" + helpers + show_detail + """
+const api=()=>new Promise(resolve=>resolveA=resolve);
+const card={card:{},user_state:{order_plan:null,draft:null},verdict:'관찰',filter:{verdict:'FAIL',reasons:[],as_of:'',known_at:'',computed:{}},event_scenarios:[],evidence:{name:'A',status:'',known_at:''},fill_summary:{},generated_at:'',version:''};
+(async()=>{const pending=showDetail('A');stopScenarioPolling();openScenarioCard=null;resolveA(card);await pending;console.log(JSON.stringify({owner:openScenarioCard,hidden:detail.hidden,html:detail.innerHTML,notice:notice.textContent}));})().catch(e=>{console.error(e);process.exit(1)});
+"""
+    state = json.loads(subprocess.check_output(["node", "-e", script], text=True, env=os.environ).strip())
+    assert state == {"owner": None, "hidden": True, "html": "", "notice": ""}
