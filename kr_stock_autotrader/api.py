@@ -414,7 +414,9 @@ def kis_orderbook(symbol: str, request: Request):
         global _default_kis_client
         if _default_kis_client is None: _default_kis_client = KISReadOnlyClient()
         provider = _default_kis_client.orderbook
-    return _safe_kis_orderbook(symbol, provider(symbol))
+    try: outcome = provider(symbol)
+    except Exception: outcome = None
+    return _safe_kis_orderbook(symbol, outcome)
 
 
 @app.post("/api/cards/{card_id}/scenario-observations")
@@ -429,17 +431,27 @@ async def card_scenario_observation(card_id: int, request: Request):
         try: body = await request.json()
         except ValueError: raise HTTPException(422, "invalid observation body")
         if not isinstance(body, dict): raise HTTPException(422, "invalid observation body")
-        forbidden = {"symbol", "scenario", "match", "action", "active_scenario_label", "trusted_business_invalidation", "price", "price_krw", "best_bid", "best_ask", "provider", "source", "known_at", "quote_known_at", "retrieved_at", "timestamp_source", "benchmark_excess_pct", "sector_excess_pct", "volume_ratio"}
+        forbidden = {"symbol", "scenario", "match", "action", "active_scenario_label", "trusted_business_invalidation", "price", "price_krw", "best_bid", "best_ask", "top_bid_qty", "top_ask_qty", "spread_pct", "imbalance", "provider", "source", "source_receipt", "known_at", "quote_known_at", "retrieved_at", "timestamp_source", "benchmark_excess_pct", "sector_excess_pct", "volume_ratio"}
         if forbidden.intersection(body): raise HTTPException(422, "server-owned observation fields")
         provider = getattr(app.state, "kis_orderbook_provider", None)
         if provider is None:
             global _default_kis_client
             if _default_kis_client is None: _default_kis_client = KISReadOnlyClient()
             provider = _default_kis_client.orderbook
-        quote = _safe_kis_orderbook(scenario["symbol"], provider(scenario["symbol"]))
+        try: outcome = provider(scenario["symbol"])
+        except Exception: outcome = None
+        quote = _safe_kis_orderbook(scenario["symbol"], outcome)
         if quote.get("status") != "ok": raise HTTPException(503, "orderbook unavailable")
-        observation = {**quote, "provider": quote["source"], "source": quote["source"], "symbol": scenario["symbol"], "known_at": quote["quote_known_at"], "retrieved_at": quote["retrieved_at"], "price_krw": quote["last_price"], "best_bid": quote["best_bid"], "best_ask": quote["best_ask"], "spread_pct": quote["spread_pct"], "imbalance": quote["imbalance"], "idempotency_key": body.get("idempotency_key", quote["quote_known_at"]), "volume_ratio": 1.0, "benchmark_excess_pct": 0.0, "sector_excess_pct": 0.0}
-        return observe_scenario(db, scenario["id"], observation)
+        observation = {
+            "provider": "KIS", "source": "KIS", "source_receipt": f"KIS:{quote['quote_known_at']}",
+            "symbol": scenario["symbol"], "known_at": quote["quote_known_at"], "retrieved_at": quote["retrieved_at"],
+            "price_krw": quote["last_price"], "best_bid": quote["best_bid"], "best_ask": quote["best_ask"],
+            "top_bid_qty": quote["top_bid_qty"], "top_ask_qty": quote["top_ask_qty"],
+            "idempotency_key": body.get("idempotency_key", quote["quote_known_at"]),
+            "volume_ratio": 1.0, "benchmark_excess_pct": 0.0, "sector_excess_pct": 0.0,
+            "market_context_status": "UNAVAILABLE",
+        }
+        return observe_scenario(db, scenario["event_identity"], observation)
     finally: db.close()
 
 @app.post("/api/order-plans/{plan_id}/live-dry-run")
@@ -591,7 +603,7 @@ async def internal_scenario_set_create(request: Request, _: None = Depends(requi
 @app.get('/api/internal/scenario-sets/{identity}')
 def internal_scenario_set_read(identity: str, _: None = Depends(require_internal_api_key)):
     db=connect()
-    try: return scenario_set_detail(db, identity)
+    try: return __import__("kr_stock_autotrader.event_scenarios", fromlist=["detail_by_event_identity"]).detail_by_event_identity(db, identity)
     finally: db.close()
 
 @app.get('/api/internal/scenario-sets')

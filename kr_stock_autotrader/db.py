@@ -65,19 +65,19 @@ def connect() -> sqlite3.Connection:
     -- Additive immutable event scenario records. These tables have no order/allocation foreign keys.
     CREATE TABLE IF NOT EXISTS event_scenario_sets (
       id INTEGER PRIMARY KEY, event_identity TEXT NOT NULL, version INTEGER NOT NULL, symbol TEXT NOT NULL, event_type TEXT NOT NULL,
-      profile_id TEXT NOT NULL, profile_version INTEGER NOT NULL, evidence_id INTEGER REFERENCES material_evidence(id), card_id INTEGER REFERENCES decision_cards(id),
+      profile_id TEXT NOT NULL, profile_version INTEGER NOT NULL, evidence_id INTEGER NOT NULL REFERENCES material_evidence(id), card_id INTEGER NOT NULL REFERENCES decision_cards(id),
       disclosed_at TEXT NOT NULL, known_at TEXT NOT NULL, frozen_at TEXT NOT NULL, scenario_json TEXT NOT NULL, scenarios_json TEXT NOT NULL, expected_value_krw REAL NOT NULL,
-      UNIQUE(event_identity, version)
+      UNIQUE(card_id, event_identity, version)
     );
     CREATE TABLE IF NOT EXISTS event_scenario_observations (
       id INTEGER PRIMARY KEY, scenario_set_id INTEGER NOT NULL REFERENCES event_scenario_sets(id), known_at TEXT NOT NULL,
       price_krw REAL NOT NULL, benchmark_excess_pct REAL NOT NULL, sector_excess_pct REAL NOT NULL, volume_ratio REAL NOT NULL,
       match TEXT NOT NULL CHECK(match IN ('BAD_MATCH','BASE_MATCH','GOOD_MATCH','OUT_OF_RANGE')),
       action TEXT NOT NULL CHECK(action IN ('NO_ACTION','WATCH','ENTRY_REVIEW','ADD_REVIEW','REDUCE_REVIEW','EXIT_REVIEW')),
-      provider TEXT NOT NULL DEFAULT 'synthetic', source TEXT NOT NULL DEFAULT 'synthetic', symbol TEXT,
+      provider TEXT NOT NULL DEFAULT 'synthetic', source TEXT NOT NULL DEFAULT 'synthetic', source_receipt TEXT, symbol TEXT,
       retrieved_at TEXT, quote_known_at TEXT, units TEXT NOT NULL DEFAULT 'KRW/pct/ratio',
       idempotency_key TEXT, best_bid REAL, best_ask REAL, spread_pct REAL, imbalance REAL,
-      active_scenario_label TEXT, UNIQUE(scenario_set_id, known_at, source)
+      active_scenario_label TEXT, market_context_status TEXT NOT NULL DEFAULT 'UNAVAILABLE', material_hash TEXT NOT NULL DEFAULT '', UNIQUE(scenario_set_id, known_at, source)
     );
     CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, detail TEXT NOT NULL, at TEXT NOT NULL);
     -- Safe receipt only: no credentials, account data, headers, raw KIS payload, or order effects.
@@ -106,10 +106,18 @@ def connect() -> sqlite3.Connection:
     # Legacy SQLite cannot safely add NOT NULL lineage columns without a table
     # rebuild.  We keep this migration additive/repeat-safe and fail closed in
     # event_scenarios.create when modern records lack valid lineage.
-    for column, ddl in (("provider", "TEXT NOT NULL DEFAULT 'synthetic'"), ("source", "TEXT NOT NULL DEFAULT 'synthetic'"), ("symbol", "TEXT"), ("retrieved_at", "TEXT"), ("quote_known_at", "TEXT"), ("units", "TEXT NOT NULL DEFAULT 'KRW/pct/ratio'"), ("idempotency_key", "TEXT"), ("best_bid", "REAL"), ("best_ask", "REAL"), ("spread_pct", "REAL"), ("imbalance", "REAL"), ("active_scenario_label", "TEXT")):
+    for column, ddl in (("provider", "TEXT NOT NULL DEFAULT 'synthetic'"), ("source", "TEXT NOT NULL DEFAULT 'synthetic'"), ("source_receipt", "TEXT"), ("symbol", "TEXT"), ("retrieved_at", "TEXT"), ("quote_known_at", "TEXT"), ("units", "TEXT NOT NULL DEFAULT 'KRW/pct/ratio'"), ("idempotency_key", "TEXT"), ("best_bid", "REAL"), ("best_ask", "REAL"), ("spread_pct", "REAL"), ("imbalance", "REAL"), ("active_scenario_label", "TEXT"), ("market_context_status", "TEXT NOT NULL DEFAULT 'UNAVAILABLE'"), ("material_hash", "TEXT NOT NULL DEFAULT ''")):
         if column not in {col["name"] for col in db.execute("PRAGMA table_info(event_scenario_observations)")}:
             db.execute(f"ALTER TABLE event_scenario_observations ADD COLUMN {column} {ddl}")
     db.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_event_scenario_card_identity_version ON event_scenario_sets(card_id,event_identity,version)")
+    db.executescript("""
+    CREATE TRIGGER IF NOT EXISTS event_scenario_lineage_insert BEFORE INSERT ON event_scenario_sets BEGIN
+      SELECT CASE WHEN NEW.card_id IS NULL OR NEW.evidence_id IS NULL THEN RAISE(ABORT,'scenario lineage required') END;
+      SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.id=NEW.card_id AND c.evidence_id=NEW.evidence_id) THEN RAISE(ABORT,'scenario lineage mismatch') END;
+      SELECT CASE WHEN NEW.version != COALESCE((SELECT MAX(version)+1 FROM event_scenario_sets WHERE card_id=NEW.card_id AND event_identity=NEW.event_identity),1) THEN RAISE(ABORT,'scenario version must append') END;
+    END;
+    CREATE TRIGGER IF NOT EXISTS event_scenario_lineage_update BEFORE UPDATE ON event_scenario_sets BEGIN SELECT RAISE(ABORT,'immutable scenario set'); END;
+    """)
     db.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_event_observation_idempotency ON event_scenario_observations(scenario_set_id,idempotency_key) WHERE idempotency_key IS NOT NULL")
     db.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_event_observation_source ON event_scenario_observations(scenario_set_id,known_at,source)")
     return db

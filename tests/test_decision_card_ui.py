@@ -52,6 +52,8 @@ def test_fill_timestamp_and_dropdown_filter_ui_contract_is_present():
         "expires:isoKst(a.get('expires'))", "@media(max-width:390px)", "grid-template-columns:1fr", "overflow-x:hidden",
         "기본 모의투자 금액", "기본 금액 저장", "이 카드에 적용할 금액", "default-paper-amount",
         "loadPaperSetting", "savePaperSetting", "toLocaleString('ko-KR')", "min=\"10000\"", "step=\"1\"",
+        "scenarioGeneration", "scenarioAbort", "per_share_value_range_krw", "return_range_pct", "price_path",
+        "시나리오 버전·동결", "호가 출처·확인", "현재 호가 판단 보류", "refreshScenario(cardId)",
     ):
         assert text in APP_HTML
     # Green presentation is exclusively keyed to a real current-user buy fill.
