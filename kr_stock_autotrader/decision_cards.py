@@ -278,7 +278,7 @@ def user_card_view(db, ident, user_id):
     for scenario in db.execute("SELECT id,version,frozen_at,expected_value_krw,scenarios_json FROM event_scenario_sets WHERE card_id=? ORDER BY id DESC",(ident,)):
         observations=[dict(x) for x in db.execute("""SELECT known_at,retrieved_at,provider,source,
             CASE WHEN provider='KIS' THEN 'network_retrieved_at' ELSE NULL END AS timestamp_source,
-            price_krw,best_bid,best_ask,top_bid_qty,top_ask_qty,volume_ratio,benchmark_excess_pct,
+            price_krw,best_bid,best_ask,volume_ratio,benchmark_excess_pct,
             sector_excess_pct,market_context_status,spread_pct,imbalance,match,action,active_scenario_label
             FROM event_scenario_observations WHERE scenario_set_id=? ORDER BY id DESC LIMIT 1""",(scenario["id"],))]
         current = observations[0] if observations else {"match":"UNOBSERVED","action":"NO_ACTION","active_scenario_label":None}

@@ -276,30 +276,40 @@ def _safe_kis_orderbook(symbol: str, outcome: object) -> dict:
 
 
 def _tracking_health(quote: dict, result: dict, *, invalidated: bool = False) -> dict:
-    """Closed user-facing health projection; never includes provider payload/errors."""
+    """Closed, defensive projection separating quote transport from decision data."""
     attempted = now_kst()
-    age = max(0, int((attempted - parse_kst(quote["retrieved_at"])).total_seconds()))
-    context = quote["market_context_status"]
-    context_ready = context == "VERIFIED"
-    invalidation_status = "BLOCKED" if invalidated else "PASS"
-    gates = [
-        {"gate":"quote_validity_freshness", "status":"PASS", "role":"timestamp_symbol_source_prerequisite"},
-        {"gate":"market_context", "status":"PASS" if context_ready else "BLOCKED", "role":"scenario_selection_prerequisite"},
-        {"gate":"price_range", "status":"NOT_EVALUATED" if not context_ready else ("PASS" if result["active_scenario_label"] else "OUT_OF_RANGE"), "role":"selects_label_after_verified_context"},
-        {"gate":"market_sector_volume", "status":"NOT_EVALUATED" if not context_ready else "EVALUATED", "role":"changes_good_action_strength_only"},
-        {"gate":"spread_imbalance", "status":"OBSERVED", "role":"integrity_context_not_label_selector"},
-        {"gate":"business_invalidation", "status":invalidation_status, "role":"authoritative_exit_override"},
+    required = ("retrieved_at", "quote_known_at", "source", "timestamp_source", "last_price", "best_bid", "best_ask", "top_bid_qty", "top_ask_qty", "spread_pct", "imbalance", "market_context_status")
+    safe = isinstance(quote, dict) and all(key in quote for key in required)
+    try:
+        age = max(0, int((attempted - parse_kst(quote["retrieved_at"])).total_seconds())) if safe else None
+    except (TypeError, ValueError, OverflowError):
+        safe, age = False, None
+    context = quote.get("market_context_status") if isinstance(quote, dict) else None
+    quote_health = "HEALTHY" if safe and age is not None else "UNAVAILABLE"
+    context_ready = quote_health == "HEALTHY" and context == "VERIFIED" and not invalidated
+    context_readiness = "READY" if context_ready else "BLOCKED"
+    labels = {"PASS": "통과", "BLOCKED": "차단", "NOT_EVALUATED": "평가 안 함", "OBSERVED": "관측만", "OUT_OF_RANGE": "차단", "EVALUATED": "통과"}
+    gate_specs = [
+        ("quote_validity_freshness", "호가 유효성", "PASS" if quote_health == "HEALTHY" else "BLOCKED", "timestamp_symbol_source_prerequisite"),
+        ("market_context", "시장 자료", "PASS" if context_ready else "BLOCKED", "scenario_selection_prerequisite"),
+        ("price_range", "가격 범위", "NOT_EVALUATED" if not context_ready else ("PASS" if result.get("active_scenario_label") else "OUT_OF_RANGE"), "selects_label_after_verified_context"),
+        ("market_sector_volume", "시장·섹터·거래량", "NOT_EVALUATED" if not context_ready else "EVALUATED", "changes_good_action_strength_only"),
+        ("spread_imbalance", "스프레드·불균형", "OBSERVED", "integrity_context_not_label_selector"),
+        ("business_invalidation", "사업 무효화", "BLOCKED" if invalidated else "PASS", "authoritative_exit_override"),
     ]
+    gates = [{"gate": gate, "label": label, "status": status, "display_status": labels[status], "role": role} for gate, label, status, role in gate_specs]
+    status = "TRACKING_STOPPED" if invalidated else ("QUOTE_UNAVAILABLE" if quote_health != "HEALTHY" else ("HEALTHY" if context_ready else "QUOTE_OK_CONTEXT_MISSING"))
     return {
-        "status": "TRACKING_STOPPED" if invalidated else ("HEALTHY" if context_ready else "QUOTE_OK_CONTEXT_MISSING"),
-        "last_attempted_at": attempted.isoformat(), "last_success_at": quote["retrieved_at"],
-        "quote_age_seconds": age, "freshness": "FRESH", "source": quote["source"],
-        "timestamp_source": quote["timestamp_source"], "quote_known_at": quote["quote_known_at"],
-        "price_krw": quote["last_price"], "best_bid": quote["best_bid"], "best_ask": quote["best_ask"],
-        "top_bid_qty": quote["top_bid_qty"], "top_ask_qty": quote["top_ask_qty"],
-        "spread_pct": quote["spread_pct"], "imbalance": quote["imbalance"],
-        "market_context_status": context, "match": result["match"], "action": result["action"],
-        "active_scenario_label": result["active_scenario_label"], "gate_results": gates,
+        "quote_health": quote_health, "context_readiness": context_readiness, "status": status,
+        "last_attempted_at": attempted.isoformat(), "last_success_at": quote.get("retrieved_at") if safe else None,
+        "quote_age_seconds": age, "freshness": "FRESH" if quote_health == "HEALTHY" else "UNAVAILABLE",
+        "source": quote.get("source") if safe else None, "timestamp_source": quote.get("timestamp_source") if safe else None,
+        "quote_known_at": quote.get("quote_known_at") if safe else None, "price_krw": quote.get("last_price") if safe else None,
+        "best_bid": quote.get("best_bid") if safe else None, "best_ask": quote.get("best_ask") if safe else None,
+        "top_bid_qty": quote.get("top_bid_qty") if safe else None, "top_ask_qty": quote.get("top_ask_qty") if safe else None,
+        "spread_pct": quote.get("spread_pct") if safe else None, "imbalance": quote.get("imbalance") if safe else None,
+        "market_context_status": context if safe else "UNAVAILABLE", "match": result.get("match", "UNOBSERVED"),
+        "action": result.get("action", "NO_ACTION"), "active_scenario_label": result.get("active_scenario_label"), "gate_results": gates,
     }
 
 
