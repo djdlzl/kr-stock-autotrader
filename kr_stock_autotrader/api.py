@@ -22,6 +22,7 @@ from .ui import APP_HTML, AUTH_HTML
 from .kis_readonly import KISReadOnlyClient
 from .market_data import build_premarket_snapshot, filter_inputs_from_snapshot
 from .live_dry_run import existing_live_dry_run_receipt, persist_live_dry_run
+from .event_scenarios import create as create_scenario_set, detail as scenario_set_detail, observe as observe_scenario
 
 
 class AuthIn(BaseModel):
@@ -530,6 +531,31 @@ def submit_tick(data: TickIn, request: Request):
     finally:
         db.close()
 
+
+@app.post('/api/internal/scenario-sets')
+async def internal_scenario_set_create(request: Request, _: None = Depends(require_internal_api_key)):
+    """Freeze a server-calculated scenario set; this endpoint cannot create trading artifacts."""
+    db=connect()
+    try: return create_scenario_set(db, await request.json())
+    finally: db.close()
+
+@app.get('/api/internal/scenario-sets/{identity}')
+def internal_scenario_set_read(identity: str, _: None = Depends(require_internal_api_key)):
+    db=connect()
+    try: return scenario_set_detail(db, identity)
+    finally: db.close()
+
+@app.get('/api/internal/scenario-sets')
+def internal_scenario_set_list(_: None = Depends(require_internal_api_key)):
+    db=connect()
+    try: return [scenario_set_detail(db, row['id']) for row in db.execute('SELECT id FROM event_scenario_sets ORDER BY id DESC')]
+    finally: db.close()
+
+@app.post('/api/internal/scenario-sets/{identity}/observations')
+async def internal_scenario_observation_append(identity: str, request: Request, _: None = Depends(require_internal_api_key)):
+    db=connect()
+    try: return observe_scenario(db, identity, await request.json())
+    finally: db.close()
 
 @app.post('/api/internal/evidence')
 async def internal_evidence_create(request: Request, _: None = Depends(require_internal_api_key)):

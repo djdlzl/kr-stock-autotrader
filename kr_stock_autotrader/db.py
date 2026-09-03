@@ -62,6 +62,19 @@ def connect() -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS positions (id INTEGER PRIMARY KEY, order_plan_id INTEGER NOT NULL UNIQUE REFERENCES order_plans(id), symbol TEXT NOT NULL, qty INTEGER NOT NULL, avg_price REAL, status TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS exit_lineage (id INTEGER PRIMARY KEY, order_plan_id INTEGER NOT NULL REFERENCES order_plans(id), fill_id INTEGER NOT NULL REFERENCES order_fills(id), rule TEXT NOT NULL, quote_known_at TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS scheduler_runs (id INTEGER PRIMARY KEY, run_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, detail TEXT NOT NULL DEFAULT '{}');
+    -- Additive immutable event scenario records. These tables have no order/allocation foreign keys.
+    CREATE TABLE IF NOT EXISTS event_scenario_sets (
+      id INTEGER PRIMARY KEY, event_identity TEXT NOT NULL, version INTEGER NOT NULL, symbol TEXT NOT NULL, event_type TEXT NOT NULL,
+      profile_id TEXT NOT NULL, profile_version INTEGER NOT NULL, evidence_id INTEGER REFERENCES material_evidence(id), card_id INTEGER REFERENCES decision_cards(id),
+      disclosed_at TEXT NOT NULL, known_at TEXT NOT NULL, frozen_at TEXT NOT NULL, scenario_json TEXT NOT NULL, scenarios_json TEXT NOT NULL, expected_value_krw REAL NOT NULL,
+      UNIQUE(event_identity, version)
+    );
+    CREATE TABLE IF NOT EXISTS event_scenario_observations (
+      id INTEGER PRIMARY KEY, scenario_set_id INTEGER NOT NULL REFERENCES event_scenario_sets(id), known_at TEXT NOT NULL,
+      price_krw REAL NOT NULL, benchmark_excess_pct REAL NOT NULL, sector_excess_pct REAL NOT NULL, volume_ratio REAL NOT NULL,
+      match TEXT NOT NULL CHECK(match IN ('BAD_MATCH','BASE_MATCH','GOOD_MATCH','OUT_OF_RANGE')),
+      action TEXT NOT NULL CHECK(action IN ('NO_ACTION','WATCH','ENTRY_REVIEW','ADD_REVIEW','REDUCE_REVIEW','EXIT_REVIEW'))
+    );
     CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, detail TEXT NOT NULL, at TEXT NOT NULL);
     -- Safe receipt only: no credentials, account data, headers, raw KIS payload, or order effects.
     CREATE TABLE IF NOT EXISTS live_dry_run_receipts (
