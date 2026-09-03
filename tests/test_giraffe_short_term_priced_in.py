@@ -75,6 +75,8 @@ def test_card_detail_ui_has_visible_approval_cta_and_separate_sections():
     for text in ("재료 정보", "판단 카드", "매수 승인", "승인할 수 없는 이유", "short_term_excess_return_pct", "short_term_window"):
         assert text in APP_HTML
     assert "buy?draftForm(values,plan,id)" not in APP_HTML
+    for text in ("material-section", "judgment-section", "#f59e0b", "#2563eb"):
+        assert text in APP_HTML
 
 
 def test_manager_card7_completed_close_denominator_order_and_boundaries(monkeypatch):
@@ -112,3 +114,47 @@ def test_short_term_gate_fails_closed_for_duplicate_missing_or_future_boundary(m
     inputs = __import__("kr_stock_autotrader.market_data", fromlist=["filter_inputs_from_snapshot"]).filter_inputs_from_snapshot(market)
     result = run_filter(inputs | {"source":"dart", "announcement_at":"2026-09-01T17:00:00+09:00", "economic_terms":"verified", "short_term_window": inputs["short_term_window"] | {"ended_known_at":"2026-09-02T15:30:00+09:00"}}, market["market_data_known_at"], market["market_data_known_at"])
     assert result["verdict"] == "FAIL" and "short-term window known_at future" in result["reasons"]
+
+
+def test_v2_contract_requires_exactly_two_sessions_in_config_snapshot_and_filter(monkeypatch):
+    from kr_stock_autotrader.decision_cards import run_filter
+    from kr_stock_autotrader.market_data import build_premarket_snapshot, filter_inputs_from_snapshot
+    configure(monkeypatch)
+    as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
+    market = build_premarket_snapshot("005930", as_of, lambda *_: snapshot(rows()), "2026-09-01T17:00:00+09:00")
+    inputs = filter_inputs_from_snapshot(market) | {"source": "dart", "announcement_at": "2026-09-01T17:00:00+09:00", "economic_terms": "verified"}
+    monkeypatch.setenv("GIRAFFE_SHORT_TERM_RISE_SESSIONS", "3")
+    assert build_premarket_snapshot("005930", as_of, lambda *_: snapshot(rows()), "2026-09-01T17:00:00+09:00")["status"] == "unavailable"
+    assert filter_inputs_from_snapshot(market) == {"market_data_status": "unavailable", "market_data_attempted_at": market["retrieved_at"]}
+    result = run_filter(inputs | {"short_term_rise_sessions": 3, "short_term_window": inputs["short_term_window"] | {"sessions": 3}}, market["market_data_known_at"], market["market_data_known_at"])
+    assert result["verdict"] == "FAIL"
+    assert "short-term session window must be exactly two completed sessions" in result["reasons"]
+
+
+def test_v2_filter_recomputes_excess_and_rejects_forged_value(monkeypatch):
+    from kr_stock_autotrader.decision_cards import run_filter
+    from kr_stock_autotrader.market_data import build_premarket_snapshot, filter_inputs_from_snapshot
+    configure(monkeypatch)
+    as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
+    market = build_premarket_snapshot("005930", as_of, lambda *_: snapshot(rows()), "2026-09-01T17:00:00+09:00")
+    inputs = filter_inputs_from_snapshot(market) | {"source": "dart", "announcement_at": "2026-09-01T17:00:00+09:00", "economic_terms": "verified", "short_term_stock_return_pct": 20, "short_term_benchmark_return_pct": 0, "short_term_excess_return_pct": 0}
+    result = run_filter(inputs, market["market_data_known_at"], market["market_data_known_at"])
+    assert result["verdict"] == "FAIL"
+    assert "short-term excess return mismatch" in result["reasons"]
+    assert "short-term excess rise too high" in result["reasons"]
+    assert result["computed"]["short_term_excess_return_pct"] == 20.0
+
+
+def test_v2_excess_precision_boundary_uses_eight_decimal_producer_precision(monkeypatch):
+    from kr_stock_autotrader.decision_cards import run_filter
+    from kr_stock_autotrader.market_data import build_premarket_snapshot, filter_inputs_from_snapshot
+    configure(monkeypatch)
+    as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
+    market = build_premarket_snapshot("005930", as_of, lambda *_: snapshot(rows()), "2026-09-01T17:00:00+09:00")
+    base = filter_inputs_from_snapshot(market) | {"source": "dart", "announcement_at": "2026-09-01T17:00:00+09:00", "economic_terms": "verified", "short_term_stock_return_pct": 10, "short_term_benchmark_return_pct": 0}
+    accepted = run_filter(base | {"short_term_excess_return_pct": 10.000000004}, market["market_data_known_at"], market["market_data_known_at"])
+    rejected = run_filter(base | {"short_term_excess_return_pct": 10.000000006}, market["market_data_known_at"], market["market_data_known_at"])
+    assert accepted["verdict"] == "PASS"
+    assert accepted["computed"]["short_term_excess_return_pct"] == 10.0
+    assert rejected["verdict"] == "FAIL"
+    assert "short-term excess return mismatch" in rejected["reasons"]

@@ -23,6 +23,7 @@ MARKET_CAP_UNIT_KRW = 100_000_000.0
 RETURN_HORIZON_SESSIONS = 20
 # v2 promotion gate: never allow a one-day move to masquerade as a durable signal.
 MIN_SHORT_TERM_SESSIONS = 2
+SHORT_TERM_RISE_SESSIONS = 2
 KST_CASH_CLOSE = time(15, 30)
 
 
@@ -201,9 +202,9 @@ def _filter_config() -> dict:
     if version != "giraffe-premarket-filter-v2-short-term-priced-in":
         raise ValueError("unknown GIRAFFE_FILTER_CONFIG_VERSION")
     sessions = _threshold("GIRAFFE_SHORT_TERM_RISE_SESSIONS")
-    if not sessions.is_integer() or sessions < MIN_SHORT_TERM_SESSIONS:
-        raise ValueError("short-term session window must be an integer of at least two")
-    return {"filter_config_version": version, "short_term_rise_sessions": int(sessions),
+    if not sessions.is_integer() or sessions != SHORT_TERM_RISE_SESSIONS:
+        raise ValueError("short-term session window must be exactly two completed sessions")
+    return {"filter_config_version": version, "short_term_rise_sessions": SHORT_TERM_RISE_SESSIONS,
             "max_short_term_excess_rise_pct": _threshold("GIRAFFE_MAX_SHORT_TERM_EXCESS_RISE_PCT")}
 
 

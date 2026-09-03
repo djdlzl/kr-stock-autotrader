@@ -8,6 +8,9 @@ from .decision_card_schema import SCHEMA_VERSION, validate_card
 from .domain import fresh_quote, market_open, now_kst, parse_kst
 
 PROMPT_PATH = Path(__file__).parents[1] / "prompts" / "decision-card-v1.md"
+SHORT_TERM_RISE_SESSIONS = 2
+SHORT_TERM_EXCESS_PRECISION = 8
+SHORT_TERM_EXCESS_TOLERANCE = 0.5 * 10 ** -SHORT_TERM_EXCESS_PRECISION
 def prompt_hash(): return hashlib.sha256(PROMPT_PATH.read_bytes()).hexdigest()
 def canon(x): return json.dumps(x, ensure_ascii=False, sort_keys=True, separators=(",",":"))
 def now(): return now_kst().isoformat()
@@ -114,15 +117,17 @@ def run_filter(inputs, as_of, known_at):
     for actual, limit, label in ((numbers["recent_rise_pct"],inputs.get("max_recent_rise_pct"),"recent rise"),(numbers["gap_pct"],inputs.get("max_gap_pct"),"gap"),(numbers["pre_announcement_return_pct"],inputs.get("max_pre_return_pct"),"pre-return")):
         if actual is not None and isinstance(limit,(int,float)) and actual>limit: reasons.append(label+" too high")
     is_v2 = inputs.get("filter_config_version") == "giraffe-premarket-filter-v2-short-term-priced-in"
+    expected_short_term_excess = None
     if is_v2:
-        _num(inputs, "max_short_term_excess_rise_pct", reasons, positive=True)
-        for key in ("short_term_stock_return_pct", "short_term_benchmark_return_pct", "short_term_excess_return_pct"):
-            _num(inputs, key, reasons)
+        max_short_term_excess = _num(inputs, "max_short_term_excess_rise_pct", reasons, positive=True)
+        short_stock_return = _num(inputs, "short_term_stock_return_pct", reasons)
+        short_benchmark_return = _num(inputs, "short_term_benchmark_return_pct", reasons)
+        supplied_short_term_excess = _num(inputs, "short_term_excess_return_pct", reasons)
         window, provenance = inputs.get("short_term_window"), inputs.get("short_term_provenance")
         if not isinstance(window, dict) or window.get("sessions") != inputs.get("short_term_rise_sessions") or not isinstance(window.get("start"), str) or not isinstance(window.get("end"), str):
             reasons.append("missing/invalid short-term window")
-        if not isinstance(inputs.get("short_term_rise_sessions"), int) or inputs["short_term_rise_sessions"] < 2:
-            reasons.append("short-term session window must include at least two completed sessions")
+        if inputs.get("short_term_rise_sessions") != SHORT_TERM_RISE_SESSIONS:
+            reasons.append("short-term session window must be exactly two completed sessions")
         try:
             ended_known = parse_kst(window.get("ended_known_at"))
             if ended_known > kdt or ended_known > asdt: reasons.append("short-term window known_at future")
@@ -133,8 +138,11 @@ def run_filter(inputs, as_of, known_at):
             if provenance.get("source") != "KIS" or daily_known > kdt or daily_known > asdt: reasons.append("missing/invalid short-term provenance")
         except (AttributeError, ValueError, TypeError):
             reasons.append("missing/invalid short-term provenance")
-        excess = _num(inputs, "short_term_excess_return_pct", reasons)
-        if excess is not None and excess > inputs.get("max_short_term_excess_rise_pct", float("-inf")):
+        if short_stock_return is not None and short_benchmark_return is not None:
+            expected_short_term_excess = round(short_stock_return - short_benchmark_return, SHORT_TERM_EXCESS_PRECISION)
+            if supplied_short_term_excess is not None and abs(supplied_short_term_excess - expected_short_term_excess) > SHORT_TERM_EXCESS_TOLERANCE:
+                reasons.append("short-term excess return mismatch")
+        if expected_short_term_excess is not None and max_short_term_excess is not None and expected_short_term_excess > max_short_term_excess:
             reasons.append("short-term excess rise too high")
     elif inputs.get("filter_config_version") not in (None, "giraffe-premarket-filter-v1-frozen"):
         reasons.append("unknown filter config version")
@@ -145,7 +153,8 @@ def run_filter(inputs, as_of, known_at):
     volume_ratio=None if numbers["current_volume"] is None or numbers["baseline_volume"] is None else numbers["current_volume"]/numbers["baseline_volume"]
     computed={"stock_vs_benchmark_pct":None if numbers["stock_return_pct"] is None or numbers["benchmark_return_pct"] is None else numbers["stock_return_pct"]-numbers["benchmark_return_pct"],"stock_vs_sector_pct":None if numbers["stock_return_pct"] is None or numbers["sector_return_pct"] is None else numbers["stock_return_pct"]-numbers["sector_return_pct"],"volume_ratio":volume_ratio}
     if is_v2:
-        computed.update({key: inputs.get(key) for key in ("filter_config_version", "short_term_stock_return_pct", "short_term_benchmark_return_pct", "short_term_excess_return_pct", "short_term_window", "short_term_provenance", "max_short_term_excess_rise_pct")})
+        computed.update({key: inputs.get(key) for key in ("filter_config_version", "short_term_stock_return_pct", "short_term_benchmark_return_pct", "short_term_window", "short_term_provenance", "max_short_term_excess_rise_pct")})
+        computed["short_term_excess_return_pct"] = expected_short_term_excess
     return {"verdict":"FAIL" if reasons else "PASS","reasons":reasons,"computed":computed,"units":{"stock_vs_benchmark_pct":"percent; stock_return_pct - benchmark_return_pct; positive means stock outperformed benchmark","stock_vs_sector_pct":"percent; stock_return_pct - sector_return_pct; positive means stock outperformed sector","volume_ratio":"ratio; current_volume / baseline_volume; baseline_volume > 0","short_term_stock_return_pct":"percent; close-to-close stock return over short_term_window","short_term_benchmark_return_pct":"percent; close-to-close benchmark return over short_term_window","short_term_excess_return_pct":"percent; short_term_stock_return_pct - short_term_benchmark_return_pct; positive means stock outperformed benchmark","short_term_window":"KST ISO date window, completed aligned sessions only; ended_known_at must not be after decision known_at","short_term_provenance":"KIS completed daily bars and known-at timestamps","as_of":"KST ISO-8601; evidence.known_at and market_data_known_at must each be at or before filter.known_at <= filter.as_of"}}
 def save_filter(db,evidence_id,inputs,as_of,known_at):
     evidence=row(db,"material_evidence",evidence_id)
