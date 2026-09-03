@@ -166,6 +166,16 @@ class KISReadOnlyClient:
             pass
         return {"symbol":symbol,"source":"KIS","environment":"production","status":"unavailable","retrieved_at":retrieved.isoformat(),"timestamp_source":"network_retrieved_at"}
 
+    @staticmethod
+    def project_orderbook(raw: dict, symbol: str) -> dict:
+        """Project synthetic/raw-shaped data into the safe top-of-book schema."""
+        if not isinstance(raw, dict) or raw.get("symbol", symbol) != symbol: raise ValueError("orderbook symbol mismatch")
+        try: values = [float(raw[k]) for k in ("last", "bid", "ask", "bid_qty", "ask_qty")]
+        except (KeyError, TypeError, ValueError): raise ValueError("malformed orderbook")
+        if not all(math.isfinite(x) and x > 0 for x in values) or values[1] > values[2]: raise ValueError("malformed orderbook")
+        last,bid,ask,bq,aq = values; stamp=now_kst().isoformat()
+        return {"symbol":symbol,"last_price":last,"best_bid":bid,"best_ask":ask,"top_bid_qty":bq,"top_ask_qty":aq,"spread_pct":(ask-bid)/last*100,"imbalance":(bq-aq)/(bq+aq),"quote_known_at":stamp,"retrieved_at":stamp,"timestamp_source":"synthetic","source":"synthetic","status":"ok"}
+
     def daily_snapshot(self, symbol: str, as_of: datetime) -> DailySnapshot:
         """Read the official output1 summary plus output2 bars as a closed object."""
         if not isinstance(symbol, str) or not re.fullmatch(r"\d{6}", symbol) or as_of.tzinfo is None:
