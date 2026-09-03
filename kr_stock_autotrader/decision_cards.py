@@ -276,7 +276,11 @@ def user_card_view(db, ident, user_id):
         plan_view["exit_lineage"]=[dict(x) for x in db.execute("SELECT rule,quote_known_at,created_at FROM exit_lineage WHERE order_plan_id=? ORDER BY id",(plan["id"],))]
     result["event_scenarios"]=[]
     for scenario in db.execute("SELECT id,version,frozen_at,expected_value_krw,scenarios_json FROM event_scenario_sets WHERE card_id=? ORDER BY id DESC",(ident,)):
-        observations=[dict(x) for x in db.execute("SELECT known_at,retrieved_at,provider,source,source_receipt,market_context_status,spread_pct,imbalance,match,action,active_scenario_label FROM event_scenario_observations WHERE scenario_set_id=? ORDER BY id DESC LIMIT 1",(scenario["id"],))]
+        observations=[dict(x) for x in db.execute("""SELECT known_at,retrieved_at,provider,source,
+            CASE WHEN provider='KIS' THEN 'network_retrieved_at' ELSE NULL END AS timestamp_source,
+            price_krw,best_bid,best_ask,top_bid_qty,top_ask_qty,volume_ratio,benchmark_excess_pct,
+            sector_excess_pct,market_context_status,spread_pct,imbalance,match,action,active_scenario_label
+            FROM event_scenario_observations WHERE scenario_set_id=? ORDER BY id DESC LIMIT 1""",(scenario["id"],))]
         current = observations[0] if observations else {"match":"UNOBSERVED","action":"NO_ACTION","active_scenario_label":None}
         result["event_scenarios"].append({"version":scenario["version"],"frozen_at":scenario["frozen_at"],"expected_value_krw":scenario["expected_value_krw"],"scenarios":json.loads(scenario["scenarios_json"]),"current":current,"tracking_state":"ACTIVE" if not result.get("invalidated_at") else "INACTIVE"})
     result["user_state"]={"decision":dict(decision) if decision else None,"order_plan":plan_view,"draft":({**dict(draft),"snapshot":json.loads(draft["snapshot_json"])} if draft else None),"default_paper_amount":_default_paper_amount(db, user_id)}

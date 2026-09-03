@@ -59,6 +59,8 @@ def test_fill_timestamp_and_dropdown_filter_ui_contract_is_present():
     # Green presentation is exclusively keyed to a real current-user buy fill.
     assert "const bought=Boolean(c.fill_summary?.first_buy_at)" in APP_HTML
     assert "last_full_sell_at" in APP_HTML and "kst(summary?.last_full_sell_at)" in APP_HTML
+    for text in ("추적 상태", "정상 추적", "판단자료 부족", "연결 오류", "오래된 호가", "추적 중지", "시나리오 판단 지표", "시장·섹터·거래량 검증 자료가 없어 시나리오 선택 보류", "scenarioCountdown", "QUOTE_UNAVAILABLE"):
+        assert text in APP_HTML
 
 
 def test_filter_change_stops_scenario_polling_and_closes_detail():

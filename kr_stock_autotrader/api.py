@@ -275,6 +275,34 @@ def _safe_kis_orderbook(symbol: str, outcome: object) -> dict:
     return {"symbol":symbol, "last_price":last, "best_bid":bid, "best_ask":ask, "top_bid_qty":bid_qty, "top_ask_qty":ask_qty, "spread_pct":(ask-bid)/last*100, "imbalance":(bid_qty-ask_qty)/(bid_qty+ask_qty), "quote_known_at":quote_known_at, "retrieved_at":retrieved_at, "timestamp_source":"network_retrieved_at", "source":"KIS", "environment":"production", "market_context_status":"UNAVAILABLE", "status":"ok"}
 
 
+def _tracking_health(quote: dict, result: dict, *, invalidated: bool = False) -> dict:
+    """Closed user-facing health projection; never includes provider payload/errors."""
+    attempted = now_kst()
+    age = max(0, int((attempted - parse_kst(quote["retrieved_at"])).total_seconds()))
+    context = quote["market_context_status"]
+    context_ready = context == "VERIFIED"
+    invalidation_status = "BLOCKED" if invalidated else "PASS"
+    gates = [
+        {"gate":"quote_validity_freshness", "status":"PASS", "role":"timestamp_symbol_source_prerequisite"},
+        {"gate":"market_context", "status":"PASS" if context_ready else "BLOCKED", "role":"scenario_selection_prerequisite"},
+        {"gate":"price_range", "status":"NOT_EVALUATED" if not context_ready else ("PASS" if result["active_scenario_label"] else "OUT_OF_RANGE"), "role":"selects_label_after_verified_context"},
+        {"gate":"market_sector_volume", "status":"NOT_EVALUATED" if not context_ready else "EVALUATED", "role":"changes_good_action_strength_only"},
+        {"gate":"spread_imbalance", "status":"OBSERVED", "role":"integrity_context_not_label_selector"},
+        {"gate":"business_invalidation", "status":invalidation_status, "role":"authoritative_exit_override"},
+    ]
+    return {
+        "status": "TRACKING_STOPPED" if invalidated else ("HEALTHY" if context_ready else "QUOTE_OK_CONTEXT_MISSING"),
+        "last_attempted_at": attempted.isoformat(), "last_success_at": quote["retrieved_at"],
+        "quote_age_seconds": age, "freshness": "FRESH", "source": quote["source"],
+        "timestamp_source": quote["timestamp_source"], "quote_known_at": quote["quote_known_at"],
+        "price_krw": quote["last_price"], "best_bid": quote["best_bid"], "best_ask": quote["best_ask"],
+        "top_bid_qty": quote["top_bid_qty"], "top_ask_qty": quote["top_ask_qty"],
+        "spread_pct": quote["spread_pct"], "imbalance": quote["imbalance"],
+        "market_context_status": context, "match": result["match"], "action": result["action"],
+        "active_scenario_label": result["active_scenario_label"], "gate_results": gates,
+    }
+
+
 def _cache_success(key: tuple[int, str], quote: dict) -> dict:
     safe = dict(quote)
     with _quote_cache_lock:
@@ -441,7 +469,8 @@ async def card_scenario_observation(card_id: int, request: Request):
         try: outcome = provider(scenario["symbol"])
         except Exception: outcome = None
         quote = _safe_kis_orderbook(scenario["symbol"], outcome)
-        if quote.get("status") != "ok": raise HTTPException(503, "orderbook unavailable")
+        if quote.get("status") != "ok":
+            raise HTTPException(503, {"code": "QUOTE_UNAVAILABLE", "message": "호가를 안전하게 확인하지 못했습니다"})
         observation = {
             "provider": "KIS", "source": "KIS", "source_receipt": f"KIS:{quote['quote_known_at']}",
             "symbol": scenario["symbol"], "known_at": quote["quote_known_at"], "retrieved_at": quote["retrieved_at"],
@@ -451,7 +480,8 @@ async def card_scenario_observation(card_id: int, request: Request):
             "volume_ratio": 1.0, "benchmark_excess_pct": 0.0, "sector_excess_pct": 0.0,
             "market_context_status": "UNAVAILABLE",
         }
-        return observe_scenario(db, scenario["event_identity"], observation)
+        result = observe_scenario(db, scenario["event_identity"], observation)
+        return {"tracking_health": _tracking_health(quote, result), "observation": result}
     finally: db.close()
 
 @app.post("/api/order-plans/{plan_id}/live-dry-run")
