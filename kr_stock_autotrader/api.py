@@ -261,6 +261,17 @@ def _safe_kis_quote(symbol: str, outcome: object) -> dict:
         "status": "ok",
     }
 
+def _safe_kis_orderbook(symbol: str, outcome: object) -> dict:
+    unavailable = {"symbol": symbol, "source": "KIS", "status": "unavailable"}
+    if not isinstance(outcome, dict) or outcome.get("symbol") != symbol: return unavailable
+    try:
+        known = datetime.fromisoformat(str(outcome["quote_known_at"]).replace("Z", "+00:00")); retrieved = datetime.fromisoformat(str(outcome["retrieved_at"]).replace("Z", "+00:00"))
+        vals = [float(outcome[k]) for k in ("last_price", "best_bid", "best_ask", "top_bid_qty", "top_ask_qty")]
+        if known != retrieved or retrieved > now_kst() or now_kst() - retrieved > timedelta(minutes=5) or not all(math.isfinite(x) and x > 0 for x in vals) or vals[2] < vals[1]: return unavailable
+    except (KeyError, TypeError, ValueError): return unavailable
+    last,bid,ask,bq,aq=vals
+    return {"symbol":symbol,"last_price":last,"best_bid":bid,"best_ask":ask,"top_bid_qty":bq,"top_ask_qty":aq,"spread_pct":(ask-bid)/last*100,"imbalance":(bq-aq)/(bq+aq),"quote_known_at":known.isoformat(),"retrieved_at":retrieved.isoformat(),"timestamp_source":"network_retrieved_at","source":"KIS","status":"ok"}
+
 
 def _cache_success(key: tuple[int, str], quote: dict) -> dict:
     safe = dict(quote)
@@ -392,6 +403,39 @@ def kis_quote(symbol: str, request: Request):
         raise HTTPException(422, "종목코드는 6자리 숫자입니다")
     return _cached_kis_quote(symbol)
 
+@app.get("/api/kis/orderbook/{symbol}")
+def kis_orderbook(symbol: str, request: Request):
+    current_user(request)
+    if not re.fullmatch(r"\d{6}", symbol): raise HTTPException(422, "종목코드는 6자리 숫자입니다")
+    provider = getattr(app.state, "kis_orderbook_provider", None)
+    if provider is None:
+        global _default_kis_client
+        if _default_kis_client is None: _default_kis_client = KISReadOnlyClient()
+        provider = _default_kis_client.orderbook
+    return _safe_kis_orderbook(symbol, provider(symbol))
+
+
+@app.post("/api/cards/{card_id}/scenario-observations")
+async def card_scenario_observation(card_id: int, request: Request):
+    """Authenticated detail-open readback; DB owns card and scenario symbol."""
+    csrf_origin_ok(request); current_user(request)
+    db = connect()
+    try:
+        scenario = db.execute("SELECT * FROM event_scenario_sets WHERE card_id=? ORDER BY version DESC,id DESC LIMIT 1", (card_id,)).fetchone()
+        card = db.execute("SELECT e.symbol,c.invalidated_at FROM decision_cards c JOIN material_evidence e ON e.id=c.evidence_id WHERE c.id=?", (card_id,)).fetchone()
+        if not scenario or not card or card["invalidated_at"] or scenario["symbol"] != card["symbol"]: raise HTTPException(409, "active scenario unavailable")
+        body = await request.json()
+        if any(k in body for k in ("symbol", "scenario", "match", "action", "active_scenario_label", "trusted_business_invalidation")): raise HTTPException(422, "server-owned scenario fields")
+        provider = getattr(app.state, "kis_orderbook_provider", None)
+        if provider is None:
+            global _default_kis_client
+            if _default_kis_client is None: _default_kis_client = KISReadOnlyClient()
+            provider = _default_kis_client.orderbook
+        quote = _safe_kis_orderbook(scenario["symbol"], provider(scenario["symbol"]))
+        if quote.get("status") != "ok": raise HTTPException(503, "orderbook unavailable")
+        observation = {**body, **quote, "provider": quote["source"], "source": quote["source"], "symbol": scenario["symbol"], "known_at": quote["quote_known_at"], "retrieved_at": quote["retrieved_at"], "price_krw": quote["last_price"], "best_bid": quote["best_bid"], "best_ask": quote["best_ask"], "spread_pct": quote["spread_pct"], "imbalance": quote["imbalance"], "idempotency_key": body.get("idempotency_key", quote["quote_known_at"]), "volume_ratio": body.get("volume_ratio", 1.0), "benchmark_excess_pct": body.get("benchmark_excess_pct", 0.0), "sector_excess_pct": body.get("sector_excess_pct", 0.0)}
+        return observe_scenario(db, scenario["id"], observation)
+    finally: db.close()
 
 @app.post("/api/order-plans/{plan_id}/live-dry-run")
 def live_dry_run(plan_id: int, data: LiveDryRunIn, request: Request):
