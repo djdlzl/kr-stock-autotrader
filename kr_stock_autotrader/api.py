@@ -457,9 +457,49 @@ def kis_orderbook(symbol: str, request: Request):
     return _safe_kis_orderbook(symbol, outcome)
 
 
+def _kis_orderbook_provider():
+    provider = getattr(app.state, "kis_orderbook_provider", None)
+    if provider is None:
+        global _default_kis_client
+        if _default_kis_client is None:
+            _default_kis_client = KISReadOnlyClient()
+        provider = _default_kis_client.orderbook
+    return provider
+
+
+def _card_tracking_scenario(db, card_id: int):
+    """Resolve only server-owned active card/scenario identity for polling."""
+    scenario = db.execute("SELECT * FROM event_scenario_sets WHERE card_id=? ORDER BY version DESC,id DESC LIMIT 1", (card_id,)).fetchone()
+    card = db.execute("SELECT e.symbol,c.invalidated_at FROM decision_cards c JOIN material_evidence e ON e.id=c.evidence_id WHERE c.id=?", (card_id,)).fetchone()
+    if not scenario or not card or card["invalidated_at"] or scenario["symbol"] != card["symbol"]:
+        raise HTTPException(409, {"code": "TRACKING_STOPPED", "message": "추적할 현재 시나리오가 없습니다"})
+    return scenario
+
+
+@app.get("/api/cards/{card_id}/tracking-health")
+def card_tracking_health(card_id: int, request: Request):
+    """Authenticated read-only KIS health projection; never observes or persists."""
+    current_user(request)
+    db = connect()
+    try:
+        scenario = _card_tracking_scenario(db, card_id)
+        try:
+            outcome = _kis_orderbook_provider()(scenario["symbol"])
+        except Exception:
+            outcome = None
+        quote = _safe_kis_orderbook(scenario["symbol"], outcome)
+        if quote.get("status") != "ok":
+            raise HTTPException(503, {"code": "QUOTE_UNAVAILABLE", "message": "호가를 안전하게 확인하지 못했습니다"})
+        # KIS top-of-book alone is never sufficient to select a scenario.
+        result = {"match": "OUT_OF_RANGE", "action": "NO_ACTION", "active_scenario_label": None}
+        return {"tracking_health": _tracking_health(quote, result)}
+    finally:
+        db.close()
+
+
 @app.post("/api/cards/{card_id}/scenario-observations")
 async def card_scenario_observation(card_id: int, request: Request):
-    """Authenticated detail-open readback; DB owns card and scenario symbol."""
+    """Explicit compatibility observation route; UI polling must use GET health."""
     csrf_origin_ok(request); current_user(request)
     db = connect()
     try:

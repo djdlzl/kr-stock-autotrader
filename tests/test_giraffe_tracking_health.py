@@ -31,6 +31,52 @@ def _authenticated_scenario_client(monkeypatch, tmp_path):
     return app, client, card_id
 
 
+def test_authenticated_tracking_health_get_is_closed_and_read_only(monkeypatch, tmp_path):
+    app, client, card_id = _authenticated_scenario_client(monkeypatch, tmp_path)
+    app.state.kis_orderbook_provider = _fresh_book
+    db = dbmod.connect()
+    before = db.execute("SELECT COUNT(*) FROM event_scenario_observations").fetchone()[0]
+    db.close()
+    responses = [client.get(f"/api/cards/{card_id}/tracking-health") for _ in range(2)]
+    assert all(response.status_code == 200 for response in responses)
+    body = responses[0].json()
+    assert set(body) == {"tracking_health"}
+    health = body["tracking_health"]
+    assert set(health) == {"quote_health", "context_readiness", "status", "last_attempted_at", "last_success_at", "quote_age_seconds", "freshness", "source", "timestamp_source", "quote_known_at", "price_krw", "best_bid", "best_ask", "top_bid_qty", "top_ask_qty", "spread_pct", "imbalance", "market_context_status", "match", "action", "active_scenario_label", "gate_results"}
+    assert {key: health[key] for key in ("quote_health", "context_readiness", "match", "action", "active_scenario_label")} == {"quote_health": "HEALTHY", "context_readiness": "BLOCKED", "match": "OUT_OF_RANGE", "action": "NO_ACTION", "active_scenario_label": None}
+    db = dbmod.connect()
+    after = db.execute("SELECT COUNT(*) FROM event_scenario_observations").fetchone()[0]
+    db.close()
+    assert (before, after) == (0, 0)
+
+
+def test_tracking_health_get_failure_is_sanitized_and_read_only(monkeypatch, tmp_path):
+    app, client, card_id = _authenticated_scenario_client(monkeypatch, tmp_path)
+    app.state.kis_orderbook_provider = lambda _: (_ for _ in ()).throw(RuntimeError("KIS-SECRET-token"))
+    response = client.get(f"/api/cards/{card_id}/tracking-health")
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "QUOTE_UNAVAILABLE", "message": "호가를 안전하게 확인하지 못했습니다"}}
+    assert "SECRET" not in response.text and "token" not in response.text
+    db = dbmod.connect()
+    assert db.execute("SELECT COUNT(*) FROM event_scenario_observations").fetchone()[0] == 0
+    db.close()
+
+
+def test_tracking_health_get_stopped_scenario_is_sanitized_conflict(monkeypatch, tmp_path):
+    app, client, card_id = _authenticated_scenario_client(monkeypatch, tmp_path)
+    app.state.kis_orderbook_provider = _fresh_book
+    db = dbmod.connect()
+    db.execute("UPDATE decision_cards SET invalidated_at=? WHERE id=?", ("2026-09-03T12:00:00+09:00", card_id))
+    db.commit()
+    db.close()
+    response = client.get(f"/api/cards/{card_id}/tracking-health")
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "TRACKING_STOPPED", "message": "추적할 현재 시나리오가 없습니다"}}
+    db = dbmod.connect()
+    assert db.execute("SELECT COUNT(*) FROM event_scenario_observations").fetchone()[0] == 0
+    db.close()
+
+
 def test_authenticated_kis_poll_exposes_closed_dual_health_and_safe_card(monkeypatch, tmp_path):
     app, client, card_id = _authenticated_scenario_client(monkeypatch, tmp_path)
     app.state.kis_orderbook_provider = _fresh_book
@@ -178,3 +224,25 @@ const card={card:{},user_state:{order_plan:null,draft:null},verdict:'관찰',fil
 """
     state = json.loads(subprocess.check_output(["node", "-e", script], text=True, env=os.environ).strip())
     assert state == {"owner": None, "hidden": True, "html": "", "notice": ""}
+
+
+def test_same_card_poll_sequence_rejects_late_health_and_detail_and_failure_clears_green():
+    """Abort is advisory: token/controller ownership is the final mutation guard."""
+    from kr_stock_autotrader.ui import APP_HTML
+    helpers = re.search(r"let scenarioPoll=.*?(?=async function showDetail)", APP_HTML, re.S).group(0)
+    script = """
+let healthA,healthB,detailA,detailB;
+let detail={hidden:false}; let document={hidden:false,addEventListener:()=>{},createElement:()=>({innerHTML:'',firstElementChild:{}})};
+const $=s=>s==='#detail'?detail:(s==='#scenario-section'?null:null); const clearInterval=()=>{},setInterval=()=>({});
+const AbortController=class{constructor(){this.signal={};this.abort=()=>{}}}; const esc=x=>String(x??''),details=(a,b)=>a+':'+b,kst=x=>x||'';
+""" + helpers + """
+const item=(source,price)=>[{current:{provider:source,price_krw:price},scenarios:[]}];
+const response=(source,price)=>({tracking_health:{status:'HEALTHY',quote_health:'HEALTHY',context_readiness:'READY',source,price_krw:price,active_scenario_label:null,match:'OUT_OF_RANGE',action:'NO_ACTION'}});
+let healthCalls=0, detailCalls=0; let api=path=>{if(path.includes('tracking-health')) return new Promise(r=>healthCalls++===0?healthA=r:healthB=r); return new Promise(r=>detailCalls++===0?detailA=r:detailB=r)};
+(async()=>{openScenarioCard='7';resetScenarioHealth('7',true,item('INITIAL',1));const a=refreshScenario(7);healthA(response('OLD',111));await Promise.resolve();const b=refreshScenario(7);healthB(response('NEW',222));await Promise.resolve();detailB({event_scenarios:item('NEW',222)});await b;detailA({event_scenarios:item('OLD',111)});await a;const retained={source:scenarioHealth.health.source,price:scenarioHealth.health.price_krw,item:scenarioHealth.items[0].current.provider};const prior={...scenarioHealth,state:'HEALTHY',health:response('GREEN',1).tracking_health};scenarioHealth=prior;api=()=>Promise.reject(Error('QUOTE_UNAVAILABLE'));await refreshScenario(7);console.log(JSON.stringify({retained,state:scenarioHealth.state,failures:scenarioHealth.failures,view:healthView(),glow:scenarioView(scenarioHealth.items).includes('active-scenario')}));})().catch(e=>{console.error(e);process.exit(1)});
+"""
+    state = json.loads(subprocess.check_output(["node", "-e", script], text=True, env=os.environ).strip())
+    assert state["retained"] == {"source": "NEW", "price": 222, "item": "NEW"}
+    assert state["state"] == "UNAVAILABLE" and state["failures"] == 1
+    assert "호가 확인 실패" in state["view"] and "호가 정상 추적" not in state["view"]
+    assert state["glow"] is False
