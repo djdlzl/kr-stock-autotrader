@@ -41,6 +41,7 @@ def test_authenticated_kis_poll_exposes_closed_dual_health_and_safe_card(monkeyp
     health = body["tracking_health"]
     assert set(health) == {"quote_health", "context_readiness", "status", "last_attempted_at", "last_success_at", "quote_age_seconds", "freshness", "source", "timestamp_source", "quote_known_at", "price_krw", "best_bid", "best_ask", "top_bid_qty", "top_ask_qty", "spread_pct", "imbalance", "market_context_status", "match", "action", "active_scenario_label", "gate_results"}
     assert health["quote_health"] == "HEALTHY"
+    assert health["top_bid_qty"] == 10.0 and health["top_ask_qty"] == 8.0
     assert health["context_readiness"] == "BLOCKED"
     assert health["status"] == "QUOTE_OK_CONTEXT_MISSING"
     assert health["active_scenario_label"] is None and health["action"] == "NO_ACTION"
@@ -96,6 +97,40 @@ console.log(JSON.stringify({healthy,blockedGlow,failedGlow,failures:scenarioHeal
     assert "호가 정상 추적" in state["healthy"]
     assert "시나리오 판단자료 부족" in state["healthy"]
     assert state["blockedGlow"] is False and state["failedGlow"] is False
-    assert state["failures"] == 1
+    assert state["failures"] == 0  # stopped detail clears prior-card failure state
     assert state["state"] == "STOPPED" and state["poll"] is None and state["countdown"] is None
     assert state["cleared"] == ["poll", "countdown"]
+
+
+def test_scenario_card_switch_never_leaks_previous_quote_or_glow():
+    from kr_stock_autotrader.ui import APP_HTML
+    helpers = re.search(r"let scenarioPoll=.*?(?=async function showDetail)", APP_HTML, re.S).group(0)
+    script = """
+let detail={hidden:false}; let document={hidden:false,addEventListener:()=>{},createElement:()=>({innerHTML:'',firstElementChild:{}})};
+const $=selector=>selector==='#detail'?detail:null; const clearInterval=()=>{}; const setInterval=()=>({});
+const AbortController=class{constructor(){this.signal={};this.abort=()=>{}}};
+const esc=x=>String(x??''); const details=(a,b)=>a+':'+b; const kst=x=>x||'';
+""" + helpers + """
+const items=(source,price)=>[{current:{provider:source,price_krw:price,best_bid:price-1,best_ask:price+1},scenarios:[{label:'GOOD',per_share_value_range_krw:{low:1,high:2},return_range_pct:{low:1,high:2}}]}];
+const a=items('A-SOURCE',111), b=items('B-SOURCE',222), c=items('C-SOURCE',333);
+resetScenarioHealth('A',true,a);
+scenarioHealth={...scenarioHealth,state:'HEALTHY',health:{quote_health:'HEALTHY',context_readiness:'READY',active_scenario_label:'GOOD',source:'A-SOURCE',price_krw:111,best_bid:110,best_ask:112}};
+const aGlow=scenarioView(a).includes('active-scenario');
+startScenarioPolling('B',false,b);
+const bView=scenarioView(scenarioHealth.items)+healthView();
+resetScenarioHealth('A',true,a);
+scenarioHealth={...scenarioHealth,state:'HEALTHY',health:{quote_health:'HEALTHY',context_readiness:'READY',active_scenario_label:'GOOD',source:'A-SOURCE',price_krw:111}};
+const api=()=>new Promise(()=>{});
+startScenarioPolling('C',true,c);
+const cView=scenarioView(scenarioHealth.items)+healthView();
+console.log(JSON.stringify({aGlow,bState:scenarioHealth.cardId==='C'?'switched':null,bView,cState:scenarioHealth.state,cView}));
+"""
+    state = json.loads(subprocess.check_output(["node", "-e", script], text=True, env=os.environ).strip())
+    assert state["aGlow"] is True
+    assert "추적 중지" in state["bView"]
+    assert "A-SOURCE" not in state["bView"] and "111" not in state["bView"]
+    assert "active-scenario" not in state["bView"]
+    assert state["cState"] == "CHECKING"
+    assert "확인 중" in state["cView"]
+    assert "A-SOURCE" not in state["cView"] and "111" not in state["cView"]
+    assert "active-scenario" not in state["cView"]
