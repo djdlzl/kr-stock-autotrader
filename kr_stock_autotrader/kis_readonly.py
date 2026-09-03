@@ -15,7 +15,8 @@ QUOTE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
 QUOTE_TR_ID = "FHKST01010100"
 ORDERBOOK_PATH = "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
 ORDERBOOK_TR_ID = "FHKST01010200"
-# Official KIS output1 fields used exclusively: stck_prpr (last/current), askp1, bidp1, askp_rsqn1, bidp_rsqn1.
+# Actual KIS orderbook shape: output1 carries ask/bid prices and quantities;
+# output2 carries stck_prpr (last/current) and stck_shrn_iscd (requested symbol).
 # Official KIS contract (endpoint, TR, output2 field catalogue and sample):
 # https://apiportal.koreainvestment.com/api/apis/public/detail?accessUrl=/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice
 DAILY_CHART_PATH = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
@@ -175,10 +176,16 @@ class KISReadOnlyClient:
         try: payload = response.json()
         except (ValueError, TypeError): raise ValueError("KIS orderbook malformed")
         if self._auth_expired(response, payload): return {}, retrieved, True
-        if not _response_ok(response) or payload.get("rt_cd") != "0" or not isinstance(payload.get("output1"), dict): raise ValueError("KIS orderbook unavailable")
-        output = payload["output1"]
+        if not _response_ok(response) or payload.get("rt_cd") != "0":
+            raise ValueError("KIS orderbook unavailable")
+        output1, output2 = payload.get("output1"), payload.get("output2")
+        if not isinstance(output1, dict) or not isinstance(output2, dict):
+            raise ValueError("KIS orderbook unavailable")
+        if output2.get("stck_shrn_iscd") != symbol:
+            raise ValueError("KIS orderbook symbol mismatch")
         # Deliberately closed allowlist: no raw KIS output leaves this method.
-        last, ask, bid, ask_qty, bid_qty = (_positive_number(output[k]) for k in ("stck_prpr", "askp1", "bidp1", "askp_rsqn1", "bidp_rsqn1"))
+        last = _positive_number(output2["stck_prpr"])
+        ask, bid, ask_qty, bid_qty = (_positive_number(output1[k]) for k in ("askp1", "bidp1", "askp_rsqn1", "bidp_rsqn1"))
         if bid > ask: raise ValueError("KIS orderbook malformed")
         return {"last_price":last, "best_bid":bid, "best_ask":ask, "top_bid_qty":bid_qty, "top_ask_qty":ask_qty}, retrieved, False
 

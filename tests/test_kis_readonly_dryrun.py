@@ -58,20 +58,52 @@ def test_oauth_http_status_expiry_refresh_and_one_auth_retry():
     assert len(failed.calls)==1
 
 
+def _actual_orderbook_payload(**overrides):
+    payload = {
+        'rt_cd': '0',
+        # The production response splits top-of-book fields from the last price.
+        'output1': {'askp1': '70100', 'bidp1': '69900', 'askp_rsqn1': '12', 'bidp_rsqn1': '18', 'raw_secret': 'nope'},
+        'output2': {'stck_prpr': '70000', 'stck_shrn_iscd': '005930', 'raw_secret': 'nope'},
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_kis_orderbook_allowlist_projection_and_auth_retry():
     transport = FakeTransport([
         Response({'access_token':'old','expires_in':86400}),
         Response({'msg_cd':'EGW00123'}, 401),
         Response({'access_token':'retry','expires_in':86400}),
-        Response({'rt_cd':'0','output1':{'stck_prpr':'70000','askp1':'70100','bidp1':'69900','askp_rsqn1':'12','bidp_rsqn1':'18','raw_secret':'nope'}}),
+        Response(_actual_orderbook_payload()),
     ])
     quote = KISReadOnlyClient('key', 'value', transport=transport).orderbook('005930')
     assert quote['status'] == 'ok' and quote['last_price'] == 70000 and quote['best_bid'] == 69900 and quote['best_ask'] == 70100
     assert quote['top_bid_qty'] == 18 and quote['top_ask_qty'] == 12 and quote['timestamp_source'] == 'network_retrieved_at'
+    assert set(quote) == {'symbol', 'last_price', 'best_bid', 'best_ask', 'top_bid_qty', 'top_ask_qty', 'quote_known_at', 'retrieved_at', 'timestamp_source', 'source', 'environment', 'status'}
     assert 'raw_secret' not in quote and [call[0] for call in transport.calls] == ['POST', 'GET', 'POST', 'GET']
     request = transport.calls[-1]
     assert request[1] == PRODUCTION_BASE_URL + ORDERBOOK_PATH and request[2]['headers']['tr_id'] == ORDERBOOK_TR_ID
     with pytest.raises(ValueError): KISReadOnlyClient('key', 'value', transport=transport)._request('POST', '/uapi/domestic-stock/v1/trading/order-cash')
+
+
+@pytest.mark.parametrize('payload', [
+    _actual_orderbook_payload(rt_cd='1'),
+    _actual_orderbook_payload(output1=None),
+    _actual_orderbook_payload(output1={}),
+    _actual_orderbook_payload(output2=None),
+    _actual_orderbook_payload(output2='malformed'),
+    _actual_orderbook_payload(output2={'stck_shrn_iscd': '005930'}),
+    _actual_orderbook_payload(output2={'stck_prpr': '0', 'stck_shrn_iscd': '005930'}),
+    _actual_orderbook_payload(output2={'stck_prpr': 'NaN', 'stck_shrn_iscd': '005930'}),
+    _actual_orderbook_payload(output2={'stck_prpr': '70000', 'stck_shrn_iscd': '000660'}),
+    _actual_orderbook_payload(output1={'askp1': '69900', 'bidp1': '70100', 'askp_rsqn1': '12', 'bidp_rsqn1': '18'}),
+])
+def test_kis_orderbook_actual_shape_fails_closed_for_malformed_or_cross_symbol_payload(payload):
+    transport = FakeTransport([Response({'access_token': 'x', 'expires_in': 86400}), Response(payload)])
+    quote = KISReadOnlyClient('key', 'value', transport=transport).orderbook('005930')
+    assert quote['status'] == 'unavailable'
+    assert set(quote) == {'symbol', 'source', 'environment', 'status', 'retrieved_at', 'timestamp_source'}
+    assert 'raw_secret' not in quote
 
 
 def test_daily_snapshot_uses_official_output1_summary_and_output2_bars():
