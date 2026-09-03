@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import pytest
-from kr_stock_autotrader.kis_readonly import KISReadOnlyClient, OAUTH_PATH, QUOTE_PATH, QUOTE_TR_ID, PRODUCTION_BASE_URL, DAILY_CHART_PATH, DAILY_CHART_TR_ID, DAILY_CHART_OFFICIAL_REFERENCE
+from kr_stock_autotrader.kis_readonly import KISReadOnlyClient, OAUTH_PATH, QUOTE_PATH, QUOTE_TR_ID, ORDERBOOK_PATH, ORDERBOOK_TR_ID, PRODUCTION_BASE_URL, DAILY_CHART_PATH, DAILY_CHART_TR_ID, DAILY_CHART_OFFICIAL_REFERENCE
 from kr_stock_autotrader.live_dry_run import evaluate_live_dry_run
 
 KST=ZoneInfo('Asia/Seoul')
@@ -56,6 +56,22 @@ def test_oauth_http_status_expiry_refresh_and_one_auth_retry():
     failed=FakeTransport([Response({'access_token':'x','expires_in':86400},500)])
     assert KISReadOnlyClient('key','value',transport=failed).current_price('005930')['status']=='unavailable'
     assert len(failed.calls)==1
+
+
+def test_kis_orderbook_allowlist_projection_and_auth_retry():
+    transport = FakeTransport([
+        Response({'access_token':'old','expires_in':86400}),
+        Response({'msg_cd':'EGW00123'}, 401),
+        Response({'access_token':'retry','expires_in':86400}),
+        Response({'rt_cd':'0','output1':{'stck_prpr':'70000','askp1':'70100','bidp1':'69900','askp_rsqn1':'12','bidp_rsqn1':'18','raw_secret':'nope'}}),
+    ])
+    quote = KISReadOnlyClient('key', 'value', transport=transport).orderbook('005930')
+    assert quote['status'] == 'ok' and quote['last_price'] == 70000 and quote['best_bid'] == 69900 and quote['best_ask'] == 70100
+    assert quote['top_bid_qty'] == 18 and quote['top_ask_qty'] == 12 and quote['timestamp_source'] == 'network_retrieved_at'
+    assert 'raw_secret' not in quote and [call[0] for call in transport.calls] == ['POST', 'GET', 'POST', 'GET']
+    request = transport.calls[-1]
+    assert request[1] == PRODUCTION_BASE_URL + ORDERBOOK_PATH and request[2]['headers']['tr_id'] == ORDERBOOK_TR_ID
+    with pytest.raises(ValueError): KISReadOnlyClient('key', 'value', transport=transport)._request('POST', '/uapi/domestic-stock/v1/trading/order-cash')
 
 
 def test_daily_snapshot_uses_official_output1_summary_and_output2_bars():

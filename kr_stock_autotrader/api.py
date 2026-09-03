@@ -262,15 +262,17 @@ def _safe_kis_quote(symbol: str, outcome: object) -> dict:
     }
 
 def _safe_kis_orderbook(symbol: str, outcome: object) -> dict:
-    unavailable = {"symbol": symbol, "source": "KIS", "status": "unavailable"}
-    if not isinstance(outcome, dict) or outcome.get("symbol") != symbol: return unavailable
-    try:
-        known = datetime.fromisoformat(str(outcome["quote_known_at"]).replace("Z", "+00:00")); retrieved = datetime.fromisoformat(str(outcome["retrieved_at"]).replace("Z", "+00:00"))
-        vals = [float(outcome[k]) for k in ("last_price", "best_bid", "best_ask", "top_bid_qty", "top_ask_qty")]
-        if known != retrieved or retrieved > now_kst() or now_kst() - retrieved > timedelta(minutes=5) or not all(math.isfinite(x) and x > 0 for x in vals) or vals[2] < vals[1]: return unavailable
-    except (KeyError, TypeError, ValueError): return unavailable
-    last,bid,ask,bq,aq=vals
-    return {"symbol":symbol,"last_price":last,"best_bid":bid,"best_ask":ask,"top_bid_qty":bq,"top_ask_qty":aq,"spread_pct":(ask-bid)/last*100,"imbalance":(bq-aq)/(bq+aq),"quote_known_at":known.isoformat(),"retrieved_at":retrieved.isoformat(),"timestamp_source":"network_retrieved_at","source":"KIS","status":"ok"}
+    """Closed KIS top-of-book projection; timestamps are retrieval, not exchange time."""
+    unavailable = {"symbol": symbol, "source": "KIS", "environment": "production", "status": "unavailable", "market_context_status": "UNAVAILABLE"}
+    if not isinstance(outcome, dict) or outcome.get("status") != "ok" or outcome.get("symbol") != symbol:
+        return unavailable
+    retrieved_at = _valid_kis_retrieved_at(outcome.get("retrieved_at")); quote_known_at = _valid_kis_retrieved_at(outcome.get("quote_known_at"))
+    values = [_valid_kis_number(outcome.get(key), minimum=0.0) for key in ("last_price", "best_bid", "best_ask", "top_bid_qty", "top_ask_qty")]
+    if (not isinstance(symbol, str) or re.fullmatch(r"\d{6}", symbol) is None or not retrieved_at or not quote_known_at or outcome.get("timestamp_source") != "network_retrieved_at" or not _kis_timestamp_pair_is_current(retrieved_at, quote_known_at) or any(value is None or value <= 0 for value in values)):
+        return unavailable
+    last, bid, ask, bid_qty, ask_qty = values
+    if bid > ask or bid_qty + ask_qty <= 0: return unavailable
+    return {"symbol":symbol, "last_price":last, "best_bid":bid, "best_ask":ask, "top_bid_qty":bid_qty, "top_ask_qty":ask_qty, "spread_pct":(ask-bid)/last*100, "imbalance":(bid_qty-ask_qty)/(bid_qty+ask_qty), "quote_known_at":quote_known_at, "retrieved_at":retrieved_at, "timestamp_source":"network_retrieved_at", "source":"KIS", "environment":"production", "market_context_status":"UNAVAILABLE", "status":"ok"}
 
 
 def _cache_success(key: tuple[int, str], quote: dict) -> dict:
@@ -424,8 +426,11 @@ async def card_scenario_observation(card_id: int, request: Request):
         scenario = db.execute("SELECT * FROM event_scenario_sets WHERE card_id=? ORDER BY version DESC,id DESC LIMIT 1", (card_id,)).fetchone()
         card = db.execute("SELECT e.symbol,c.invalidated_at FROM decision_cards c JOIN material_evidence e ON e.id=c.evidence_id WHERE c.id=?", (card_id,)).fetchone()
         if not scenario or not card or card["invalidated_at"] or scenario["symbol"] != card["symbol"]: raise HTTPException(409, "active scenario unavailable")
-        body = await request.json()
-        if any(k in body for k in ("symbol", "scenario", "match", "action", "active_scenario_label", "trusted_business_invalidation")): raise HTTPException(422, "server-owned scenario fields")
+        try: body = await request.json()
+        except ValueError: raise HTTPException(422, "invalid observation body")
+        if not isinstance(body, dict): raise HTTPException(422, "invalid observation body")
+        forbidden = {"symbol", "scenario", "match", "action", "active_scenario_label", "trusted_business_invalidation", "price", "price_krw", "best_bid", "best_ask", "provider", "source", "known_at", "quote_known_at", "retrieved_at", "timestamp_source", "benchmark_excess_pct", "sector_excess_pct", "volume_ratio"}
+        if forbidden.intersection(body): raise HTTPException(422, "server-owned observation fields")
         provider = getattr(app.state, "kis_orderbook_provider", None)
         if provider is None:
             global _default_kis_client
@@ -433,7 +438,7 @@ async def card_scenario_observation(card_id: int, request: Request):
             provider = _default_kis_client.orderbook
         quote = _safe_kis_orderbook(scenario["symbol"], provider(scenario["symbol"]))
         if quote.get("status") != "ok": raise HTTPException(503, "orderbook unavailable")
-        observation = {**body, **quote, "provider": quote["source"], "source": quote["source"], "symbol": scenario["symbol"], "known_at": quote["quote_known_at"], "retrieved_at": quote["retrieved_at"], "price_krw": quote["last_price"], "best_bid": quote["best_bid"], "best_ask": quote["best_ask"], "spread_pct": quote["spread_pct"], "imbalance": quote["imbalance"], "idempotency_key": body.get("idempotency_key", quote["quote_known_at"]), "volume_ratio": body.get("volume_ratio", 1.0), "benchmark_excess_pct": body.get("benchmark_excess_pct", 0.0), "sector_excess_pct": body.get("sector_excess_pct", 0.0)}
+        observation = {**quote, "provider": quote["source"], "source": quote["source"], "symbol": scenario["symbol"], "known_at": quote["quote_known_at"], "retrieved_at": quote["retrieved_at"], "price_krw": quote["last_price"], "best_bid": quote["best_bid"], "best_ask": quote["best_ask"], "spread_pct": quote["spread_pct"], "imbalance": quote["imbalance"], "idempotency_key": body.get("idempotency_key", quote["quote_known_at"]), "volume_ratio": 1.0, "benchmark_excess_pct": 0.0, "sector_excess_pct": 0.0}
         return observe_scenario(db, scenario["id"], observation)
     finally: db.close()
 

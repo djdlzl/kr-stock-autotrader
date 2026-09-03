@@ -13,6 +13,9 @@ PRODUCTION_BASE_URL = "https://openapi.koreainvestment.com:9443"
 OAUTH_PATH = "/oauth2/tokenP"
 QUOTE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
 QUOTE_TR_ID = "FHKST01010100"
+ORDERBOOK_PATH = "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+ORDERBOOK_TR_ID = "FHKST01010200"
+# Official KIS output1 fields used exclusively: stck_prpr (last/current), askp1, bidp1, askp_rsqn1, bidp_rsqn1.
 # Official KIS contract (endpoint, TR, output2 field catalogue and sample):
 # https://apiportal.koreainvestment.com/api/apis/public/detail?accessUrl=/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice
 DAILY_CHART_PATH = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
@@ -96,7 +99,7 @@ class KISReadOnlyClient:
                 "network_order_calls": 0, "environment": "production"}
 
     def _request(self, method: str, path: str, **kwargs):
-        if (method, path) not in {("POST", OAUTH_PATH), ("GET", QUOTE_PATH), ("GET", DAILY_CHART_PATH)}:
+        if (method, path) not in {("POST", OAUTH_PATH), ("GET", QUOTE_PATH), ("GET", ORDERBOOK_PATH), ("GET", DAILY_CHART_PATH)}:
             raise ValueError("non-allowlisted KIS request")
         return self._transport.request(method, self._base_url + path, **kwargs)
 
@@ -165,6 +168,32 @@ class KISReadOnlyClient:
         except (RuntimeError, ValueError, TypeError, KeyError, httpx.HTTPError):
             pass
         return {"symbol":symbol,"source":"KIS","environment":"production","status":"unavailable","retrieved_at":retrieved.isoformat(),"timestamp_source":"network_retrieved_at"}
+
+    def _orderbook_once(self, symbol: str, token: str) -> tuple[dict, datetime, bool]:
+        response = self._request("GET", ORDERBOOK_PATH, params={"FID_COND_MRKT_DIV_CODE":"J", "FID_INPUT_ISCD":symbol}, headers={"authorization":f"Bearer {token}", "appkey":self._app_key, "appsecret":self._app_secret, "tr_id":ORDERBOOK_TR_ID})
+        retrieved = now_kst()
+        try: payload = response.json()
+        except (ValueError, TypeError): raise ValueError("KIS orderbook malformed")
+        if self._auth_expired(response, payload): return {}, retrieved, True
+        if not _response_ok(response) or payload.get("rt_cd") != "0" or not isinstance(payload.get("output1"), dict): raise ValueError("KIS orderbook unavailable")
+        output = payload["output1"]
+        # Deliberately closed allowlist: no raw KIS output leaves this method.
+        last, ask, bid, ask_qty, bid_qty = (_positive_number(output[k]) for k in ("stck_prpr", "askp1", "bidp1", "askp_rsqn1", "bidp_rsqn1"))
+        if bid > ask: raise ValueError("KIS orderbook malformed")
+        return {"last_price":last, "best_bid":bid, "best_ask":ask, "top_bid_qty":bid_qty, "top_ask_qty":ask_qty}, retrieved, False
+
+    def orderbook(self, symbol: str) -> dict:
+        if not isinstance(symbol, str) or not re.fullmatch(r"\d{6}", symbol): raise ValueError("symbol must be six digits")
+        retrieved = now_kst()
+        try:
+            for attempt in range(2):
+                book, retrieved, expired = self._orderbook_once(symbol, self._token_value())
+                if not expired:
+                    return {"symbol":symbol, **book, "quote_known_at":retrieved.isoformat(), "retrieved_at":retrieved.isoformat(), "timestamp_source":"network_retrieved_at", "source":"KIS", "environment":"production", "status":"ok"}
+                self._clear_token()
+                if attempt == 1: raise ValueError("KIS orderbook authentication failed")
+        except (RuntimeError, ValueError, TypeError, KeyError, httpx.HTTPError): pass
+        return {"symbol":symbol, "source":"KIS", "environment":"production", "status":"unavailable", "retrieved_at":retrieved.isoformat(), "timestamp_source":"network_retrieved_at"}
 
     @staticmethod
     def project_orderbook(raw: dict, symbol: str) -> dict:
