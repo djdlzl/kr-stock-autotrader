@@ -61,6 +61,24 @@ def test_fill_timestamp_and_dropdown_filter_ui_contract_is_present():
     assert "last_full_sell_at" in APP_HTML and "kst(summary?.last_full_sell_at)" in APP_HTML
 
 
+def test_filter_change_stops_scenario_polling_and_closes_detail():
+    """A filter change must stop and abort tracking for hidden cards."""
+    from kr_stock_autotrader.ui import APP_HTML
+    match = re.search(r"function changeCardFilter\(\)\{[^}]+\}", APP_HTML)
+    assert match is not None
+    handler = match.group(0)
+    assert ".onchange=changeCardFilter" in APP_HTML
+    script = """
+let stopped=0,drawn=0,openScenarioCard=7;
+const detail={hidden:false};
+const $=selector=>detail;
+function stopScenarioPolling(){stopped++}
+function draw(){drawn++}
+""" + handler + ";changeCardFilter();console.log(JSON.stringify({stopped,drawn,openScenarioCard,hidden:detail.hidden}));"
+    output = subprocess.check_output(["node", "-e", script], text=True, env=os.environ).strip()
+    assert json.loads(output) == {"stopped": 1, "drawn": 1, "openScenarioCard": None, "hidden": True}
+
+
 def test_dropdown_predicate_uses_and_semantics_for_card_and_missing_rows():
     from kr_stock_autotrader.ui import APP_HTML
     helpers = re.search(r"function decision.*?function selected\(id\)\{[^}]*\}", APP_HTML, re.S).group(0)
