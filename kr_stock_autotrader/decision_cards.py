@@ -1,6 +1,6 @@
 """Immutable, fail-closed decision-card domain (paper only)."""
 from __future__ import annotations
-import hashlib, hmac, json, math, os, sqlite3
+import hashlib, hmac, ipaddress, json, math, os, re, sqlite3
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -394,23 +394,42 @@ _HEALTHY_EVIDENCE_STATUSES = frozenset({"card_generated"})
 
 def _safe_source_url(value):
     """Accept only a complete http(s) original link for the public read model."""
-    if not isinstance(value, str) or not value or value != value.strip():
+    if (not isinstance(value, str) or not value or value != value.strip() or "\\" in value
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
         return None
     try:
         parsed = urlsplit(value)
+        port = parsed.port
     except ValueError:
         return None
-    return value if parsed.scheme in {"http", "https"} and parsed.netloc and parsed.hostname else None
+    host = parsed.hostname
+    if (parsed.scheme not in {"http", "https"} or not parsed.netloc or not host
+            or parsed.username is not None or parsed.password is not None
+            or any(char in parsed.netloc for char in "@%\\") or not host.isascii()
+            or host != host.lower() or host.endswith(".") or port == 0):
+        return None
+    canonical_authority = f"[{host}]" if ":" in host else host
+    if port is not None:
+        canonical_authority += f":{port}"
+    if parsed.netloc != canonical_authority:
+        return None
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        labels = host.split(".")
+        if not labels or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels):
+            return None
+    return value
 
 
-def _valid_source_timestamp(value):
+def _valid_source_timestamp(value, *, now):
     if not isinstance(value, str) or not value:
         return None
     try:
-        parse_kst(value)
-    except (ValueError, TypeError):
+        parsed = parse_kst(value)
+    except (ValueError, TypeError, OverflowError):
         return None
-    return value
+    return parsed if parsed <= now else None
 
 
 def _source_facts(evidence, filter_result, *, invalidated):
@@ -420,8 +439,12 @@ def _source_facts(evidence, filter_result, *, invalidated):
     source = evidence.get("source")
     source = source.strip() if isinstance(source, str) else ""
     source_url = _safe_source_url(evidence.get("source_url"))
-    known_at = _valid_source_timestamp(evidence.get("known_at"))
-    last_success_at = _valid_source_timestamp(evidence.get("collected_at"))
+    observed_now = now_kst()
+    known_time = _valid_source_timestamp(evidence.get("known_at"), now=observed_now)
+    last_success_time = _valid_source_timestamp(evidence.get("collected_at"), now=observed_now)
+    timestamps_valid = bool(known_time and last_success_time and last_success_time >= known_time)
+    known_at = evidence.get("known_at") if timestamps_valid else None
+    last_success_at = evidence.get("collected_at") if timestamps_valid else None
     status = evidence.get("status")
     raw_reasons = filter_result.get("reasons")
     reasons = tuple(reason for reason in raw_reasons if isinstance(reason, str)) if isinstance(raw_reasons, list) else ()
@@ -429,18 +452,16 @@ def _source_facts(evidence, filter_result, *, invalidated):
 
     if invalidated or status == "invalidated":
         trust = "invalidated"
-    elif not (source and source_url and known_at and last_success_at) or not reasons_known:
+    elif not (source and source_url and reasons_known and status in _HEALTHY_EVIDENCE_STATUSES):
         trust = "missing"
-    elif "conflicting or recycled disclosure" in reasons:
+    elif "conflicting or recycled disclosure" in reasons and timestamps_valid:
         trust = "conflict"
     elif "known_at future or stale" in reasons:
         trust = "stale"
-    elif reasons:
+    elif not timestamps_valid or reasons:
         trust = "missing"
-    elif status in _HEALTHY_EVIDENCE_STATUSES:
-        trust = "verified"
     else:
-        trust = "missing"
+        trust = "verified"
     return {
         "source": source or None,
         "source_url": source_url,

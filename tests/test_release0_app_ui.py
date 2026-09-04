@@ -180,6 +180,70 @@ def test_source_fact_projection_maps_only_authoritative_repository_reasons_fail_
     assert _source_facts(evidence, {"reasons": []}, invalidated=True)["trust_state"] == "가설 폐기 조건 충족"
 
 
+def test_source_fact_url_and_timestamp_controls_fail_closed(monkeypatch):
+    import kr_stock_autotrader.decision_cards as cards
+    from kr_stock_autotrader.domain import parse_kst
+
+    now = parse_kst("2026-09-04T12:00:00+09:00")
+    monkeypatch.setattr(cards, "now_kst", lambda: now)
+    evidence = {
+        "source": "DART", "source_url": "https://example.test/original?notice=1",
+        "known_at": "2026-09-04T10:00:00+09:00", "collected_at": "2026-09-04T10:01:00+09:00",
+        "status": "card_generated",
+    }
+    assert cards._source_facts(evidence, {"reasons": []}, invalidated=False)["trust_state"] == "확인됨"
+    for unsafe in (
+        "https://trusted.example@evil.example/original", "https://user:password@example.test/original",
+        "https://%65vil.example/original", "https:///no-host", "//example.test/original",
+        "https://example.test\\evil/original", "https://example.test:bad/original", "https://example.test\x01/original",
+    ):
+        assert cards._safe_source_url(unsafe) is None
+        assert cards._source_facts({**evidence, "source_url": unsafe}, {"reasons": []}, invalidated=False)["trust_state"] == "확인 필요"
+    future = cards._source_facts({**evidence, "known_at": "2026-09-04T12:00:01+09:00", "collected_at": "2026-09-04T12:01:00+09:00"}, {"reasons": []}, invalidated=False)
+    assert future == {"source": "DART", "source_url": "https://example.test/original?notice=1", "known_at": None, "last_success_at": None, "trust_state": "확인 필요"}
+    chronology = cards._source_facts({**evidence, "known_at": "2026-09-04T10:01:00+09:00", "collected_at": "2026-09-04T10:00:00+09:00"}, {"reasons": []}, invalidated=False)
+    assert chronology["known_at"] is None and chronology["last_success_at"] is None and chronology["trust_state"] == "확인 필요"
+    offset = cards._source_facts({**evidence, "known_at": "2026-09-04T01:00:00+00:00", "collected_at": "2026-09-04T10:01:00+09:00"}, {"reasons": []}, invalidated=False)
+    assert offset["trust_state"] == "확인됨"
+    stale = cards._source_facts({**evidence, "known_at": "2026-09-04T12:00:01+09:00", "collected_at": "2026-09-04T12:01:00+09:00"}, {"reasons": ["known_at future or stale"]}, invalidated=False)
+    assert stale["known_at"] is None and stale["last_success_at"] is None and stale["trust_state"] == "정보가 오래됨"
+
+
+def test_release0_persisted_source_url_and_timestamp_trust_regressions(monkeypatch, tmp_path):
+    import kr_stock_autotrader.decision_cards as cards
+    from kr_stock_autotrader import db as dbmod
+    from kr_stock_autotrader.domain import parse_kst
+    from tests.test_date_lifecycle import _seed
+
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "source-facts-hostile.db"))
+    monkeypatch.setattr(cards, "now_kst", lambda: parse_kst("2026-09-04T12:00:00+09:00"))
+    db = dbmod.connect()
+    evidence, saved = _seed(db, "source-facts-hostile", "2026-09-04T10:00:00+09:00", collected_at="2026-09-04T10:01:00+09:00")
+    db.close()
+    client = TestClient(app)
+    assert client.post("/api/signup", json={"email": "source-facts-hostile@test.com", "password": "long-password"}).status_code == 200
+    script = re.search(r"<script>(.*?)</script>", client.get("/app").text, re.S).group(1)
+    renderer = re.search(r"function safeSourceLink.*?(?=function trustedScenario)", script, re.S).group(0)
+    for source_url in ("https://trusted.example@evil.example/original", "https://%65vil.example/original"):
+        db = dbmod.connect(); db.execute("UPDATE material_evidence SET source_url=? WHERE id=?", (source_url, evidence["id"])); db.commit(); db.close()
+        payload = client.get(f"/api/cards/{saved['id']}").json()
+        assert payload["source_facts"]["source_url"] is None
+        assert payload["source_facts"]["trust_state"] == "확인 필요"
+        node = "const esc=v=>String(v??'');const kst=v=>String(v??'');" + renderer + "\nconsole.log(sourceFacts(" + json.dumps(payload) + "));"
+        rendered = subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip()
+        assert "원문 보기" not in rendered and "신뢰 상태: 확인 필요" in rendered
+    db = dbmod.connect(); db.execute("UPDATE material_evidence SET source_url=?, known_at=?, collected_at=? WHERE id=?", ("https://example.test/original", "2026-09-04T12:00:01+09:00", "2026-09-04T12:01:00+09:00", evidence["id"])); db.commit(); db.close()
+    payload = client.get(f"/api/cards/{saved['id']}").json()
+    assert payload["source_facts"] == {"source": "DART", "source_url": "https://example.test/original", "known_at": None, "last_success_at": None, "trust_state": "확인 필요"}
+    node = "const esc=v=>String(v??'');const kst=v=>String(v??'');" + renderer + "\nconsole.log(sourceFacts(" + json.dumps(payload) + "));"
+    rendered = subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip()
+    assert "원문 보기" in rendered and "신뢰 상태: 확인 필요" in rendered and "2026" not in rendered
+    tampered = {"source_facts": {"source": "DART", "source_url": "https://trusted.example@evil.example/original", "known_at": "2026-09-04T10:00:00+09:00", "last_success_at": "2026-09-04T10:01:00+09:00", "trust_state": "확인됨"}}
+    node = "const esc=v=>String(v??'');const kst=v=>String(v??'');" + renderer + "\nconsole.log(sourceFacts(" + json.dumps(tampered) + "));"
+    rendered = subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip()
+    assert "원문 보기" not in rendered and "신뢰 상태: 확인 필요" in rendered
+
+
 def test_release0_detail_request_ownership_rejects_late_switch_refresh_close_and_failure():
     html = authenticated_app_html()
     script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
