@@ -1,7 +1,7 @@
 """Immutable, fail-closed decision-card domain (paper only)."""
 from __future__ import annotations
 import hashlib, hmac, ipaddress, json, math, os, re, sqlite3
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 from fastapi import Header, HTTPException
@@ -426,6 +426,9 @@ def _valid_source_timestamp(value, *, now):
     if not isinstance(value, str) or not value:
         return None
     try:
+        # Source facts require an explicit offset; parse_kst intentionally assigns KST to naive domain values.
+        if datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is None:
+            return None
         parsed = parse_kst(value)
     except (ValueError, TypeError, OverflowError):
         return None
