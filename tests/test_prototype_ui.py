@@ -124,6 +124,16 @@ def test_public_prototype_is_static_mock_without_order_surface():
         assert forbidden not in html
 
 
+def test_prototype_mock_source_links_have_a_real_44px_touch_target():
+    html = prototype_html()
+    mock_link_rule = re.search(r"\.mock-link\{([^}]*)\}", html)
+    assert mock_link_rule is not None
+    declarations = mock_link_rule.group(1)
+    assert "display:inline-flex" in declarations or "display:inline-block" in declarations
+    assert "min-width:44px" in declarations
+    assert "min-height:44px" in declarations
+
+
 def test_prototype_mock_source_links_are_honest_and_allowlisted():
     client = TestClient(app)
     html = prototype_html()
