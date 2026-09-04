@@ -116,6 +116,70 @@ def test_release0_detail_api_projects_trust_for_a_real_verified_match(monkeypatc
     assert _scenario_trust(item["current"], invalidated=True)["status"] == "INVALIDATED"
 
 
+def test_release0_source_facts_use_persisted_api_projection_for_missing_source(monkeypatch, tmp_path):
+    from kr_stock_autotrader import db as dbmod
+    from tests.test_date_lifecycle import _seed
+
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "source-facts-missing.db"))
+    db = dbmod.connect()
+    evidence, saved = _seed(db, "source-facts-missing", "2026-08-31T10:00:00+09:00")
+    db.close()
+    client = TestClient(app)
+    assert client.post("/api/signup", json={"email": "source-facts-missing@test.com", "password": "long-password"}).status_code == 200
+    normal = client.get(f"/api/cards/{saved['id']}")
+    assert normal.status_code == 200
+    assert normal.json()["source_facts"] == {
+        "source": "DART", "source_url": "https://example.test/e",
+        "known_at": "2026-08-31T10:00:00+09:00", "last_success_at": "2026-08-31T10:00:00+09:00",
+        "trust_state": "확인됨",
+    }
+
+    script = re.search(r"<script>(.*?)</script>", client.get("/app").text, re.S).group(1)
+    renderer = re.search(r"function safeSourceLink.*?(?=function trustedScenario)", script, re.S).group(0)
+    normal_node = "const esc=v=>String(v??'');const kst=v=>String(v??'');" + renderer + "\nconsole.log(sourceFacts(" + json.dumps(normal.json()) + "));"
+    normal_rendered = subprocess.check_output(["node", "-e", normal_node], text=True, env=os.environ).strip()
+    assert 'href="https://example.test/e"' in normal_rendered and normal_rendered.count("원문 보기") == 1
+
+    db = dbmod.connect()
+    db.execute("UPDATE material_evidence SET source='', source_url=NULL WHERE id=?", (evidence["id"],))
+    db.commit(); db.close()
+    detail = client.get(f"/api/cards/{saved['id']}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert {key: payload["evidence"][key] for key in ("source", "source_url", "status")} == {"source": "", "source_url": None, "status": "card_generated"}
+
+    script = re.search(r"<script>(.*?)</script>", client.get("/app").text, re.S).group(1)
+    renderer = re.search(r"function safeSourceLink.*?(?=function trustedScenario)", script, re.S).group(0)
+    node = "const esc=v=>String(v??'');const kst=v=>String(v??'');" + renderer + "\nconsole.log(sourceFacts(" + json.dumps(payload) + "));"
+    rendered = subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip()
+    assert "신뢰 상태: 확인됨" not in rendered
+    assert "신뢰 상태: 확인 필요" in rendered
+
+
+def test_source_fact_projection_maps_only_authoritative_repository_reasons_fail_closed():
+    from kr_stock_autotrader.decision_cards import _source_facts
+
+    evidence = {
+        "source": "DART", "source_url": "https://example.test/original",
+        "known_at": "2026-08-31T10:00:00+09:00", "collected_at": "2026-08-31T10:01:00+09:00",
+        "status": "card_generated", "snapshot": {"secret": "must-not-project"},
+    }
+    assert _source_facts(evidence, {"reasons": []}, invalidated=False) == {
+        "source": "DART", "source_url": "https://example.test/original",
+        "known_at": "2026-08-31T10:00:00+09:00", "last_success_at": "2026-08-31T10:01:00+09:00",
+        "trust_state": "확인됨",
+    }
+    assert _source_facts(evidence, {"reasons": ["known_at future or stale"]}, invalidated=False)["trust_state"] == "정보가 오래됨"
+    assert _source_facts(evidence, {"reasons": ["conflicting or recycled disclosure"]}, invalidated=False)["trust_state"] == "출처 간 내용이 다름"
+    assert _source_facts(evidence, {"reasons": ["unrecognized persisted reason"]}, invalidated=False)["trust_state"] == "확인 필요"
+    assert _source_facts(evidence, {"reasons": "unreadable"}, invalidated=False)["trust_state"] == "확인 필요"
+    assert _source_facts({**evidence, "status": "new"}, {"reasons": []}, invalidated=False)["trust_state"] == "확인 필요"
+    assert _source_facts({**evidence, "source_url": "javascript:alert(1)"}, {"reasons": []}, invalidated=False)["trust_state"] == "확인 필요"
+    assert _source_facts({**evidence, "known_at": "not-a-time"}, {"reasons": []}, invalidated=False)["trust_state"] == "확인 필요"
+    assert _source_facts({**evidence, "source": ""}, {"reasons": []}, invalidated=False)["trust_state"] == "확인 필요"
+    assert _source_facts(evidence, {"reasons": []}, invalidated=True)["trust_state"] == "가설 폐기 조건 충족"
+
+
 def test_release0_detail_request_ownership_rejects_late_switch_refresh_close_and_failure():
     html = authenticated_app_html()
     script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)

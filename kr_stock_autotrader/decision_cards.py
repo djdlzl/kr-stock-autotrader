@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib, hmac, json, math, os, sqlite3
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 from fastapi import Header, HTTPException
 from .decision_card_schema import SCHEMA_VERSION, validate_card
 from .db import FILTER_EVALUATOR_VERSION
@@ -381,6 +382,74 @@ def _scenario_trust(current, *, invalidated):
     return {"freshness": "FRESH", "context_readiness": "READY", "status": "READY"}
 
 
+_SOURCE_TRUST_LABELS = {
+    "verified": "확인됨",
+    "missing": "확인 필요",
+    "stale": "정보가 오래됨",
+    "conflict": "출처 간 내용이 다름",
+    "invalidated": "가설 폐기 조건 충족",
+}
+_HEALTHY_EVIDENCE_STATUSES = frozenset({"card_generated"})
+
+
+def _safe_source_url(value):
+    """Accept only a complete http(s) original link for the public read model."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return None
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
+    return value if parsed.scheme in {"http", "https"} and parsed.netloc and parsed.hostname else None
+
+
+def _valid_source_timestamp(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parse_kst(value)
+    except (ValueError, TypeError):
+        return None
+    return value
+
+
+def _source_facts(evidence, filter_result, *, invalidated):
+    """Project only persisted source trust facts; unknown inputs never earn trust."""
+    evidence = evidence if isinstance(evidence, dict) else {}
+    filter_result = filter_result if isinstance(filter_result, dict) else {}
+    source = evidence.get("source")
+    source = source.strip() if isinstance(source, str) else ""
+    source_url = _safe_source_url(evidence.get("source_url"))
+    known_at = _valid_source_timestamp(evidence.get("known_at"))
+    last_success_at = _valid_source_timestamp(evidence.get("collected_at"))
+    status = evidence.get("status")
+    raw_reasons = filter_result.get("reasons")
+    reasons = tuple(reason for reason in raw_reasons if isinstance(reason, str)) if isinstance(raw_reasons, list) else ()
+    reasons_known = isinstance(raw_reasons, list) and len(reasons) == len(raw_reasons)
+
+    if invalidated or status == "invalidated":
+        trust = "invalidated"
+    elif not (source and source_url and known_at and last_success_at) or not reasons_known:
+        trust = "missing"
+    elif "conflicting or recycled disclosure" in reasons:
+        trust = "conflict"
+    elif "known_at future or stale" in reasons:
+        trust = "stale"
+    elif reasons:
+        trust = "missing"
+    elif status in _HEALTHY_EVIDENCE_STATUSES:
+        trust = "verified"
+    else:
+        trust = "missing"
+    return {
+        "source": source or None,
+        "source_url": source_url,
+        "known_at": known_at,
+        "last_success_at": last_success_at,
+        "trust_state": _SOURCE_TRUST_LABELS[trust],
+    }
+
+
 def user_card_view(db, ident, user_id):
     """Safe read model for the owner-facing UI; never expose internal raw input."""
     result=card_detail(db,ident)
@@ -390,6 +459,7 @@ def user_card_view(db, ident, user_id):
     filter_result=filter_detail(db,result["filter_id"])
     result["filter"]={k:filter_result.get(k) for k in ("id","verdict","reasons","as_of","known_at")}
     result["filter"]["computed"]=filter_result.get("computed_outputs",{}).get("computed",{})
+    result["source_facts"] = _source_facts(evidence, filter_result, invalidated=bool(result.get("invalidated_at")))
     result["fill_summary"] = user_fill_summary(db, ident, user_id)
     decision=db.execute("SELECT decision,decided_at,note FROM user_decisions WHERE card_id=? AND user_id=?",(ident,user_id)).fetchone()
     plan=db.execute("SELECT * FROM order_plans WHERE card_id=? AND user_id=? ORDER BY id DESC LIMIT 1",(ident,user_id)).fetchone()
