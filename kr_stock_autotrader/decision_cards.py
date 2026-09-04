@@ -514,9 +514,18 @@ def user_card_view(db, ident, user_id):
         plan_view["position"]=dict(db.execute("SELECT symbol,qty,avg_price,status FROM positions WHERE order_plan_id=?",(plan["id"],)).fetchone() or {})
         plan_view["exit_lineage"]=[dict(x) for x in db.execute("SELECT rule,quote_known_at,created_at FROM exit_lineage WHERE order_plan_id=? ORDER BY id",(plan["id"],))]
     result["event_scenarios"]=[]
-    scenarios = list(db.execute("SELECT id,version,frozen_at,expected_value_krw,scenario_kind,scenario_schema_version,scenarios_json FROM event_scenario_sets WHERE card_id=?",(ident,)))
+    quantitative_columns = {row["name"] for row in db.execute("PRAGMA table_info(event_scenario_sets)")}
+    quantitative_projection = (
+        "scenario_kind,scenario_schema_version"
+        if {"scenario_kind", "scenario_schema_version"} <= quantitative_columns
+        else "'QUANTITATIVE' AS scenario_kind,1 AS scenario_schema_version"
+    )
+    scenarios = list(db.execute(
+        "SELECT id,version,frozen_at,expected_value_krw," + quantitative_projection + ",scenarios_json "
+        "FROM event_scenario_sets WHERE card_id=?", (ident,)
+    ))
     scenarios += list(db.execute("SELECT id,version,frozen_at,NULL AS expected_value_krw,'CONDITIONAL' AS scenario_kind,1 AS scenario_schema_version,scenarios_json FROM event_conditional_scenario_sets WHERE card_id=?",(ident,)))
-    for scenario in sorted(scenarios, key=lambda item: item["id"], reverse=True):
+    for scenario in sorted(scenarios, key=lambda item: (item["scenario_kind"] == "CONDITIONAL", item["version"], item["frozen_at"], item["id"]), reverse=True):
         is_conditional = scenario["scenario_kind"] == "CONDITIONAL"
         observations=[] if is_conditional else [dict(x) for x in db.execute("""SELECT known_at,retrieved_at,provider,source,
             CASE WHEN provider='KIS' THEN 'network_retrieved_at' ELSE NULL END AS timestamp_source,

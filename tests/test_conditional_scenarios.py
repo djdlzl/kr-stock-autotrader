@@ -1,5 +1,7 @@
 """RED/GREEN contracts for evidence-only conditional judgment-hold scenarios."""
 from copy import deepcopy
+from datetime import timedelta
+import sqlite3
 import threading
 
 import pytest
@@ -259,4 +261,90 @@ def test_repeated_connect_preserves_legacy_quantitative_schema_customizations(mo
     assert "legacy_note" in db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='event_scenario_sets'").fetchone()[0]
     assert db.execute("SELECT sql FROM sqlite_master WHERE name='legacy_quant_idx'").fetchone()[0] == "CREATE INDEX legacy_quant_idx ON event_scenario_sets(legacy_note)"
     assert "CREATE TRIGGER legacy_quant_trigger" in db.execute("SELECT sql FROM sqlite_master WHERE name='legacy_quant_trigger'").fetchone()[0]
+    db.close()
+
+
+def test_legacy_quantitative_readback_is_schema_safe_and_conditional_first(monkeypatch, tmp_path):
+    """A production-shaped old quantitative table remains read-only-compatible."""
+    database = tmp_path / "legacy-quantitative-readback.db"
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(database))
+    raw = sqlite3.connect(database)
+    raw.executescript("""
+    CREATE TABLE event_scenario_sets (
+      id INTEGER PRIMARY KEY, event_identity TEXT NOT NULL, version INTEGER NOT NULL, symbol TEXT NOT NULL,
+      event_type TEXT NOT NULL, profile_id TEXT NOT NULL, profile_version INTEGER NOT NULL,
+      evidence_id INTEGER NOT NULL REFERENCES material_evidence(id), card_id INTEGER NOT NULL REFERENCES decision_cards(id),
+      disclosed_at TEXT NOT NULL, known_at TEXT NOT NULL, frozen_at TEXT NOT NULL, scenario_json TEXT NOT NULL,
+      scenarios_json TEXT NOT NULL, expected_value_krw REAL NOT NULL, legacy_note TEXT,
+      UNIQUE(card_id, event_identity, version)
+    );
+    CREATE INDEX legacy_quantitative_note_idx ON event_scenario_sets(legacy_note);
+    CREATE TRIGGER legacy_quantitative_note_trigger AFTER INSERT ON event_scenario_sets BEGIN SELECT 1; END;
+    """)
+    objects_before = dict(raw.execute("SELECT name, sql FROM sqlite_master WHERE name IN ('event_scenario_sets', 'legacy_quantitative_note_idx', 'legacy_quantitative_note_trigger')"))
+    raw.close()
+
+    db = dbmod.connect()
+    assert {row["name"] for row in db.execute("PRAGMA table_info(event_scenario_sets)")} >= {"expected_value_krw", "legacy_note"}
+    assert not {"scenario_kind", "scenario_schema_version"} & {row["name"] for row in db.execute("PRAGMA table_info(event_scenario_sets)")}
+    evidence, card = _hold(db)
+    conditional_json = dbmod.json.dumps([{"label": "BASE", "conditions": [{"text": "hold", "provenance": "test"}]}])
+    for ident, version, frozen_at in ((1, 1, "2026-08-31T09:00:00+09:00"), (2, 2, "2026-09-04T09:00:00+09:00")):
+        db.execute("""INSERT INTO event_conditional_scenario_sets(id,event_identity,version,symbol,evidence_id,card_id,disclosed_at,known_at,source_url,frozen_at,scenario_json,scenarios_json)
+                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (ident, "CONDITIONAL:legacy", version, evidence["symbol"], evidence["id"], card["id"], "2026-08-30T09:00:00+09:00", "2026-08-31T09:00:00+09:00", "https://example.test/dart", frozen_at, "{}", conditional_json))
+
+    from kr_stock_autotrader.event_scenarios import create, observe
+    from tests.test_event_scenarios import _observation, payload
+    first_payload = payload(evidence["id"], card["id"])
+    first_payload["symbol"] = evidence["symbol"]
+    first_payload["event_identity"] = "LEGACY:quantitative"; first = create(db, first_payload)
+    second_payload = deepcopy(first_payload); second_payload["version"] = 2; second = create(db, second_payload)
+    # Independent-table IDs are deliberately non-chronological: old quantitative IDs are high.
+    db.execute("UPDATE event_scenario_sets SET id=99 WHERE id=?", (first["id"],))
+    db.execute("UPDATE event_scenario_sets SET id=100 WHERE id=?", (second["id"],))
+    db.commit()
+    frozen_at = db.execute("SELECT frozen_at FROM event_scenario_sets WHERE id=100").fetchone()[0]
+    from kr_stock_autotrader.domain import parse_kst
+    import kr_stock_autotrader.event_scenarios as quantitative_scenarios
+    monkeypatch.setattr(quantitative_scenarios, "now_kst", lambda: parse_kst(frozen_at) + timedelta(minutes=2))
+    observation = _observation({**second, "frozen_at": frozen_at}, "legacy-observation", 100)
+    observation["symbol"] = evidence["symbol"]
+    observed = observe(db, "LEGACY:quantitative", observation)
+    assert observed["active_scenario_label"] is not None
+    quantitative_before = db.execute("SELECT id, quote(event_identity), quote(version), quote(frozen_at), quote(expected_value_krw), quote(scenarios_json), quote(legacy_note) FROM event_scenario_sets ORDER BY id").fetchall()
+
+    view = user_card_view(db, card["id"], 1)["event_scenarios"]
+    assert [(item["kind"], item["version"]) for item in view] == [("CONDITIONAL", 2), ("CONDITIONAL", 1), ("QUANTITATIVE", 2), ("QUANTITATIVE", 1)]
+    assert view[0]["schema_version"] == 1 and view[0]["tracking_state"] == "UNOBSERVABLE"
+    assert view[0]["current"]["active_scenario_label"] is None
+    assert view[2]["schema_version"] == 1 and view[2]["tracking_state"] == "ACTIVE"
+    assert view[2]["current"]["active_scenario_label"] is not None
+    db.close()
+
+    from fastapi.testclient import TestClient
+    from kr_stock_autotrader.api import app
+    client = TestClient(app)
+    assert client.post("/api/signup", json={"email": "legacy-readback@example.test", "password": "long-password"}).status_code == 200
+    response = client.get(f"/api/cards/{card['id']}")
+    assert response.status_code == 200, response.text
+    api_view = response.json()["event_scenarios"]
+    assert api_view[0]["kind"] == "CONDITIONAL" and api_view[0]["schema_version"] == 1
+    assert api_view[0]["tracking_state"] == "UNOBSERVABLE" and api_view[0]["current"]["active_scenario_label"] is None
+
+    db = dbmod.connect()
+    assert dict(db.execute("SELECT name, sql FROM sqlite_master WHERE name IN ('event_scenario_sets', 'legacy_quantitative_note_idx', 'legacy_quantitative_note_trigger')")) == objects_before
+    assert db.execute("SELECT id, quote(event_identity), quote(version), quote(frozen_at), quote(expected_value_krw), quote(scenarios_json), quote(legacy_note) FROM event_scenario_sets ORDER BY id").fetchall() == quantitative_before
+    db.close()
+
+
+def test_fresh_quantitative_schema_reads_its_stored_kind_and_schema_version(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "fresh-modern.db"))
+    db = dbmod.connect(); evidence_id, card_id = _lineage(db)
+    from kr_stock_autotrader.event_scenarios import create
+    from tests.test_event_scenarios import payload
+    created = create(db, payload(evidence_id, card_id))
+    stored = db.execute("SELECT scenario_kind,scenario_schema_version FROM event_scenario_sets WHERE id=?", (created["id"],)).fetchone()
+    view = user_card_view(db, card_id, 1)["event_scenarios"]
+    assert tuple(stored) == ("QUANTITATIVE", 1)
+    assert (view[0]["kind"], view[0]["schema_version"]) == tuple(stored)
     db.close()
