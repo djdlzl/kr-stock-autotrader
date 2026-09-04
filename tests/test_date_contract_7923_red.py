@@ -8,6 +8,8 @@ from tests.test_decision_card_invariants import card, raw
 
 def test_legacy_known_at_and_operation_date_are_separate_axes(monkeypatch, tmp_path):
     monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "axes.db"))
+    import kr_stock_autotrader.decision_cards as cards
+    monkeypatch.setattr(cards, "now", lambda: "2026-09-04T08:00:04+09:00")
     db = dbmod.connect()
     evidence = create_evidence(db, {
         "symbol": "005930", "name": "삼성전자", "kind": "공시", "title": "overnight",
@@ -17,9 +19,7 @@ def test_legacy_known_at_and_operation_date_are_separate_axes(monkeypatch, tmp_p
     })
     filt = save_filter(db, evidence["id"], raw(announcement_at="2026-09-03T17:15:00+09:00", market_data_known_at="2026-09-04T08:00:03+09:00"), "2026-09-04T08:00:03+09:00", "2026-09-04T08:00:03+09:00")
     saved = save_card(db, card(evidence["id"], filt["id"]))
-    db.execute("UPDATE decision_cards SET generated_at=? WHERE id=?", ("2026-09-04T08:01:00+09:00", saved["id"]))
-    db.execute("UPDATE deterministic_filter_results SET created_at=? WHERE id=?", ("2026-09-04T08:00:04+09:00", filt["id"]))
-    db.commit(); db.close()
+    db.close()
 
     from app import app
     client = TestClient(app)

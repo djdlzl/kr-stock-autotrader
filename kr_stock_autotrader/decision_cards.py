@@ -250,7 +250,23 @@ def save_filter(db,evidence_id,inputs,as_of,known_at,parent_filter_id=None):
                 FILTER_EVALUATOR_VERSION,lineage_version,parent_filter_id,out["verdict"],canon(out["reasons"]),now()
             )).fetchone()
         except sqlite3.IntegrityError as exc:
-            raise HTTPException(409,"filter lineage conflict") from exc
+            # SQLite reports CHECK/FK/TRIGGER failures as IntegrityError too.
+            # Only known lineage uniqueness surfaces are retry conflicts.
+            code = getattr(exc, "sqlite_errorname", "")
+            message = str(exc)
+            lineage_columns = ("deterministic_filter_results.evidence_id" in message or
+                               "deterministic_filter_results.parent_filter_id" in message)
+            exact_after_conflict = db.execute("""SELECT 1 FROM deterministic_filter_results
+              WHERE evidence_id=? AND as_of=? AND known_at=? AND evidence_version=?
+                AND evaluator_version=? AND input_sha256=? AND raw_inputs=?""",
+              scope + (input_sha256, raw_inputs)).fetchone()
+            parent_has_child = parent_filter_id is not None and db.execute(
+                "SELECT 1 FROM deterministic_filter_results WHERE parent_filter_id=?", (parent_filter_id,)
+            ).fetchone()
+            if (code in {"SQLITE_CONSTRAINT_UNIQUE", "SQLITE_CONSTRAINT_PRIMARYKEY"}
+                    and lineage_columns and (exact_after_conflict or parent_has_child)):
+                raise HTTPException(409,"filter lineage conflict") from exc
+            raise HTTPException(500,"filter persistence failed") from exc
         audit(db,"internal","run","filter",saved["id"])
         result = filter_detail(db,saved["id"])
         result["idempotent"] = False
@@ -263,6 +279,24 @@ def filter_detail(db,ident):
     d=dict(row(db,"deterministic_filter_results",ident)); d["raw_inputs"]=json.loads(d["raw_inputs"]); d["computed_outputs"]=json.loads(d["computed_outputs"]); d["reasons"]=json.loads(d["reasons"])
     d["is_current"] = not bool(db.execute("SELECT 1 FROM deterministic_filter_results WHERE parent_filter_id=?", (ident,)).fetchone())
     return d
+
+
+def current_filter_head(db, evidence_id, as_of, known_at):
+    """Read one childless head for an exact current-evidence filter identity."""
+    try:
+        parse_kst(as_of); parse_kst(known_at)
+    except (ValueError, TypeError):
+        raise HTTPException(422, "as_of and known_at must be KST ISO-8601")
+    evidence = row(db, "material_evidence", evidence_id)
+    head = db.execute("""SELECT f.id FROM deterministic_filter_results f
+      WHERE f.evidence_id=? AND f.as_of=? AND f.known_at=? AND f.evidence_version=?
+        AND f.evaluator_version=?
+        AND NOT EXISTS (SELECT 1 FROM deterministic_filter_results child WHERE child.parent_filter_id=f.id)
+      ORDER BY f.lineage_version DESC, f.id DESC LIMIT 1""",
+      (evidence_id, as_of, known_at, evidence["version"], FILTER_EVALUATOR_VERSION)).fetchone()
+    if not head:
+        raise HTTPException(404, "current filter head not found")
+    return filter_detail(db, head["id"])
 
 def save_card(db,data):
     try: card=validate_card(data["card"])

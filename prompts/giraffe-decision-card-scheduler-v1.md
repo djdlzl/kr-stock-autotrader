@@ -58,7 +58,7 @@
 3. 정상 snapshot은 merged JSON으로 `filter-run`을 실행하고 `filter-detail`로 filter ID, verdict, reasons, computed units를 readback한다.
 4. `card-request`로 immutable input package를 읽어 prompt에 따라 카드를 만들고 `card-save-result`로 저장한다. 항상 `card-detail` readback으로 lineage/filter/prompt hash를 확인한다.
 5. filter FAIL 또는 unavailable이면 card verdict는 `판단 보류`/`관찰`/`제외`만 가능하며 주문 필드는 null이다. 이 job은 order_plans, order_fills, positions, order_events, allocation을 생성하지 않는다.
-6. correction 실행이면 먼저 현재 evidence lineage의 `현재 head filter ID`를 확인한다. correction request에는 반드시 그 값을 `"parent_filter_id"`로 보낸다.
+6. correction 실행이면 먼저 `filter-head EVIDENCE_ID AS_OF KNOWN_AT`로 exact identity의 현재 evidence-version head를 발견한다. 반환된 `현재 head filter ID`만 correction request의 `"parent_filter_id"`로 보낸다.
 7. correction 응답에서는 append-only successor만 허용한다. 응답으로 받은 successor filter `id`를 즉시 readback하고, 카드 저장과 `card-request`/`card-save-result`에는 반드시 그 successor를 사용한다. 즉 응답으로 받은 successor filter ID가 카드에 연결되는 유일한 filter ID다. 이전 parent filter ID로 카드를 만들거나 history row를 덮어쓰지 않는다.
 
 ## 1단계: evidence 무결성 검토

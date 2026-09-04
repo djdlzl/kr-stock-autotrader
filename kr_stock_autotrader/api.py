@@ -16,7 +16,7 @@ from .auth import csrf_origin_ok, current_user, hash_password, issue_session, ve
 from .config import COOKIE_SECURE, LIVE_TRADING, SIGNUP_ENABLED
 from .db import connect
 from .domain import Quote, parse_kst, now_kst
-from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
+from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, current_filter_head, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML, PROTOTYPE_HTML
 from .kis_readonly import KISReadOnlyClient
@@ -763,6 +763,12 @@ async def internal_filter(request: Request, _: None = Depends(require_internal_a
     try:return save_filter(db,data['evidence_id'],data['inputs'],data['as_of'],data['known_at'],data.get('parent_filter_id'))
     finally:db.close()
 
+@app.get('/api/internal/filters/head')
+def internal_filter_head(evidence_id: int, as_of: str, known_at: str, _: None = Depends(require_internal_api_key)):
+    db=connect()
+    try:return current_filter_head(db, evidence_id, as_of, known_at)
+    finally:db.close()
+
 @app.get('/api/internal/filters/{filter_id}')
 def internal_filter_detail(filter_id: int, _: None = Depends(require_internal_api_key)):
     db=connect()
@@ -870,21 +876,26 @@ def user_cards_summary(request: Request, date: str | None = None, operation_date
     db=connect()
     try:
         evidence_count=db.execute(f"SELECT count(*) n FROM material_evidence WHERE date({evidence_axis},'+9 hours')=?",(day,)).fetchone()['n']
-        active_cards = f"""SELECT c.* FROM decision_cards c JOIN material_evidence e ON e.id=c.evidence_id
-          WHERE date({card_axis},'+9 hours')=? AND c.invalidated_at IS NULL
-          AND NOT EXISTS (SELECT 1 FROM decision_cards newer WHERE newer.lineage_key=c.lineage_key AND newer.version>c.version AND newer.invalidated_at IS NULL)"""
-        cards=db.execute("SELECT verdict,count(*) n FROM (" + active_cards + ") GROUP BY verdict",(day,)).fetchall()
+        if operational:
+            # Operation date deliberately reports immutable processing history.
+            selected_cards = "SELECT c.* FROM decision_cards c WHERE date(c.generated_at,'+9 hours')=?"
+            filters=db.execute("SELECT f.verdict,count(*) n FROM deterministic_filter_results f WHERE date(f.created_at,'+9 hours')=? GROUP BY f.verdict",(day,)).fetchall()
+        else:
+            selected_cards = f"""SELECT c.* FROM decision_cards c JOIN material_evidence e ON e.id=c.evidence_id
+              WHERE date({card_axis},'+9 hours')=? AND c.invalidated_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM decision_cards newer WHERE newer.lineage_key=c.lineage_key AND newer.version>c.version AND newer.invalidated_at IS NULL)"""
+            filters=db.execute(f"""SELECT f.verdict,count(*) n FROM deterministic_filter_results f
+              JOIN material_evidence e ON e.id=f.evidence_id WHERE date({filter_axis},'+9 hours')=?
+              AND e.status != 'invalidated' AND f.evidence_version=e.version
+              AND f.id=(SELECT head.id FROM deterministic_filter_results head
+                WHERE head.evidence_id=f.evidence_id AND head.evidence_version=e.version
+                  AND NOT EXISTS (SELECT 1 FROM deterministic_filter_results child WHERE child.parent_filter_id=head.id)
+                 ORDER BY head.as_of DESC,head.known_at DESC,head.lineage_version DESC LIMIT 1)
+              GROUP BY f.verdict""",(day,)).fetchall()
+        cards=db.execute("SELECT verdict,count(*) n FROM (" + selected_cards + ") GROUP BY verdict",(day,)).fetchall()
         by_verdict={x['verdict']:x['n'] for x in cards}
-        filters=db.execute(f"""SELECT f.verdict,count(*) n FROM deterministic_filter_results f
-          JOIN material_evidence e ON e.id=f.evidence_id WHERE date({filter_axis},'+9 hours')=?
-          AND e.status != 'invalidated' AND f.evidence_version=e.version
-          AND f.id=(SELECT head.id FROM deterministic_filter_results head
-            WHERE head.evidence_id=f.evidence_id AND head.evidence_version=e.version
-              AND NOT EXISTS (SELECT 1 FROM deterministic_filter_results child WHERE child.parent_filter_id=head.id)
-             ORDER BY head.as_of DESC,head.known_at DESC,head.lineage_version DESC LIMIT 1)
-          GROUP BY f.verdict""",(day,)).fetchall()
         by_filter={x['verdict']:x['n'] for x in filters}
-        decisions=db.execute("SELECT d.decision,count(*) n FROM (" + active_cards + ") c JOIN user_decisions d ON d.card_id=c.id WHERE d.user_id=? GROUP BY d.decision",(day,uid)).fetchall()
+        decisions=db.execute("SELECT d.decision,count(*) n FROM (" + selected_cards + ") c JOIN user_decisions d ON d.card_id=c.id WHERE d.user_id=? GROUP BY d.decision",(day,uid)).fetchall()
         by_decision={x['decision']:x['n'] for x in decisions}
         missing=db.execute(f"SELECT count(*) n FROM material_evidence e WHERE date(e.{evidence_axis},'+9 hours')=? AND e.status!='invalidated' AND NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id)",(day,)).fetchone()['n']
         statuses={name: db.execute(f"SELECT count(*) n FROM material_evidence WHERE date({evidence_axis},'+9 hours')=? AND status=?",(day,name)).fetchone()['n'] for name in ('error','invalidated','decision_pending')}
@@ -897,7 +908,7 @@ def user_cards_summary(request: Request, date: str | None = None, operation_date
             import json
             detail=json.loads(run['detail'] or '{}') if run else {}
             scheduler.append({'종류':label,'상태':run['status'] if run else '미실행','건수':int(detail.get('count',0) or 0),'실패':bool(run and run['status'] in {'error','failed'}),'시각':(run['finished_at'] or run['started_at']) if run else None})
-        return {'기준일':day,'날짜 축':'운영일' if operational else '근거 확인일','전체 근거':evidence_count,'필터 PASS':by_filter.get('PASS',0),'필터 FAIL':by_filter.get('FAIL',0),'카드 생성':sum(by_verdict.values()),'카드 미생성':missing,'판단 보류':by_verdict.get('판단 보류',0),'매수 검토 가능':by_verdict.get('매수 검토 가능',0),'관찰':by_verdict.get('관찰',0),'제외':by_verdict.get('제외',0),'승인':by_decision.get('approve',0),'보류':by_decision.get('hold',0),'거절':by_decision.get('reject',0),'오류':statuses['error'],'무효화':statuses['invalidated'],'판단 대기':statuses['decision_pending'],'실패·근거 부족':failures,'최근 실행':{'07:00':scheduler[0],'08:00':scheduler[1]},'스케줄러':scheduler,'다음 실행':{'07:00 KST':next_run(7),'08:00 KST':next_run(8)}}
+        return {'기준일':day,'날짜 축':'운영 처리 이력' if operational else '근거 확인일','전체 근거':evidence_count,'필터 PASS':by_filter.get('PASS',0),'필터 FAIL':by_filter.get('FAIL',0),'카드 생성':sum(by_verdict.values()),'카드 미생성':missing,'판단 보류':by_verdict.get('판단 보류',0),'매수 검토 가능':by_verdict.get('매수 검토 가능',0),'관찰':by_verdict.get('관찰',0),'제외':by_verdict.get('제외',0),'승인':by_decision.get('approve',0),'보류':by_decision.get('hold',0),'거절':by_decision.get('reject',0),'오류':statuses['error'],'무효화':statuses['invalidated'],'판단 대기':statuses['decision_pending'],'실패·근거 부족':failures,'최근 실행':{'07:00':scheduler[0],'08:00':scheduler[1]},'스케줄러':scheduler,'다음 실행':{'07:00 KST':next_run(7),'08:00 KST':next_run(8)}}
     finally: db.close()
 
 

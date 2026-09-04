@@ -25,10 +25,16 @@ def _seed(db, key, known_at, *, make_card=True, delayed_at=None, invalid=False, 
     filt = save_filter(db, evidence["id"], raw(
         announcement_at=known_at, market_data_known_at=known_at
     ), known_at, known_at)
-    result = save_card(db, card(evidence["id"], filt["id"]))
     if delayed_at:
-        db.execute("UPDATE decision_cards SET generated_at=? WHERE id=?", (delayed_at, result["id"]))
-        db.commit()
+        import kr_stock_autotrader.decision_cards as decision_cards
+        original_now = decision_cards.now
+        decision_cards.now = lambda: delayed_at
+        try:
+            result = save_card(db, card(evidence["id"], filt["id"]))
+        finally:
+            decision_cards.now = original_now
+    else:
+        result = save_card(db, card(evidence["id"], filt["id"]))
     return evidence, result
 
 

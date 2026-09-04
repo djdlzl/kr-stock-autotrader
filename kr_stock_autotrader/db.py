@@ -27,6 +27,26 @@ def _canonical_input_sha256(raw_inputs: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def _legacy_filter_indexes(db: sqlite3.Connection) -> list[str]:
+    """Return user indexes that survive the legacy identity replacement."""
+    indexes = []
+    for item in db.execute("""SELECT name, sql FROM sqlite_master
+        WHERE type='index' AND tbl_name='deterministic_filter_results'
+          AND sql IS NOT NULL AND name NOT LIKE 'sqlite_autoindex%'"""):
+        columns = [row["name"] for row in db.execute(f"PRAGMA index_info({item['name']!r})")]
+        # This identity belonged to the old one-row-per-scope design. Do not
+        # recreate a user-named equivalent that would block corrections.
+        if columns == ["evidence_id", "as_of", "known_at", "evidence_version"]:
+            continue
+        indexes.append(item["sql"])
+    return indexes
+
+
+def _recreate_filter_index(db: sqlite3.Connection, sql: str) -> None:
+    """Narrow seam for atomic migration-failure coverage."""
+    db.execute(sql)
+
+
 def _migrate_filter_lineage(db: sqlite3.Connection) -> None:
     """Replace the legacy one-row-per-scope constraint with an append-only chain."""
     table = db.execute(
@@ -39,6 +59,7 @@ def _migrate_filter_lineage(db: sqlite3.Connection) -> None:
     if required <= columns and not legacy_unique:
         return
 
+    custom_indexes = _legacy_filter_indexes(db)
     db.commit()
     db.execute("PRAGMA foreign_keys=OFF")
     try:
@@ -62,6 +83,8 @@ def _migrate_filter_lineage(db: sqlite3.Connection) -> None:
             )
         db.execute("DROP TABLE deterministic_filter_results")
         db.execute("ALTER TABLE deterministic_filter_results_new RENAME TO deterministic_filter_results")
+        for sql in custom_indexes:
+            _recreate_filter_index(db, sql)
         db.commit()
     except Exception:
         db.rollback()
