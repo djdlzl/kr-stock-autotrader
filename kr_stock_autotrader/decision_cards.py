@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import Header, HTTPException
 from .decision_card_schema import SCHEMA_VERSION, validate_card
 from .db import FILTER_EVALUATOR_VERSION
-from .domain import fresh_quote, market_open, now_kst, parse_kst
+from .domain import Quote, fresh_quote, market_open, now_kst, parse_kst
 
 PROMPT_PATH = Path(__file__).parents[1] / "prompts" / "decision-card-v1.md"
 SHORT_TERM_RISE_SESSIONS = 2
@@ -350,6 +350,37 @@ def user_fill_summary(db, card_id, user_id):
     if remaining > 0:
         return {"first_buy_at": first_buy_at, "last_full_sell_at": None, "fill_state": "bought"}
     return {"first_buy_at": first_buy_at, "last_full_sell_at": last_full_sell_at, "fill_state": "sold_complete"}
+
+
+def _scenario_trust(current, *, invalidated):
+    """Small, read-only trust projection for a persisted scenario observation.
+
+    The detail API deliberately exposes no raw receipt or source-conflict
+    internals.  This projection reuses the established five-minute quote
+    freshness rule and the server-calculated VERIFIED context/match values so
+    the client cannot infer trust from absent or invented fields.
+    """
+    blocked = {"freshness": "MISSING", "context_readiness": "BLOCKED", "status": "MISSING"}
+    if invalidated:
+        return {"freshness": "MISSING", "context_readiness": "BLOCKED", "status": "INVALIDATED"}
+    if not isinstance(current, dict) or (current.get("provider"), current.get("source")) not in {
+        ("KIS", "KIS"), ("TRUSTED_MARKET_CONTEXT", "TRUSTED_MARKET_CONTEXT")
+    }:
+        return blocked
+    try:
+        price = float(current["price_krw"])
+        retrieved_at = parse_kst(current["retrieved_at"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return blocked
+    if not math.isfinite(price):
+        return blocked
+    if not fresh_quote(Quote("scenario", price, 1, 1, retrieved_at), now_kst()):
+        return {"freshness": "STALE", "context_readiness": "BLOCKED", "status": "STALE"}
+    if current.get("market_context_status") != "VERIFIED" or current.get("match") not in {"GOOD_MATCH", "BASE_MATCH", "BAD_MATCH"} or not current.get("active_scenario_label"):
+        return blocked
+    return {"freshness": "FRESH", "context_readiness": "READY", "status": "READY"}
+
+
 def user_card_view(db, ident, user_id):
     """Safe read model for the owner-facing UI; never expose internal raw input."""
     result=card_detail(db,ident)
@@ -379,7 +410,7 @@ def user_card_view(db, ident, user_id):
             sector_excess_pct,market_context_status,spread_pct,imbalance,match,action,active_scenario_label
             FROM event_scenario_observations WHERE scenario_set_id=? ORDER BY id DESC LIMIT 1""",(scenario["id"],))]
         current = observations[0] if observations else {"match":"UNOBSERVED","action":"NO_ACTION","active_scenario_label":None}
-        result["event_scenarios"].append({"version":scenario["version"],"frozen_at":scenario["frozen_at"],"expected_value_krw":scenario["expected_value_krw"],"scenarios":json.loads(scenario["scenarios_json"]),"current":current,"tracking_state":"ACTIVE" if not result.get("invalidated_at") else "INACTIVE"})
+        result["event_scenarios"].append({"version":scenario["version"],"frozen_at":scenario["frozen_at"],"expected_value_krw":scenario["expected_value_krw"],"scenarios":json.loads(scenario["scenarios_json"]),"current":current,"trust":_scenario_trust(current, invalidated=bool(result.get("invalidated_at"))),"tracking_state":"ACTIVE" if not result.get("invalidated_at") else "INACTIVE"})
     result["user_state"]={"decision":dict(decision) if decision else None,"order_plan":plan_view,"draft":({**dict(draft),"snapshot":json.loads(draft["snapshot_json"])} if draft else None),"default_paper_amount":_default_paper_amount(db, user_id)}
     return result
 

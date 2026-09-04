@@ -119,8 +119,8 @@ def test_tracking_health_malformed_timestamp_is_closed_not_raised():
     assert health["status"] == "QUOTE_UNAVAILABLE"
 
 
-def test_release0_scenario_highlight_requires_explicit_fresh_trusted_context():
+def test_release0_scenario_highlight_requires_explicit_server_trust_projection():
     from kr_stock_autotrader.ui import APP_HTML
-    assert "current.freshness==='FRESH'" in APP_HTML
+    assert "trust.status==='READY'&&trust.freshness==='FRESH'&&trust.context_readiness==='READY'" in APP_HTML
     assert "current.market_context_status==='VERIFIED'" in APP_HTML
-    assert "!current.stale&&!current.conflict&&!current.missing" in APP_HTML
+    assert "['GOOD_MATCH','BASE_MATCH','BAD_MATCH'].includes(current.match)" in APP_HTML

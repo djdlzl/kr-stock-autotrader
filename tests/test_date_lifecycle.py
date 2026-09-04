@@ -1,4 +1,5 @@
 """RED/green contracts for KST business-date card lifecycle."""
+import json
 import os
 import re
 import subprocess
@@ -153,6 +154,34 @@ def test_missing_cards_expose_only_safe_evidence_fields(monkeypatch, tmp_path):
     assert set(item) <= {"id", "symbol", "name", "kind", "title", "summary", "source", "source_url", "announcement_at", "collected_at", "known_at", "status", "version", "snapshot_available"}
     assert "LEAK" not in response.text
     assert not {"snapshot", "audit_json", "created_by", "dedupe_key", "newness", "updated_at", "invalidated_at"} & set(item)
+
+
+def test_missing_evidence_api_and_renderer_offer_recovery_without_card_detail(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "missing-recovery.db"))
+    db = dbmod.connect()
+    missing, _ = _seed(db, "missing-recovery", "2026-08-31T10:00:00+09:00", make_card=False)
+    db.execute("UPDATE material_evidence SET source='', source_url=NULL WHERE id=?", (missing["id"],))
+    db.commit(); db.close()
+    from app import app
+    client = TestClient(app)
+    assert client.post("/api/signup", json={"email": "missing-recovery@test.com", "password": "long-password"}).status_code == 200
+    item = client.get("/api/cards/missing?date=2026-08-31").json()[0]
+    assert item["id"] == missing["id"]
+    assert client.get(f"/api/cards/{item['id']}").status_code == 404
+    script = re.search(r"<script>(.*?)</script>", client.get("/app").text, re.S).group(1)
+    recovery = re.search(r"function missingDetail.*?(?=function sourceFacts)", script, re.S).group(0)
+    node = "const esc=v=>String(v??'');const kst=v=>String(v??'');" + recovery + "\n" + (
+        "console.log(JSON.stringify([missingDetail(" + json.dumps(item) + "),"
+        "missingDetail({..." + json.dumps(item) + ",source:'unsafe',source_url:'javascript:alert(1)'}),"
+        "missingDetail({..." + json.dumps(item) + ",source:'safe',source_url:'https://example.test/source'})]));"
+    )
+    rendered = json.loads(subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip())
+    assert "판단 시작 불가 · 출처 없음" in rendered[0]
+    assert "원문 연결 필요" in rendered[0]
+    assert "javascript:" not in rendered[1]
+    assert rendered[2].count("원문 보기") == 1
+    assert "data-kind=" in script and "openMissingDetail(item,button)" in script
+    assert "api('cards/'+id" in script and "openMissingDetail" in script
 
 
 def test_summary_uses_latest_active_lineage_card_when_newer_version_invalidated(monkeypatch, tmp_path):
