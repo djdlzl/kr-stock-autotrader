@@ -760,7 +760,7 @@ async def internal_market_snapshot(symbol: str, request: Request, _: None = Depe
 @app.post('/api/internal/filters')
 async def internal_filter(request: Request, _: None = Depends(require_internal_api_key)):
     data=await request.json(); db=connect()
-    try:return save_filter(db,data['evidence_id'],data['inputs'],data['as_of'],data['known_at'])
+    try:return save_filter(db,data['evidence_id'],data['inputs'],data['as_of'],data['known_at'],data.get('parent_filter_id'))
     finally:db.close()
 
 @app.get('/api/internal/filters/{filter_id}')
@@ -835,77 +835,86 @@ def internal_card_detail(card_id: int, _: None = Depends(require_internal_api_ke
     try:return card_detail(db,card_id)
     finally:db.close()
 
-def _business_date(date: str | None) -> str:
-    """Validate the only accepted user-facing day form (KST evidence day)."""
-    if date is None:
+def _business_date(value: str | None) -> str:
+    """Validate a KST calendar day without assigning a timestamp axis."""
+    if value is None:
         return now_kst().date().isoformat()
-    if not isinstance(date, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
         raise HTTPException(422, "기준일은 YYYY-MM-DD 형식입니다")
     try:
-        return datetime.strptime(date, "%Y-%m-%d").date().isoformat()
+        return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
     except ValueError:
         raise HTTPException(422, "기준일은 YYYY-MM-DD 형식입니다")
 
 
-@ app.get('/api/cards/summary')
-def user_cards_summary(request: Request, date: str | None = None):
-    """Current-user metrics, grouped by material_evidence.known_at KST day.
+def _date_axis(date: str | None, operation_date: str | None) -> tuple[str, bool]:
+    """Legacy `date` remains known_at; operation_date selects operational axes."""
+    if date is not None and operation_date is not None:
+        raise HTTPException(422, "date and operation_date cannot be combined")
+    return _business_date(operation_date if operation_date is not None else date), operation_date is not None
 
-    Dashboard card/filter counts use one current item: latest active card per
-    lineage and latest filter per active evidence. Detail endpoints retain all
-    append-only versions.
-    """
+
+@app.get('/api/cards/summary')
+def user_cards_summary(request: Request, date: str | None = None, operation_date: str | None = None):
+    """Summarize legacy known_at history or explicit operation timestamp axes."""
     uid = current_user(request)
+    day, operational = _date_axis(date, operation_date)
     current = now_kst()
-    day = _business_date(date)
     def next_run(hour):
         candidate = datetime.combine(current.date(), time(hour), tzinfo=current.tzinfo)
         if candidate <= current: candidate += timedelta(days=1)
         return candidate.isoformat()
+    evidence_axis = 'collected_at' if operational else 'known_at'
+    card_axis = 'c.generated_at' if operational else 'e.known_at'
+    filter_axis = 'f.created_at' if operational else 'e.known_at'
     db=connect()
     try:
-        evidence_count=db.execute("SELECT count(*) n FROM material_evidence WHERE substr(known_at,1,10)=?",(day,)).fetchone()["n"]
-        active_cards = """SELECT c.* FROM decision_cards c JOIN material_evidence e ON e.id=c.evidence_id
-          WHERE substr(e.known_at,1,10)=? AND c.invalidated_at IS NULL
+        evidence_count=db.execute(f"SELECT count(*) n FROM material_evidence WHERE date({evidence_axis},'+9 hours')=?",(day,)).fetchone()['n']
+        active_cards = f"""SELECT c.* FROM decision_cards c JOIN material_evidence e ON e.id=c.evidence_id
+          WHERE date({card_axis},'+9 hours')=? AND c.invalidated_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM decision_cards newer WHERE newer.lineage_key=c.lineage_key AND newer.version>c.version AND newer.invalidated_at IS NULL)"""
         cards=db.execute("SELECT verdict,count(*) n FROM (" + active_cards + ") GROUP BY verdict",(day,)).fetchall()
-        by_verdict={x["verdict"]:x["n"] for x in cards}
-        filters=db.execute("""SELECT f.verdict,count(*) n FROM deterministic_filter_results f
-          JOIN material_evidence e ON e.id=f.evidence_id WHERE substr(e.known_at,1,10)=?
-          AND e.status != 'invalidated' AND f.id=(SELECT MAX(f2.id) FROM deterministic_filter_results f2 WHERE f2.evidence_id=f.evidence_id)
+        by_verdict={x['verdict']:x['n'] for x in cards}
+        filters=db.execute(f"""SELECT f.verdict,count(*) n FROM deterministic_filter_results f
+          JOIN material_evidence e ON e.id=f.evidence_id WHERE date({filter_axis},'+9 hours')=?
+          AND e.status != 'invalidated' AND f.evidence_version=e.version
+          AND f.id=(SELECT head.id FROM deterministic_filter_results head
+            WHERE head.evidence_id=f.evidence_id AND head.evidence_version=e.version
+              AND NOT EXISTS (SELECT 1 FROM deterministic_filter_results child WHERE child.parent_filter_id=head.id)
+             ORDER BY head.as_of DESC,head.known_at DESC,head.lineage_version DESC LIMIT 1)
           GROUP BY f.verdict""",(day,)).fetchall()
-        by_filter={x["verdict"]:x["n"] for x in filters}
-        decisions=db.execute("SELECT d.decision,count(*) n FROM user_decisions d JOIN (" + active_cards + ") c ON c.id=d.card_id WHERE d.user_id=? GROUP BY d.decision",(day,uid)).fetchall()
-        by_decision={x["decision"]:x["n"] for x in decisions}
-        missing=db.execute("SELECT count(*) n FROM material_evidence e WHERE substr(e.known_at,1,10)=? AND e.status!='invalidated' AND NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id)",(day,)).fetchone()["n"]
-        statuses={name: db.execute("SELECT count(*) n FROM material_evidence WHERE substr(known_at,1,10)=? AND status=?",(day,name)).fetchone()["n"] for name in ("error","invalidated","decision_pending")}
-        failures=db.execute("""SELECT count(*) n FROM material_evidence e WHERE substr(e.known_at,1,10)=?
-          AND (e.status='error' OR (e.status!='invalidated' AND NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id)))""", (day,)).fetchone()["n"]
+        by_filter={x['verdict']:x['n'] for x in filters}
+        decisions=db.execute("SELECT d.decision,count(*) n FROM (" + active_cards + ") c JOIN user_decisions d ON d.card_id=c.id WHERE d.user_id=? GROUP BY d.decision",(day,uid)).fetchall()
+        by_decision={x['decision']:x['n'] for x in decisions}
+        missing=db.execute(f"SELECT count(*) n FROM material_evidence e WHERE date(e.{evidence_axis},'+9 hours')=? AND e.status!='invalidated' AND NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id)",(day,)).fetchone()['n']
+        statuses={name: db.execute(f"SELECT count(*) n FROM material_evidence WHERE date({evidence_axis},'+9 hours')=? AND status=?",(day,name)).fetchone()['n'] for name in ('error','invalidated','decision_pending')}
+        failures=db.execute(f"""SELECT count(*) n FROM material_evidence e WHERE date(e.{evidence_axis},'+9 hours')=?
+          AND (e.status='error' OR (e.status!='invalidated' AND NOT EXISTS (SELECT 1 FROM decision_cards c WHERE c.evidence_id=e.id)))""", (day,)).fetchone()['n']
         scheduler=[]
-        for kind, label in (("research","리서치"),("card","카드")):
+        for kind, label in (('research','리서치'),('card','카드')):
             run=db.execute("""SELECT status,started_at,finished_at,detail FROM scheduler_runs
-              WHERE kind=? AND (run_key LIKE ? OR substr(started_at,1,10)=?)
-              ORDER BY id DESC LIMIT 1""",(kind,f"{kind}-{day}-%",day)).fetchone()
+              WHERE kind=? AND (run_key LIKE ? OR substr(started_at,1,10)=?) ORDER BY id DESC LIMIT 1""",(kind,f"{kind}-{day}-%",day)).fetchone()
             import json
-            detail=json.loads(run["detail"] or "{}") if run else {}
-            scheduler.append({"종류":label,"상태":run["status"] if run else "미실행","건수":int(detail.get("count",0) or 0),"실패":bool(run and run["status"] in {"error","failed"}),"시각":(run["finished_at"] or run["started_at"]) if run else None})
-        return {"기준일":day,"전체 근거":evidence_count,"필터 PASS":by_filter.get("PASS",0),"필터 FAIL":by_filter.get("FAIL",0),"카드 생성":sum(by_verdict.values()),"카드 미생성":missing,"판단 보류":by_verdict.get("판단 보류",0),"매수 검토 가능":by_verdict.get("매수 검토 가능",0),"관찰":by_verdict.get("관찰",0),"제외":by_verdict.get("제외",0),"승인":by_decision.get("approve",0),"보류":by_decision.get("hold",0),"거절":by_decision.get("reject",0),"오류":statuses["error"],"무효화":statuses["invalidated"],"판단 대기":statuses["decision_pending"],"실패·근거 부족":failures,"최근 실행":{"07:00":scheduler[0],"08:00":scheduler[1]},"스케줄러":scheduler,"다음 실행":{"07:00 KST":next_run(7),"08:00 KST":next_run(8)}}
+            detail=json.loads(run['detail'] or '{}') if run else {}
+            scheduler.append({'종류':label,'상태':run['status'] if run else '미실행','건수':int(detail.get('count',0) or 0),'실패':bool(run and run['status'] in {'error','failed'}),'시각':(run['finished_at'] or run['started_at']) if run else None})
+        return {'기준일':day,'날짜 축':'운영일' if operational else '근거 확인일','전체 근거':evidence_count,'필터 PASS':by_filter.get('PASS',0),'필터 FAIL':by_filter.get('FAIL',0),'카드 생성':sum(by_verdict.values()),'카드 미생성':missing,'판단 보류':by_verdict.get('판단 보류',0),'매수 검토 가능':by_verdict.get('매수 검토 가능',0),'관찰':by_verdict.get('관찰',0),'제외':by_verdict.get('제외',0),'승인':by_decision.get('approve',0),'보류':by_decision.get('hold',0),'거절':by_decision.get('reject',0),'오류':statuses['error'],'무효화':statuses['invalidated'],'판단 대기':statuses['decision_pending'],'실패·근거 부족':failures,'최근 실행':{'07:00':scheduler[0],'08:00':scheduler[1]},'스케줄러':scheduler,'다음 실행':{'07:00 KST':next_run(7),'08:00 KST':next_run(8)}}
     finally: db.close()
 
 
 @app.get('/api/cards')
-def user_cards(request: Request, date: str | None = None):
-    uid=current_user(request); day=_business_date(date) if date is not None else None; db=connect()
-    try:return [user_card_view(db, item["id"], uid) for item in list_cards(db, date=day, current_only=date is None)]
+def user_cards(request: Request, date: str | None = None, operation_date: str | None = None):
+    uid=current_user(request); day, operational=_date_axis(date, operation_date); db=connect()
+    try:return [user_card_view(db, item['id'], uid) for item in list_cards(db, date=day if (date is not None or operation_date is not None) else None, current_only=date is None and operation_date is None, operation_date=operational)]
     finally:db.close()
 
 
 @app.get('/api/cards/missing')
-def user_missing_cards(request: Request, date: str | None = None):
-    """Authenticated, server-filtered actionable evidence rows only."""
-    current_user(request); day=_business_date(date); db=connect()
-    try:return list_cards(db, missing=True, date=day)
+def user_missing_cards(request: Request, date: str | None = None, operation_date: str | None = None):
+    """Authenticated evidence; operation date is collected_at."""
+    current_user(request); day, operational=_date_axis(date, operation_date); db=connect()
+    try:return list_cards(db, missing=True, date=day, operation_date=operational)
     finally:db.close()
+
 
 @app.get('/api/cards/{card_id}')
 def user_card(card_id: int, request: Request):

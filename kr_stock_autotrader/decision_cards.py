@@ -5,6 +5,7 @@ from datetime import timedelta
 from pathlib import Path
 from fastapi import Header, HTTPException
 from .decision_card_schema import SCHEMA_VERSION, validate_card
+from .db import FILTER_EVALUATOR_VERSION
 from .domain import fresh_quote, market_open, now_kst, parse_kst
 
 PROMPT_PATH = Path(__file__).parents[1] / "prompts" / "decision-card-v1.md"
@@ -42,7 +43,7 @@ def list_evidence(db, symbol=None,status=None, date=None):
     q="SELECT id FROM material_evidence WHERE 1=1"; p=[]
     if symbol: q+=" AND symbol=?"; p.append(symbol)
     if status: q+=" AND status=?"; p.append(status)
-    if date: q+=" AND substr(known_at,1,10)=?"; p.append(date)
+    if date: q+=" AND date(known_at,'+9 hours')=?"; p.append(date)
     return [evidence_detail(db,x["id"]) for x in db.execute(q+" ORDER BY id DESC",p)]
 def invalidate_lineage(db,evidence_id=None,card_id=None,reason="mutation"):
     """Atomically revoke every entry-capable plan but retain open positions for exit."""
@@ -156,57 +157,119 @@ def run_filter(inputs, as_of, known_at):
         computed.update({key: inputs.get(key) for key in ("filter_config_version", "short_term_stock_return_pct", "short_term_benchmark_return_pct", "short_term_window", "short_term_provenance", "max_short_term_excess_rise_pct")})
         computed["short_term_excess_return_pct"] = expected_short_term_excess
     return {"verdict":"FAIL" if reasons else "PASS","reasons":reasons,"computed":computed,"units":{"stock_vs_benchmark_pct":"percent; stock_return_pct - benchmark_return_pct; positive means stock outperformed benchmark","stock_vs_sector_pct":"percent; stock_return_pct - sector_return_pct; positive means stock outperformed sector","volume_ratio":"ratio; current_volume / baseline_volume; baseline_volume > 0","short_term_stock_return_pct":"percent; close-to-close stock return over short_term_window","short_term_benchmark_return_pct":"percent; close-to-close benchmark return over short_term_window","short_term_excess_return_pct":"percent; short_term_stock_return_pct - short_term_benchmark_return_pct; positive means stock outperformed benchmark","short_term_window":"KST ISO date window, completed aligned sessions only; ended_known_at must not be after decision known_at","short_term_provenance":"KIS completed daily bars and known-at timestamps","as_of":"KST ISO-8601; evidence.known_at and market_data_known_at must each be at or before filter.known_at <= filter.as_of"}}
-def save_filter(db,evidence_id,inputs,as_of,known_at):
-    evidence=row(db,"material_evidence",evidence_id)
+def save_filter(db,evidence_id,inputs,as_of,known_at,parent_filter_id=None):
+    if not isinstance(inputs, dict):
+        raise HTTPException(422, "filter inputs must be an object")
+    if parent_filter_id is not None and (
+        isinstance(parent_filter_id, bool) or not isinstance(parent_filter_id, int) or parent_filter_id <= 0
+    ):
+        raise HTTPException(422, "parent_filter_id must be a positive integer")
     try:
+        # A prior failed caller statement may leave SQLite's implicit transaction
+        # open; it has no durable filter work, so clear it before serialization.
+        if db.in_transaction:
+            db.rollback()
+        db.execute("BEGIN IMMEDIATE")
+        evidence=row(db,"material_evidence",evidence_id)
         evidence_known, filter_known, filter_as_of = parse_kst(evidence["known_at"]), parse_kst(known_at), parse_kst(as_of)
     except (ValueError, TypeError):
+        if db.in_transaction: db.rollback()
         raise HTTPException(422, "evidence/filter timestamps must be KST ISO-8601")
+    except sqlite3.OperationalError as exc:
+        if db.in_transaction: db.rollback()
+        raise HTTPException(409, "filter serialization conflict") from exc
+    try:
+        if filter_known > filter_as_of:
+            raise HTTPException(422, "filter.known_at must be at or before as_of")
+        if evidence_known > filter_known:
+            raise HTTPException(422, "evidence.known_at must be at or before filter.known_at")
+        if evidence_known > filter_as_of:
+            raise HTTPException(422, "evidence.known_at must be at or before as_of")
+        unavailable = inputs.get("market_data_status") == "unavailable"
+        if unavailable:
+            if "market_data_known_at" in inputs:
+                raise HTTPException(422, "unavailable market data must not claim market_data_known_at")
+            try:
+                attempted_at = parse_kst(inputs.get("market_data_attempted_at"))
+            except (ValueError, TypeError):
+                raise HTTPException(422, "market_data_attempted_at must be KST ISO-8601")
+            if attempted_at > filter_known:
+                raise HTTPException(422, "market_data_attempted_at must be at or before filter.known_at")
+            if attempted_at > filter_as_of:
+                raise HTTPException(422, "market_data_attempted_at must be at or before as_of")
+        else:
+            try:
+                market_known = parse_kst(inputs.get("market_data_known_at"))
+            except (ValueError, TypeError):
+                raise HTTPException(422, "market_data_known_at must be KST ISO-8601")
+            if market_known > filter_known:
+                raise HTTPException(422, "market_data_known_at must be at or before filter.known_at")
+            if market_known > filter_as_of:
+                raise HTTPException(422, "market_data_known_at must be at or before as_of")
 
-    if filter_known > filter_as_of:
-        raise HTTPException(422, "filter.known_at must be at or before as_of")
-    if evidence_known > filter_known:
-        raise HTTPException(422, "evidence.known_at must be at or before filter.known_at")
-    if evidence_known > filter_as_of:
-        raise HTTPException(422, "evidence.known_at must be at or before as_of")
-    unavailable = inputs.get("market_data_status") == "unavailable"
-    if unavailable:
-        if "market_data_known_at" in inputs:
-            raise HTTPException(422, "unavailable market data must not claim market_data_known_at")
-        try:
-            attempted_at = parse_kst(inputs.get("market_data_attempted_at"))
-        except (ValueError, TypeError):
-            raise HTTPException(422, "market_data_attempted_at must be KST ISO-8601")
-        if attempted_at > filter_known:
-            raise HTTPException(422, "market_data_attempted_at must be at or before filter.known_at")
-        if attempted_at > filter_as_of:
-            raise HTTPException(422, "market_data_attempted_at must be at or before as_of")
-    else:
-        try:
-            market_known = parse_kst(inputs.get("market_data_known_at"))
-        except (ValueError, TypeError):
-            raise HTTPException(422, "market_data_known_at must be KST ISO-8601")
-        if market_known > filter_known:
+        out=run_filter(inputs,as_of,known_at)
+        if out["verdict"] == "FAIL" and "market data known_at future of filter known_at" in out["reasons"]:
             raise HTTPException(422, "market_data_known_at must be at or before filter.known_at")
-        if market_known > filter_as_of:
+        if out["verdict"] == "FAIL" and "market data known_at future of as_of" in out["reasons"]:
             raise HTTPException(422, "market_data_known_at must be at or before as_of")
 
-    out=run_filter(inputs,as_of,known_at)
-    if out["verdict"] == "FAIL" and "market data known_at future of filter known_at" in out["reasons"]:
-        raise HTTPException(422, "market_data_known_at must be at or before filter.known_at")
-    if out["verdict"] == "FAIL" and "market data known_at future of as_of" in out["reasons"]:
-        raise HTTPException(422, "market_data_known_at must be at or before as_of")
-    try:r=db.execute("INSERT INTO deterministic_filter_results(evidence_id,raw_inputs,computed_outputs,as_of,known_at,evidence_version,verdict,reasons,created_at) VALUES(?,?,?,?,?,?,?,?,?) RETURNING id",(evidence_id,canon(inputs),canon(out),as_of,known_at,evidence["version"],out["verdict"],canon(out["reasons"]),now())).fetchone()
-    except sqlite3.IntegrityError: raise HTTPException(409,"duplicate filter key")
-    audit(db,"internal","run","filter",r["id"]);db.commit();return filter_detail(db,r["id"])
+        raw_inputs = canon(inputs)
+        input_sha256 = hashlib.sha256(raw_inputs.encode()).hexdigest()
+        scope = (evidence_id, as_of, known_at, evidence["version"], FILTER_EVALUATOR_VERSION)
+        exact = db.execute("""SELECT id,parent_filter_id,raw_inputs FROM deterministic_filter_results
+          WHERE evidence_id=? AND as_of=? AND known_at=? AND evidence_version=?
+            AND evaluator_version=? AND input_sha256=?""", scope + (input_sha256,)).fetchone()
+        if exact and exact["raw_inputs"] == raw_inputs:
+            if exact["parent_filter_id"] != parent_filter_id:
+                raise HTTPException(409, "filter retry parent mismatch")
+            result = filter_detail(db, exact["id"])
+            result["idempotent"] = True
+            db.commit()
+            return result
+
+        head = db.execute("""SELECT f.id,f.lineage_version FROM deterministic_filter_results f
+          WHERE f.evidence_id=? AND f.as_of=? AND f.known_at=? AND f.evidence_version=?
+            AND f.evaluator_version=?
+            AND NOT EXISTS (SELECT 1 FROM deterministic_filter_results child WHERE child.parent_filter_id=f.id)
+          ORDER BY f.lineage_version DESC LIMIT 1""", scope).fetchone()
+        if head is None:
+            if parent_filter_id is not None:
+                raise HTTPException(409, "parent_filter_id is not the current filter head")
+            lineage_version = 1
+        else:
+            if parent_filter_id != head["id"]:
+                raise HTTPException(409, "parent_filter_id is not the current filter head")
+            lineage_version = head["lineage_version"] + 1
+
+        try:
+            saved=db.execute("""INSERT INTO deterministic_filter_results(
+              evidence_id,raw_inputs,computed_outputs,as_of,known_at,evidence_version,input_sha256,
+              evaluator_version,lineage_version,parent_filter_id,verdict,reasons,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id""",(
+                evidence_id,raw_inputs,canon(out),as_of,known_at,evidence["version"],input_sha256,
+                FILTER_EVALUATOR_VERSION,lineage_version,parent_filter_id,out["verdict"],canon(out["reasons"]),now()
+            )).fetchone()
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409,"filter lineage conflict") from exc
+        audit(db,"internal","run","filter",saved["id"])
+        result = filter_detail(db,saved["id"])
+        result["idempotent"] = False
+        db.commit()
+        return result
+    except Exception:
+        if db.in_transaction: db.rollback()
+        raise
 def filter_detail(db,ident):
-    d=dict(row(db,"deterministic_filter_results",ident)); d["raw_inputs"]=json.loads(d["raw_inputs"]);d["computed_outputs"]=json.loads(d["computed_outputs"]);d["reasons"]=json.loads(d["reasons"]);return d
+    d=dict(row(db,"deterministic_filter_results",ident)); d["raw_inputs"]=json.loads(d["raw_inputs"]); d["computed_outputs"]=json.loads(d["computed_outputs"]); d["reasons"]=json.loads(d["reasons"])
+    d["is_current"] = not bool(db.execute("SELECT 1 FROM deterministic_filter_results WHERE parent_filter_id=?", (ident,)).fetchone())
+    return d
 
 def save_card(db,data):
     try: card=validate_card(data["card"])
     except (KeyError, ValueError) as exc: raise HTTPException(422, f"structured card invalid: {exc}")
     ev=row(db,"material_evidence",data["evidence_id"]); fi=filter_detail(db,data["filter_id"])
     if fi["evidence_id"]!=ev["id"] or ev["status"]=="invalidated" or fi["evidence_version"] != ev["version"]: raise HTTPException(409,"card requires current active evidence filter")
+    if db.execute("SELECT 1 FROM deterministic_filter_results WHERE parent_filter_id=?", (fi["id"],)).fetchone(): raise HTTPException(409,"card requires current filter head")
     if card["filter_verdict"] != fi["verdict"]: raise HTTPException(422,"card source evidence/filter mismatch")
     # A deterministic PASS is evidence quality, not an automatic trading recommendation.
     # Any allowed final verdict may follow PASS; only 매수 검토 가능 can later be approved.
@@ -286,29 +349,25 @@ def user_card_view(db, ident, user_id):
     result["user_state"]={"decision":dict(decision) if decision else None,"order_plan":plan_view,"draft":({**dict(draft),"snapshot":json.loads(draft["snapshot_json"])} if draft else None),"default_paper_amount":_default_paper_amount(db, user_id)}
     return result
 
-def list_cards(db, missing=False, date=None, current_only=False):
-    """Date-scoped requests retain history; current-only lists show active heads."""
+def list_cards(db, missing=False, date=None, current_only=False, operation_date=False):
+    """Legacy dates use evidence.known_at; operation dates use collected/generated."""
     params = []
-    date_clause = ""
-    if date:
-        date_clause = " AND substr(known_at,1,10)=?"
-        params.append(date)
     if missing:
-        query = """SELECT id FROM material_evidence
-          WHERE status != 'invalidated' AND NOT EXISTS (
-            SELECT 1 FROM decision_cards c WHERE c.evidence_id=material_evidence.id
-          )""" + date_clause + " ORDER BY id DESC"
-        return [missing_evidence_view(db, item["id"]) for item in db.execute(query, params)]
-    query = """SELECT c.id FROM decision_cards c
-      JOIN material_evidence e ON e.id=c.evidence_id WHERE 1=1"""
+        clause = ""
+        if date:
+            clause = " AND date(" + ("collected_at" if operation_date else "known_at") + ",'+9 hours')=?"
+            params.append(date)
+        query = """SELECT id FROM material_evidence WHERE status != 'invalidated' AND NOT EXISTS (
+          SELECT 1 FROM decision_cards c WHERE c.evidence_id=material_evidence.id)""" + clause + " ORDER BY id DESC"
+        return [missing_evidence_view(db, item['id']) for item in db.execute(query, params)]
+    query = "SELECT c.id FROM decision_cards c JOIN material_evidence e ON e.id=c.evidence_id WHERE 1=1"
     if date:
-        query += " AND substr(e.known_at,1,10)=?"
+        query += " AND date(" + ("c.generated_at" if operation_date else "e.known_at") + ",'+9 hours')=?"
+        params.append(date)
     if current_only:
-        query += """ AND c.invalidated_at IS NULL
-          AND NOT EXISTS (SELECT 1 FROM decision_cards newer
-            WHERE newer.lineage_key=c.lineage_key AND newer.version>c.version
-              AND newer.invalidated_at IS NULL)"""
-    return [card_detail(db, item["id"]) for item in db.execute(query + " ORDER BY c.id DESC", params)]
+        query += """ AND c.invalidated_at IS NULL AND NOT EXISTS (SELECT 1 FROM decision_cards newer
+          WHERE newer.lineage_key=c.lineage_key AND newer.version>c.version AND newer.invalidated_at IS NULL)"""
+    return [card_detail(db, item['id']) for item in db.execute(query + " ORDER BY c.id DESC", params)]
 def _positive(value): return isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and value>0
 def _valid_plan(card):
     x=card["card"]; window=x.get("window") or {}

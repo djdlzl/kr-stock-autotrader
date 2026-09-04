@@ -21,6 +21,7 @@
 ## 실행 시작과 대상 고정
 
 - KST 실행일 `YYYY-MM-DD`와 `run_key=card-YYYY-MM-DD-0800-kst`를 만든다.
+- 이 KST 실행일이 scheduler run date이자 operation run date다. summary/detail/readback에서 날짜 축을 혼동하지 않는다.
 - `python -m kr_stock_autotrader.cli scheduler-start "$run_key" card`를 호출한다.
 - `today-evidence --date YYYY-MM-DD`와 `pending-cards`를 모두 조회한다.
 - `today-evidence`는 원문 공개일(`known_at`) 기준 교차검증용이다. 07:00 수집 작업은 전날 장후 공개 재료도 오늘 저장할 수 있으므로 이것만으로 처리 대상을 정하지 않는다.
@@ -29,6 +30,14 @@
 - `collected_at`이 과거 날짜인 미처리 evidence는 자동으로 섞지 않는다. 별도 복구 run에서만 처리한다.
 - 같은 evidence version, filter lineage, prompt version/hash로 이미 카드가 있으면 재생성하지 않는다.
 - 처리 대상이 0건이면 두 API readback 정상 여부를 확인한 뒤 `done`, count=0으로 종료한다.
+
+## scheduler 날짜 축 문서화
+
+- `known_at`은 원문이 세상에 알려진 시각이다. legacy `?date=YYYY-MM-DD` 교차검증 축에서만 그대로 본다.
+- `collected_at`은 evidence가 운영 DB에 수집된 시각이다. scheduler 대상 선정과 operation-date evidence/missing 집계는 이 KST 날짜 축을 쓴다.
+- `generated_at`은 decision card가 실제로 저장된 시각이다. operation-date card 집계와 카드 목록은 이 KST 날짜 축을 쓴다.
+- `created_at`은 deterministic filter row가 실제 append된 시각이다. operation-date filter 집계는 이 KST 날짜 축을 쓴다.
+- scheduler summary에서 run date는 operation run date를 뜻한다. 즉 어떤 run이 어떤 날 08:00 KST에 수행됐는지의 축이며, evidence/filter/card 집계 축은 위 각 timestamp 규칙을 명시적으로 따른다.
 
 ## 시간·known-at 규칙
 
@@ -42,13 +51,15 @@
 
 ## 08:00 snapshot → filter → card 실행 연결
 
-각 eligible evidence마다 `announcement_at`를 포함해 아래 순서로 실제 API/CLI를 호출한다. snapshot의 `filter_inputs`에서 숫자/관측가능성 필드를 임의 변경하지 말고, evidence에서 확인된 `source`, `announcement_at`, `economic_terms`, 중복/상충 여부만 안전하게 merge한다.
+각 eligible evidence마다 `announcement_at`를 포함해 아래 순서로 실제 API/CLI를 호출한다. snapshot의 `filter_inputs` 전체 객체를 그대로 사용하고 숫자/관측가능성/임계값 필드를 임의 변경하지 않는다. `evidence 필드만 merge`한다. 즉 evidence에서 확인된 `source`, `announcement_at`, `economic_terms`, 중복/상충 여부만 안전하게 merge한다.
 
 1. `market-snapshot SYMBOL AS_OF --announcement-at ANNOUNCEMENT_AT`를 호출한다.
 2. snapshot `status != ok` 또는 filter inputs `market_data_status=unavailable`이면 snapshot의 실제 `market_data_attempted_at`를 **filter `known_at`과 `as_of` 모두로 사용**해 market-data unavailable filter를 실행하고, 비매수 `판단 보류` 카드만 저장한다. requested historical as_of보다 attempt가 늦으면 422/error로 종료하며 과거 시장자료라고 backdate하지 않는다. API 오류를 무시하거나 null/0을 만들어 PASS시키지 않는다.
 3. 정상 snapshot은 merged JSON으로 `filter-run`을 실행하고 `filter-detail`로 filter ID, verdict, reasons, computed units를 readback한다.
 4. `card-request`로 immutable input package를 읽어 prompt에 따라 카드를 만들고 `card-save-result`로 저장한다. 항상 `card-detail` readback으로 lineage/filter/prompt hash를 확인한다.
 5. filter FAIL 또는 unavailable이면 card verdict는 `판단 보류`/`관찰`/`제외`만 가능하며 주문 필드는 null이다. 이 job은 order_plans, order_fills, positions, order_events, allocation을 생성하지 않는다.
+6. correction 실행이면 먼저 현재 evidence lineage의 `현재 head filter ID`를 확인한다. correction request에는 반드시 그 값을 `"parent_filter_id"`로 보낸다.
+7. correction 응답에서는 append-only successor만 허용한다. 응답으로 받은 successor filter `id`를 즉시 readback하고, 카드 저장과 `card-request`/`card-save-result`에는 반드시 그 successor를 사용한다. 즉 응답으로 받은 successor filter ID가 카드에 연결되는 유일한 filter ID다. 이전 parent filter ID로 카드를 만들거나 history row를 덮어쓰지 않는다.
 
 ## 1단계: evidence 무결성 검토
 
@@ -82,7 +93,7 @@
 - CB·BW·유상증자·오버행·상충 악재
 - 원문·발표시각·경제조건 존재 여부
 
-backend `filter-run` 입력에는 다음 필드를 정확히 포함한다.
+backend `filter-run` 입력에는 snapshot이 준 `filter_inputs` 전체 객체와 evidence merge 필드를 함께 정확히 포함한다. v2 snapshot 예시는 다음과 같다.
 
 ```json
 {
@@ -99,6 +110,10 @@ backend `filter-run` 입력에는 다음 필드를 정확히 포함한다.
     "recent_rise_pct": null,
     "gap_pct": null,
     "pre_announcement_return_pct": null,
+    "observability": {
+      "current_volume": "observable|not_yet_observable|unknown",
+      "gap_pct": "observable|not_yet_observable|unknown"
+    },
     "source": "출처",
     "announcement_at": "KST ISO-8601",
     "economic_terms": "검증된 경제조건 또는 명시적 unknown",
@@ -109,6 +124,23 @@ backend `filter-run` 입력에는 다음 필드를 정확히 포함한다.
     "max_recent_rise_pct": "운영 기준 숫자",
     "max_gap_pct": "운영 기준 숫자",
     "max_pre_return_pct": "운영 기준 숫자",
+    "filter_config_version": "giraffe-premarket-filter-v2-short-term-priced-in",
+    "short_term_rise_sessions": 2,
+    "max_short_term_excess_rise_pct": 10.0,
+    "short_term_stock_return_pct": 2.0,
+    "short_term_benchmark_return_pct": 1.0,
+    "short_term_excess_return_pct": 1.0,
+    "short_term_window": {
+      "sessions": 2,
+      "start": "2026-09-01",
+      "end": "2026-09-03",
+      "ended_known_at": "2026-09-03T15:30:00+09:00"
+    },
+    "short_term_provenance": {
+      "source": "KIS",
+      "daily_bars_known_at": "2026-09-03T15:30:00+09:00",
+      "market_data_known_at": "2026-09-04T08:00:03+09:00"
+    },
     "duplicate": false,
     "recycled": false,
     "low_certainty_terms": "",
@@ -121,6 +153,9 @@ backend `filter-run` 입력에는 다음 필드를 정확히 포함한다.
   "known_at": "KST ISO-8601"
 }
 ```
+
+- `trading_status`, `trading_value`, `market_cap`, `stock_return_pct`, `benchmark_return_pct`, `sector_return_pct`, `current_volume`, `baseline_volume`, `recent_rise_pct`, `gap_pct`, `pre_announcement_return_pct`, `observability`, `min_trading_value`, `min_market_cap`, `max_market_cap`, `max_recent_rise_pct`, `max_gap_pct`, `max_pre_return_pct`, `filter_config_version`, `short_term_rise_sessions`, `max_short_term_excess_rise_pct`, `short_term_stock_return_pct`, `short_term_benchmark_return_pct`, `short_term_excess_return_pct`, `short_term_window`, `short_term_provenance`, `market_data_known_at`를 포함한 snapshot `filter_inputs` 전체 객체를 drop 없이 유지한다.
+- merge는 evidence-only다. snapshot에 이미 있는 시장 데이터·임계값·관측가능성·short-term provenance 구조는 바꾸지 않는다.
 
 - 운영 임계값은 기존 중앙 ENV/운영계약에서 읽는다. 찾을 수 없으면 임의 숫자를 만들지 말고 누락으로 FAIL-closed시킨다.
 - 검증되지 않은 수치는 `null`로 둔다.

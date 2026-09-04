@@ -1,6 +1,79 @@
 """Small SQLite persistence boundary. Every plan query is user scoped."""
+import hashlib
+import json
 import sqlite3
 from .config import DATABASE_PATH
+
+
+FILTER_EVALUATOR_VERSION = "deterministic-filter-contract-v2"
+
+
+def _filter_table_ddl(name: str = "deterministic_filter_results") -> str:
+    return f"""CREATE TABLE {name} (
+      id INTEGER PRIMARY KEY, evidence_id INTEGER NOT NULL REFERENCES material_evidence(id), raw_inputs TEXT NOT NULL, computed_outputs TEXT NOT NULL,
+      as_of TEXT NOT NULL, known_at TEXT NOT NULL, evidence_version INTEGER NOT NULL DEFAULT 1,
+      input_sha256 TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK(length(input_sha256)=64), evaluator_version TEXT NOT NULL DEFAULT 'legacy',
+      lineage_version INTEGER NOT NULL DEFAULT 1 CHECK(lineage_version >= 1), parent_filter_id INTEGER REFERENCES deterministic_filter_results(id),
+      verdict TEXT NOT NULL CHECK(verdict IN ('PASS','FAIL')), reasons TEXT NOT NULL, created_at TEXT NOT NULL
+    )"""
+
+
+def _canonical_input_sha256(raw_inputs: str) -> str:
+    """Backfill hashes without rewriting legacy raw input bytes."""
+    try:
+        value = json.dumps(json.loads(raw_inputs), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        value = raw_inputs
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _migrate_filter_lineage(db: sqlite3.Connection) -> None:
+    """Replace the legacy one-row-per-scope constraint with an append-only chain."""
+    table = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='deterministic_filter_results'"
+    ).fetchone()
+    columns = {item["name"] for item in db.execute("PRAGMA table_info(deterministic_filter_results)")}
+    required = {"input_sha256", "evaluator_version", "lineage_version", "parent_filter_id"}
+    normalized_sql = "" if not table or not table["sql"] else "".join(table["sql"].upper().split())
+    legacy_unique = "UNIQUE(EVIDENCE_ID,AS_OF,KNOWN_AT,EVIDENCE_VERSION)" in normalized_sql
+    if required <= columns and not legacy_unique:
+        return
+
+    db.commit()
+    db.execute("PRAGMA foreign_keys=OFF")
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(_filter_table_ddl("deterministic_filter_results_new"))
+        for item in db.execute("SELECT * FROM deterministic_filter_results ORDER BY id").fetchall():
+            values = dict(item)
+            db.execute(
+                """INSERT INTO deterministic_filter_results_new(
+                  id,evidence_id,raw_inputs,computed_outputs,as_of,known_at,evidence_version,
+                  input_sha256,evaluator_version,lineage_version,parent_filter_id,verdict,reasons,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    values["id"], values["evidence_id"], values["raw_inputs"], values["computed_outputs"],
+                    values["as_of"], values["known_at"], values.get("evidence_version", 1),
+                    values.get("input_sha256") or _canonical_input_sha256(values["raw_inputs"]),
+                    values.get("evaluator_version") or FILTER_EVALUATOR_VERSION,
+                    values.get("lineage_version") or 1, values.get("parent_filter_id"),
+                    values["verdict"], values["reasons"], values["created_at"],
+                ),
+            )
+        db.execute("DROP TABLE deterministic_filter_results")
+        db.execute("ALTER TABLE deterministic_filter_results_new RENAME TO deterministic_filter_results")
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.execute("PRAGMA foreign_keys=ON")
+
+    violations = db.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise sqlite3.IntegrityError("filter lineage migration broke foreign keys")
+    if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise sqlite3.IntegrityError("filter lineage migration failed integrity check")
 
 
 def connect() -> sqlite3.Connection:
@@ -26,8 +99,9 @@ def connect() -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS deterministic_filter_results (
       id INTEGER PRIMARY KEY, evidence_id INTEGER NOT NULL REFERENCES material_evidence(id), raw_inputs TEXT NOT NULL, computed_outputs TEXT NOT NULL,
       as_of TEXT NOT NULL, known_at TEXT NOT NULL, evidence_version INTEGER NOT NULL DEFAULT 1,
-      verdict TEXT NOT NULL CHECK(verdict IN ('PASS','FAIL')), reasons TEXT NOT NULL, created_at TEXT NOT NULL,
-      UNIQUE(evidence_id, as_of, known_at, evidence_version)
+      input_sha256 TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK(length(input_sha256)=64), evaluator_version TEXT NOT NULL DEFAULT 'legacy',
+      lineage_version INTEGER NOT NULL DEFAULT 1 CHECK(lineage_version >= 1), parent_filter_id INTEGER REFERENCES deterministic_filter_results(id),
+      verdict TEXT NOT NULL CHECK(verdict IN ('PASS','FAIL')), reasons TEXT NOT NULL, created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS decision_cards (
       id INTEGER PRIMARY KEY, lineage_key TEXT NOT NULL, version INTEGER NOT NULL, evidence_id INTEGER NOT NULL REFERENCES material_evidence(id),
@@ -103,6 +177,13 @@ def connect() -> sqlite3.Connection:
     ):
         if column not in {col["name"] for col in db.execute(f"PRAGMA table_info({table})")}:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    _migrate_filter_lineage(db)
+    db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_filter_lineage_version
+      ON deterministic_filter_results(evidence_id,as_of,known_at,evidence_version,evaluator_version,lineage_version)""")
+    db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_filter_canonical_input
+      ON deterministic_filter_results(evidence_id,as_of,known_at,evidence_version,evaluator_version,input_sha256)""")
+    db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_filter_parent
+      ON deterministic_filter_results(parent_filter_id) WHERE parent_filter_id IS NOT NULL""")
     # Legacy SQLite cannot safely add NOT NULL lineage columns without a table
     # rebuild.  We keep this migration additive/repeat-safe and fail closed in
     # event_scenarios.create when modern records lack valid lineage.

@@ -9,11 +9,12 @@ from kr_stock_autotrader.decision_cards import create_evidence, mutate_evidence,
 from tests.test_decision_card_invariants import card, raw
 
 
-def _seed(db, key, known_at, *, make_card=True, delayed_at=None, invalid=False):
+def _seed(db, key, known_at, *, make_card=True, delayed_at=None, invalid=False, collected_at=None):
     evidence = create_evidence(db, {
         "symbol": "005930", "name": "삼성전자", "kind": "공시", "title": key,
         "summary": "호재", "source": "DART", "source_url": "https://example.test/e",
         "snapshot": {"key": key}, "dedupe_key": key, "known_at": known_at,
+        "collected_at": collected_at or known_at,
         "announcement_at": known_at,
     })
     if invalid:
@@ -120,8 +121,9 @@ def test_date_ui_has_server_date_picker_lifecycle_notice_and_mobile_constraints(
     for text in ("재료 업무일", "카드 생성시각", "원문 발표시각", "카드 버전", "무효", "기준일", "type=\"date\"", "fresh quote/tick", "동결 조건 재검증", "overflow-x:hidden"):
         assert text in html
     assert "cards/summary'+q" in html and "cards/missing'+q" in html
-    assert "api('cards')" in html and "api('cards'+q)" not in html
-    assert "모든 기준일의 현재 카드" in html and "요약과 카드 미생성 목록에만 적용" in html
+    assert "api('cards'+q)" in html and "api('cards')" not in html
+    assert "c.evidence.collected_at" in html and "c.evidence.known_at?.slice" not in html
+    assert "모든 기준일의 현재 카드" not in html and "요약과 카드 미생성 목록에만 적용" not in html
 
 
 def test_previous_business_day_is_timezone_independent():
