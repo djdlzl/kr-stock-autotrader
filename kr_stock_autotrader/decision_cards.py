@@ -300,33 +300,36 @@ def current_filter_head(db, evidence_id, as_of, known_at):
     return filter_detail(db, head["id"])
 
 def save_card(db,data):
+    """One transaction owns card lineage, audit/status and conditional append."""
     try: card=validate_card(data["card"])
     except (KeyError, ValueError) as exc: raise HTTPException(422, f"structured card invalid: {exc}")
-    ev=row(db,"material_evidence",data["evidence_id"]); fi=filter_detail(db,data["filter_id"])
-    if fi["evidence_id"]!=ev["id"] or ev["status"]=="invalidated" or fi["evidence_version"] != ev["version"]: raise HTTPException(409,"card requires current active evidence filter")
-    if db.execute("SELECT 1 FROM deterministic_filter_results WHERE parent_filter_id=?", (fi["id"],)).fetchone(): raise HTTPException(409,"card requires current filter head")
-    if card["filter_verdict"] != fi["verdict"]: raise HTTPException(422,"card source evidence/filter mismatch")
-    # A deterministic PASS is evidence quality, not an automatic trading recommendation.
-    # Any allowed final verdict may follow PASS; only 매수 검토 가능 can later be approved.
-    if fi["verdict"] == "FAIL" and card["verdict"] == "매수 검토 가능": raise HTTPException(422,"FAIL filter cannot be buy-review")
-    lineage=data.get("lineage_key",f"{ev['symbol']}:{ev['id']}"); version=db.execute("SELECT COALESCE(MAX(version),0)+1 n FROM decision_cards WHERE lineage_key=?",(lineage,)).fetchone()["n"]
-    if version>1:
-        old_ids=[item["id"] for item in db.execute("SELECT id FROM decision_cards WHERE lineage_key=?", (lineage,))]
-        for old_id in old_ids:
-            invalidate_lineage(db, card_id=old_id, reason="new_card")
-    r=db.execute("INSERT INTO decision_cards(lineage_key,version,evidence_id,filter_id,prompt_version,prompt_hash,model,provider,card_json,schema_version,verdict,confidence,generated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",(lineage,version,ev["id"],fi["id"],data.get("prompt_version","decision-card-v1"),prompt_hash(),data["model"],data["provider"],canon(card),card["schema_version"],card["verdict"],float(card["confidence"]),now())).fetchone()
-    db.execute("UPDATE material_evidence SET status='card_generated',updated_at=? WHERE id=?",(now(),ev["id"]))
-    audit(db,"internal","save","decision_card",r["id"]);db.commit()
-    result = card_detail(db,r["id"])
-    # Post-persistence only: an incomplete evidence-only candidate leaves the
-    # immutable card untouched.  A complete judgment-hold candidate is a
-    # separate append-only scenario set, never a valuation or order artifact.
-    if result["card"].get("verdict") == "판단 보류":
-        from .conditional_scenarios import build_scenario_candidate, create as create_conditional_scenario
-        candidate = build_scenario_candidate(evidence_detail(db, ev["id"]), result)
-        if candidate["status"] == "COMPLETE":
-            create_conditional_scenario(db, candidate["payload"])
-    return result
+    try:
+        # connect() may have performed repeat-safe schema DDL; close that setup
+        # transaction before acquiring the owner transaction for this save.
+        if db.in_transaction: db.commit()
+        db.execute("BEGIN IMMEDIATE")
+        ev=row(db,"material_evidence",data["evidence_id"]); fi=filter_detail(db,data["filter_id"])
+        if fi["evidence_id"]!=ev["id"] or ev["status"]=="invalidated" or fi["evidence_version"] != ev["version"]: raise HTTPException(409,"card requires current active evidence filter")
+        if db.execute("SELECT 1 FROM deterministic_filter_results WHERE parent_filter_id=?", (fi["id"],)).fetchone(): raise HTTPException(409,"card requires current filter head")
+        if card["filter_verdict"] != fi["verdict"]: raise HTTPException(422,"card source evidence/filter mismatch")
+        if fi["verdict"] == "FAIL" and card["verdict"] == "매수 검토 가능": raise HTTPException(422,"FAIL filter cannot be buy-review")
+        lineage=data.get("lineage_key",f"{ev['symbol']}:{ev['id']}"); version=db.execute("SELECT COALESCE(MAX(version),0)+1 n FROM decision_cards WHERE lineage_key=?",(lineage,)).fetchone()["n"]
+        if version>1:
+            for old in db.execute("SELECT id FROM decision_cards WHERE lineage_key=?", (lineage,)): invalidate_lineage(db, card_id=old["id"], reason="new_card")
+        r=db.execute("INSERT INTO decision_cards(lineage_key,version,evidence_id,filter_id,prompt_version,prompt_hash,model,provider,card_json,schema_version,verdict,confidence,generated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",(lineage,version,ev["id"],fi["id"],data.get("prompt_version","decision-card-v1"),prompt_hash(),data["model"],data["provider"],canon(card),card["schema_version"],card["verdict"],float(card["confidence"]),now())).fetchone()
+        result=card_detail(db,r["id"])
+        # Mark active inside the same owner transaction before validating the
+        # conditional lineage; a failure below rolls this status back too.
+        db.execute("UPDATE material_evidence SET status='card_generated',updated_at=? WHERE id=?",(now(),ev["id"]))
+        if result["card"].get("verdict") == "판단 보류":
+            from .conditional_scenarios import build_scenario_candidate, create as create_conditional_scenario
+            candidate=build_scenario_candidate(evidence_detail(db,ev["id"]),result)
+            if candidate["status"] == "COMPLETE": create_conditional_scenario(db,candidate["payload"],commit=False)
+        db.execute("UPDATE material_evidence SET status='card_generated',updated_at=? WHERE id=?",(now(),ev["id"]))
+        audit(db,"internal","save","decision_card",r["id"]); db.commit(); return result
+    except Exception:
+        if db.in_transaction: db.rollback()
+        raise
 def card_detail(db,ident):
     d=dict(row(db,"decision_cards",ident));d["card"]=json.loads(d.pop("card_json"));return d
 def user_fill_summary(db, card_id, user_id):
@@ -507,7 +510,9 @@ def user_card_view(db, ident, user_id):
         plan_view["position"]=dict(db.execute("SELECT symbol,qty,avg_price,status FROM positions WHERE order_plan_id=?",(plan["id"],)).fetchone() or {})
         plan_view["exit_lineage"]=[dict(x) for x in db.execute("SELECT rule,quote_known_at,created_at FROM exit_lineage WHERE order_plan_id=? ORDER BY id",(plan["id"],))]
     result["event_scenarios"]=[]
-    for scenario in db.execute("SELECT id,version,frozen_at,expected_value_krw,scenario_kind,scenario_schema_version,scenarios_json FROM event_scenario_sets WHERE card_id=? ORDER BY id DESC",(ident,)):
+    scenarios = list(db.execute("SELECT id,version,frozen_at,expected_value_krw,scenario_kind,scenario_schema_version,scenarios_json FROM event_scenario_sets WHERE card_id=?",(ident,)))
+    scenarios += list(db.execute("SELECT id,version,frozen_at,NULL AS expected_value_krw,'CONDITIONAL' AS scenario_kind,1 AS scenario_schema_version,scenarios_json FROM event_conditional_scenario_sets WHERE card_id=?",(ident,)))
+    for scenario in sorted(scenarios, key=lambda item: item["id"], reverse=True):
         is_conditional = scenario["scenario_kind"] == "CONDITIONAL"
         observations=[] if is_conditional else [dict(x) for x in db.execute("""SELECT known_at,retrieved_at,provider,source,
             CASE WHEN provider='KIS' THEN 'network_retrieved_at' ELSE NULL END AS timestamp_source,
