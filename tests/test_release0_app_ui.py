@@ -419,7 +419,7 @@ def test_release0_bottom_sheet_swipe_contract():
     node = r'''
 let closeCalls=0,captures=0;const listeners={};
 const cls=()=>({items:new Set(),add(x){this.items.add(x)},remove(...x){x.forEach(y=>this.items.delete(y))},contains(x){return this.items.has(x)}});
-const sheet={style:{}};const dialog={hidden:false,classList:cls(),querySelector:()=>sheet};
+const sheet={style:{},scrollTop:0,addEventListener:(type,fn)=>listeners[type]=fn,setPointerCapture:()=>captures++,releasePointerCapture:()=>{}};const dialog={hidden:false,classList:cls(),querySelector:()=>sheet};
 const handle={addEventListener:(type,fn)=>listeners[type]=fn,setPointerCapture:()=>captures++,releasePointerCapture:()=>{}};
 const $=s=>s==='#detail'?dialog:handle;const window={innerHeight:600};const closeDetail=()=>closeCalls++;
 ''' + motion + r'''
@@ -441,6 +441,40 @@ console.log(JSON.stringify({upward,horizontal,badTime,rejectedTypes,qualified,af
         "rejectedTypes": {"closeCalls": 0, "captures": 0},
         "qualified": 2,
         "after": {"closeCalls": 2, "transform": "", "drag": False},
+    }
+
+
+def test_release0_sheet_wide_swipe_at_scroll_top_contains_overscroll():
+    """TDD: shipped handlers claim only top-of-scroll body drags and contain Safari overscroll."""
+    html = authenticated_app_html()
+    script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+    motion = re.search(r"const sheetGesture=.*?(?=const today)", script, re.S).group(0)
+    node = r'''
+let closeCalls=0,captures=0,releases=0;const listeners={};
+const cls=()=>({items:new Set(),add(x){this.items.add(x)},remove(...x){x.forEach(y=>this.items.delete(y))},contains(x){return this.items.has(x)}});
+const sheet={style:{},scrollTop:0,addEventListener:(type,fn,opts)=>listeners[type]={fn,opts},setPointerCapture:()=>captures++,releasePointerCapture:()=>releases++};
+const dialog={hidden:false,classList:cls(),querySelector:()=>sheet};
+const $=s=>s==='#detail'?dialog:null;const window={innerHeight:600};const closeDetail=()=>closeCalls++;
+''' + motion + r'''
+const body={closest:()=>null},button={closest:sel=>sel==='button,input,select,textarea,a,[contenteditable="true"],[role="button"],[role="link"],[data-sheet-gesture-ignore]'?button:null};
+const fire=(type,e={})=>{let prevented=false;const event={pointerType:'touch',isPrimary:true,pointerId:1,clientX:0,clientY:0,timeStamp:100,target:body,cancelable:true,preventDefault:()=>prevented=true,...e,type};listeners[type].fn(event);return prevented};
+const drag=(target,scrollTop,up={clientY:130,timeStamp:250})=>{sheet.scrollTop=scrollTop;fire('pointerdown',{target,timeStamp:100});const prevented=fire('pointermove',{target,clientY:130,timeStamp:200});fire('pointerup',{target,...up});return prevented};
+const topPrevented=drag(body,0);const top={closeCalls,captures,releases,prevented:topPrevented,transform:sheet.style.transform,drag:dialog.classList.contains('is-dragging')};
+const beforeInteractive=closeCalls;const interactivePrevented=drag(button,0);const interactive={closed:closeCalls-beforeInteractive,prevented:interactivePrevented,captures};
+const beforeScrolled=closeCalls;const scrolledPrevented=drag(body,40);const scrolled={closed:closeCalls-beforeScrolled,prevented:scrolledPrevented,captures,transform:sheet.style.transform};
+sheet.scrollTop=0;fire('pointerdown',{timeStamp:300});const shortPrevented=fire('pointermove',{clientY:8,timeStamp:310});fire('pointerup',{clientY:8,timeStamp:320});
+sheet.scrollTop=0;fire('pointerdown',{timeStamp:400});const cancelPrevented=fire('pointermove',{clientY:130,timeStamp:410});fire('pointercancel',{clientY:130,timeStamp:420});
+sheet.scrollTop=0;fire('pointerdown',{timeStamp:500});fire('pointermove',{clientY:130,timeStamp:510});fire('lostpointercapture',{clientY:130,timeStamp:520});
+console.log(JSON.stringify({top,interactive,scrolled,shortPrevented,cancelPrevented,after:{closeCalls,transform:sheet.style.transform,drag:dialog.classList.contains('is-dragging')}}));
+'''
+    state = json.loads(subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip())
+    assert state == {
+        "top": {"closeCalls": 1, "captures": 1, "releases": 1, "prevented": True, "transform": "", "drag": False},
+        "interactive": {"closed": 0, "prevented": False, "captures": 1},
+        "scrolled": {"closed": 0, "prevented": False, "captures": 1, "transform": ""},
+        "shortPrevented": True,
+        "cancelPrevented": True,
+        "after": {"closeCalls": 1, "transform": "", "drag": False},
     }
 
 
@@ -475,15 +509,7 @@ def test_release0_bottom_sheet_sync_lost_capture_is_reentrancy_safe():
     node = r'''
 let closeCalls=0,captures=0,releases=0;const listeners={};
 const cls=()=>({items:new Set(),add(x){this.items.add(x)},remove(...x){x.forEach(y=>this.items.delete(y))},contains(x){return this.items.has(x)}});
-const sheet={style:{}};const dialog={hidden:false,classList:cls(),querySelector:()=>sheet};
-const handle={
-  addEventListener:(type,fn)=>listeners[type]=fn,
-  setPointerCapture:()=>captures++,
-  releasePointerCapture:id=>{
-    releases++;
-    listeners.lostpointercapture({pointerType:'touch',isPrimary:true,pointerId:id,clientX:0,clientY:130,timeStamp:120,type:'lostpointercapture',preventDefault:()=>{}});
-  },
-};
+const sheet={style:{},scrollTop:0,addEventListener:(type,fn)=>listeners[type]=fn,setPointerCapture:()=>captures++,releasePointerCapture:id=>{releases++;listeners.lostpointercapture({pointerType:'touch',isPrimary:true,pointerId:id,clientX:0,clientY:130,timeStamp:120,type:'lostpointercapture',preventDefault:()=>{}})}};const dialog={hidden:false,classList:cls(),querySelector:()=>sheet};
 const $=s=>s==='#detail'?dialog:handle;const window={innerHeight:600};const closeDetail=()=>closeCalls++;
 ''' + motion + r'''
 const fire=(type,e={})=>listeners[type]({pointerType:'touch',isPrimary:true,pointerId:1,clientX:0,clientY:0,timeStamp:100,preventDefault:()=>{},...e,type});
