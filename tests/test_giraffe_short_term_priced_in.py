@@ -70,14 +70,12 @@ def test_short_term_excess_blocks_promotion_and_reports_units_window(monkeypatch
     assert result["units"]["short_term_excess_return_pct"].startswith("percent;")
 
 
-def test_card_detail_ui_has_visible_approval_cta_and_separate_sections():
+def test_card_detail_ui_prioritizes_release0_read_only_sections():
     from kr_stock_autotrader.ui import APP_HTML
-    for text in ("재료 정보", "판단 카드", "매수 승인", "승인할 수 없는 이유", "short_term_excess_return_pct", "short_term_window"):
+    for text in ("무엇이 달라졌나", "현재 판단", "지금 할 일과 다음 확인 항목", "판단을 막는 누락·충돌", "자동화 단계"):
         assert text in APP_HTML
-    assert "buy?draftForm(values,plan,id)" not in APP_HTML
-    for text in ("material-section", "judgment-section", "#f59e0b", "#2563eb"):
-        assert text in APP_HTML
-
+    for text in ("매수 승인", "short_term_excess_return_pct", "수익률"):
+        assert text not in APP_HTML
 
 def test_manager_card7_completed_close_denominator_order_and_boundaries(monkeypatch):
     """Card 7's supplied rows prove the v2 gate uses only completed close data."""

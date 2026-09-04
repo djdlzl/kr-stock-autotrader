@@ -24,7 +24,7 @@ def test_signup_login_logout_navigation_and_json_contracts():
     assert client.get("/", follow_redirects=False).headers["location"] == "/app"
     app_page = client.get("/app")
     assert app_page.status_code == 200
-    for expected in ("결정 카드", "카드 미생성", "매수 검토 가능", "로그아웃"):
+    for expected in ("오늘 판단이 필요한 종목", "판단 상세", "로그아웃"):
         assert expected in app_page.text
     logout = client.post("/api/logout")
     assert logout.status_code == 200 and logout.json() == {"ok": True}
@@ -33,14 +33,15 @@ def test_signup_login_logout_navigation_and_json_contracts():
     assert login.status_code == 200 and login.json() == {"ok": True}
 
 
-def test_app_shell_source_has_responsive_accessibility_and_decision_controls():
+def test_app_shell_source_has_responsive_accessibility_and_record_only_controls():
     client = TestClient(app)
     assert client.post("/api/signup", json={"email": "ux-smoke@test.com", "password": "long-password"}).status_code == 200
     html = client.get("/app").text
     for required in (
         "--primary:#2563eb", "--primary-low:#eff6ff", "min-height:44px", ":focus-visible",
-        "@media(max-width:700px)", "@media(max-width:390px)", "prefers-reduced-motion",
-        "카드 미생성", "근거 무효화 조건", "confirm(", "세션이 만료되었습니다",
+        "@media(max-width:390px)", "prefers-reduced-motion", "role=\"dialog\"", "aria-modal=\"true\"",
+        "세션이 만료되었습니다", "현재 단계: 기록 전용", "주문 기능 없음",
     ):
         assert required in html
-    assert "디버그 JSON" not in html and "새 매수 계획" not in html
+    for forbidden in ("디버그 JSON", "새 매수 계획", "매수 승인", "수동 매도"):
+        assert forbidden not in html

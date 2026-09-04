@@ -53,28 +53,24 @@ def test_auth_shell_is_login_only_without_signup_controls_or_code():
         assert forbidden not in html
 
 
-def test_decision_card_dashboard_has_scrollable_tabs_and_no_legacy_execution_ctas():
+def test_release0_dashboard_is_change_first_and_has_no_execution_controls():
     client = TestClient(app)
     assert client.post("/api/signup", json={"email":"aria-stepper@test.com","password":"long-password"}).status_code == 200
     html = client.get("/app").text
-    assert 'aria-label="카드 필터"' in html and 'overflow-x:auto' in html
-    assert "새 매수 계획" not in html and "시세 입력" not in html
+    for required in ('오늘 판단이 필요한 종목', '마지막 확인 이후 중요한 변화가 있는 종목만 표시합니다.', 'role="dialog"', 'aria-modal="true"'):
+        assert required in html
+    for forbidden in ('새 매수 계획', '시세 입력', '매수 승인', '수동 매도'):
+        assert forbidden not in html
 
-def test_decision_card_accessibility_controls_and_mobile_rules():
+
+def test_release0_accessibility_controls_and_mobile_rules():
     client = TestClient(app)
     assert client.post("/api/signup", json={"email":"form-accessibility@test.com","password":"long-password"}).status_code == 200
     html = client.get("/app").text
-    for marker in ("min-height:44px", ":focus-visible", "overflow-x:hidden", "@media(max-width:390px)", "prefers-reduced-motion"):
+    for marker in ("min-height:44px", ":focus-visible", "@media(max-width:390px)", "prefers-reduced-motion", "visibleFocusable", "inert"):
         assert marker in html
 
-def test_decision_card_ui_uses_safe_korean_formatting_and_no_raw_json():
-    from kr_stock_autotrader.ui import APP_HTML
-    assert 'function korean' in APP_HTML and '해당 없음' in APP_HTML and 'innerHTML=JSON.stringify' not in APP_HTML
 
-def test_decision_card_ui_has_order_type_select_and_kst_conversion():
+def test_release0_ui_uses_safe_korean_formatting_and_no_raw_json():
     from kr_stock_autotrader.ui import APP_HTML
-    assert 'name="order_type"' in APP_HTML and 'function isoKst' in APP_HTML and 'function localValue' in APP_HTML
-
-def test_decision_card_ui_has_order_draft_and_explicit_close_confirmation():
-    from kr_stock_autotrader.ui import APP_HTML
-    assert '근거 무효화 조건' in APP_HTML and '수동 전량 매도' in APP_HTML and 'confirm(' in APP_HTML
+    assert 'function korean' in APP_HTML and '확인 필요' in APP_HTML and 'innerHTML=JSON.stringify' not in APP_HTML

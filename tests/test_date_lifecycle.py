@@ -118,31 +118,21 @@ def test_all_date_cards_show_only_current_active_versions_and_user_fill_states(m
     assert owner.get("/api/cards?date=not-a-date").status_code == 422
 
 
-def test_date_ui_has_server_date_picker_lifecycle_notice_and_mobile_constraints(monkeypatch, tmp_path):
+def test_date_ui_keeps_operation_date_contract_and_mobile_constraints(monkeypatch, tmp_path):
     monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "ui.db"))
     from app import app
     client = TestClient(app)
     assert client.post("/api/signup", json={"email": "ui-date@test.com", "password": "long-password"}).status_code == 200
     html = client.get("/app").text
-    for text in ("재료 업무일", "카드 생성시각", "원문 발표시각", "카드 버전", "무효", "기준일", "type=\"date\"", "fresh quote/tick", "동결 조건 재검증", "overflow-x:hidden"):
+    for text in ("선택 운영일", "type=\"date\"", "@media(max-width:390px)", "현재 정보를 갱신하지 못했습니다"):
         assert text in html
     assert "cards/summary'+q" in html and "cards/missing'+q" in html
     assert "api('cards'+q)" in html and "api('cards')" not in html
-    assert "c.evidence.collected_at" in html and "c.evidence.known_at?.slice" not in html
-    assert "모든 기준일의 현재 카드" not in html and "요약과 카드 미생성 목록에만 적용" not in html
 
-
-def test_previous_business_day_is_timezone_independent():
-    """The browser's local zone must not move a KST calendar date back two days."""
+def test_date_ui_does_not_add_a_client_side_legacy_date_axis():
     from kr_stock_autotrader.ui import APP_HTML
-    helper = re.search(r"const previousBusinessDate=(day=>\{.*?\});", APP_HTML).group(1)
-    for zone in ("Pacific/Kiritimati", "Asia/Seoul", "America/Los_Angeles"):
-        output = subprocess.check_output(
-            ["node", "-e", f"console.log(({helper})('2026-09-01'))"],
-            text=True, env={**os.environ, "TZ": zone},
-        ).strip()
-        assert output == "2026-08-31"
-
+    assert 'operation_date=${day}' in APP_HTML
+    assert 'previousBusinessDate' not in APP_HTML
 
 def test_missing_cards_expose_only_safe_evidence_fields(monkeypatch, tmp_path):
     monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "safe-missing.db"))

@@ -205,10 +205,11 @@ def test_concurrent_cancel_has_one_transition_and_one_audit_event():
     assert [event["event"] for event in stored["events"]].count("cancelled") == 1
 
 
-def test_ui_exposes_decision_cards_not_legacy_execution_controls():
+def test_ui_exposes_release0_read_only_decision_surface():
     client = TestClient(app)
     assert client.post("/api/signup", json={"email":"ui-controls@test.com","password":"long-password"}).status_code == 200
     html=client.get('/app').text
-    for required in ('id="logout"', '카드 미생성', '수동 전량 매도', '결정 카드'):
+    for required in ('id="logout"', '오늘 판단이 필요한 종목', '현재 단계: 기록 전용', '주문 기능 없음'):
         assert required in html
-    assert '새 매수 계획' not in html and '시세 입력' not in html
+    for forbidden in ('새 매수 계획', '시세 입력', '수동 전량 매도', '매수 승인'):
+        assert forbidden not in html
