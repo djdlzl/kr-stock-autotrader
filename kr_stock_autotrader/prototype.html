@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Giraffe · Release 0 목업</title>
+<style>
+:root{--primary:#2563eb;--primary-low:#eff6ff;--paper:#fffaf6;--sheet:#fff;--ink:#172033;--ink-low:#64748b;--divider:#dbe3ef;--success:#126b49;--warning:#a95b00;--danger:#c73524;--radius:16px;--shadow:0 8px 24px rgba(23,32,51,.08)}
+*{box-sizing:border-box}html{background:var(--paper);color:var(--ink);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:clamp(16px,1rem,20px);line-height:1.55}body{margin:0}.shell{width:min(100%,720px);margin:0 auto;padding:16px 16px 40px}.prototype-note{margin:0 0 18px;padding:10px 12px;border:1px solid #bfdbfe;border-radius:12px;background:var(--primary-low);color:#173f8a;font-size:.875rem;font-weight:700}.eyebrow{margin:0 0 4px;color:var(--primary);font-size:.875rem;font-weight:800}h1{margin:0;font-size:clamp(1.5rem,6vw,2.15rem);line-height:1.22;letter-spacing:-.04em}p{margin:8px 0;color:var(--ink-low)}.list{display:grid;gap:10px;margin-top:24px}.item{display:grid;grid-template-columns:1fr auto;align-items:center;gap:12px;width:100%;min-height:88px;padding:16px;border:1px solid var(--divider);border-radius:var(--radius);background:var(--sheet);box-shadow:var(--shadow);text-align:left;color:inherit;font:inherit;cursor:pointer}.item:hover{border-color:#93c5fd}.item-name{display:block;font-weight:800}.item-change{display:block;margin-top:3px;color:var(--ink-low);font-size:.9375rem}.item-status,.badge{display:inline-flex;align-items:center;justify-content:center;min-height:28px;padding:3px 8px;border-radius:999px;font-size:.8125rem;font-weight:800;white-space:nowrap}.normal{background:#eaf7f0;color:var(--success)}.stale{background:#fff4df;color:var(--warning)}.conflict,.discarded{background:#fff0ee;color:var(--danger)}.detail{position:fixed;z-index:2;inset:0;background:var(--paper);overflow:auto}.detail-inner{width:min(100%,720px);margin:auto;padding:12px 16px 40px}.detail-top{display:flex;align-items:center;gap:10px;margin-bottom:14px}.back{min-width:44px;min-height:44px;border:1px solid var(--divider);border-radius:12px;background:var(--sheet);color:var(--ink);font:inherit;font-weight:800;cursor:pointer}.detail-title{margin:0;font-size:1.375rem}.section{margin:12px 0;padding:16px;border:1px solid var(--divider);border-radius:var(--radius);background:var(--sheet)}h2{margin:0;font-size:1rem;letter-spacing:-.02em}.section p{font-size:.9375rem}.notice{border-left:4px solid var(--primary)}.disclosure{width:100%;min-height:44px;display:flex;align-items:center;justify-content:space-between;border:0;background:transparent;color:var(--ink);font:inherit;font-weight:800;text-align:left;cursor:pointer}.panel{padding:0 0 8px}.scenario{margin-top:8px;padding:12px;border:1px solid var(--divider);border-radius:12px}.scenario[aria-current="true"]{border:2px solid var(--primary);box-shadow:0 0 0 4px rgba(37,99,235,.16)}.scenario strong{display:block}.scenario small{color:var(--ink-low)}.automation{background:#f8fafc}.live{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}button:focus-visible{outline:3px solid rgba(37,99,235,.48);outline-offset:3px}@media(min-width:721px){.shell{padding-top:32px}.detail{inset:24px max(16px,calc((100vw - 720px)/2));border:1px solid var(--divider);border-radius:20px;box-shadow:0 20px 60px rgba(23,32,51,.2)}}@media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;transition:none!important;animation:none!important}.scenario[aria-current="true"]{box-shadow:none}}
+</style>
+</head>
+<body>
+<main class="shell" id="prototype-list" aria-labelledby="page-title">
+  <p class="prototype-note">Release 0 목업 · 실제 데이터가 아닙니다</p>
+  <p class="eyebrow">Giraffe</p>
+  <h1 id="page-title">오늘 판단이 필요한 종목</h1>
+  <p>마지막 확인 이후 중요한 변화가 있는 종목만 표시합니다.</p>
+  <div class="list" aria-label="판단이 필요한 목업 종목">
+    <button class="item" type="button" onclick="openItem('fresh')"><span><span class="item-name">한빛반도체</span><span class="item-change">공식 계약 공시의 납기 범위가 확인됨 · 다음 확인 오늘 16:00</span></span><span class="item-status normal">정상</span></button>
+    <button class="item" type="button" onclick="openItem('stale')"><span><span class="item-name">모노바이오</span><span class="item-change">임상 발표 후 후속 원문 확인이 멈춤 · 다음 확인 재확인 필요</span></span><span class="item-status stale">정보가 오래됨</span></button>
+    <button class="item" type="button" onclick="openItem('conflict')"><span><span class="item-name">동해전기</span><span class="item-change">두 출처의 생산 일정 문장이 다름 · 다음 확인 원문 비교</span></span><span class="item-status conflict">출처 충돌</span></button>
+  </div>
+</main>
+<div id="detail" class="detail" hidden aria-labelledby="detail-title" tabindex="-1"><div class="detail-inner"><div class="detail-top"><button id="back" class="back" type="button" onclick="closeDetail()" aria-label="목록으로 돌아가기">← 뒤로</button><h1 id="detail-title" class="detail-title">판단 상세</h1></div><div id="detail-content"></div></div></div>
+<div id="status-live" class="live" aria-live="polite"></div>
+<script>
+const items={
+ fresh:{name:'한빛반도체',status:'정상',statusClass:'normal',change:'공식 계약 공시의 납기 범위가 확인됐습니다. 시장·섹터·거래량 확인도 모두 최신입니다.',judgment:'가설 유지 · 기준 조건을 검토합니다.',action:'공시 원문과 납기 조건을 오늘 16:00에 다시 확인합니다.',missing:'누락 또는 충돌 없음. 현재 확인 범위에서만 기록합니다.',glow:true},
+ stale:{name:'모노바이오',status:'정보가 오래됨',statusClass:'stale',change:'임상 발표 이후 후속 원문의 마지막 확인 성공시각이 오래됐습니다.',judgment:'판단 보류 · 정보가 오래됨.',action:'새 원문이 확인되기 전에는 판단을 바꾸지 않습니다. 다음 확인: 원문 다시 확인.',missing:'후속 공시의 공개 확인 시각이 오래돼 현재 조건을 비교할 수 없습니다.',glow:false},
+ conflict:{name:'동해전기',status:'출처 충돌',statusClass:'conflict',change:'공식 자료와 보도자료의 생산 일정 문장이 서로 다릅니다.',judgment:'판단 보류 · 출처 충돌.',action:'두 원문을 나란히 비교해 일정 문장을 확인합니다. 다음 확인: 원문 비교.',missing:'출처 간 내용이 다름: 생산 시작 시점이 일치하지 않습니다.',glow:false}
+};
+let openedBy=null;
+function scenario(id,label,description,active){return `<article class="scenario" id="scenario-${id}"${active?' aria-current="true"':''}><strong>${label}</strong><small>${description}${active?' · 현재 확인된 조건과 가장 가까움':''}</small></article>`}
+function openItem(id){const item=items[id];openedBy=document.activeElement;document.getElementById('detail-title').textContent=item.name+' 판단 상세';document.getElementById('detail-content').innerHTML=`
+ <section class="section"><h2>무엇이 달라졌나</h2><p>${item.change}</p><span class="badge ${item.statusClass}">${item.status}</span></section>
+ <section class="section notice"><h2>현재 판단</h2><p>${item.judgment}</p></section>
+ <section class="section"><h2>지금 할 일과 다음 확인 항목</h2><p>${item.action}</p></section>
+ <section class="section"><h2>누락·충돌</h2><p>${item.missing}</p></section>
+ <section class="section"><button class="disclosure" type="button" aria-expanded="false" aria-controls="scenarios-panel" onclick="togglePanel(this,'scenarios-panel')">조건별 시나리오 <span aria-hidden="true">⌄</span></button><div id="scenarios-panel" class="panel" hidden>${scenario('good','상방 조건','사업 proof point가 계획 이상으로 확인',item.glow)}${scenario('base','기준 조건','핵심 가정은 유지되나 추가 확인 필요',false)}${scenario('bad','하방 조건','경제 가정 또는 가격 경로가 약화',false)}</div></section>
+ <section class="section"><button class="disclosure" type="button" aria-expanded="false" aria-controls="history-panel" onclick="togglePanel(this,'history-panel')">출처와 변경 이력 <span aria-hidden="true">⌄</span></button><div id="history-panel" class="panel" hidden><p>목업 출처 · 공개 확인 시각: 2026-09-04 09:00 KST · 마지막 확인 성공시각: 2026-09-04 10:00 KST</p></div></section>
+ <section class="section automation"><h2>자동화 단계</h2><p><strong>현재 단계: 기록 전용</strong> · 주문 기능 없음</p></section>`;document.getElementById('detail').hidden=false;document.getElementById('status-live').textContent=item.name+' 상세를 열었습니다. 상태: '+item.status;document.getElementById('detail').focus()}
+function togglePanel(button,id){const panel=document.getElementById(id),expanded=button.getAttribute('aria-expanded')==='true';button.setAttribute('aria-expanded',String(!expanded));panel.hidden=expanded}
+function closeDetail(){document.getElementById('detail').hidden=true;document.getElementById('status-live').textContent='목록으로 돌아왔습니다.';if(openedBy)openedBy.focus()}
+document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!document.getElementById('detail').hidden)closeDetail()});
+</script>
+</body></html>

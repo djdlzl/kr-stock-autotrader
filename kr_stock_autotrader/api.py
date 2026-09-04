@@ -18,7 +18,7 @@ from .db import connect
 from .domain import Quote, parse_kst, now_kst
 from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
 from .service import audit, evaluate_tick
-from .ui import APP_HTML, AUTH_HTML
+from .ui import APP_HTML, AUTH_HTML, PROTOTYPE_HTML
 from .kis_readonly import KISReadOnlyClient
 from .market_data import build_premarket_snapshot, filter_inputs_from_snapshot
 from .live_dry_run import existing_live_dry_run_receipt, persist_live_dry_run
@@ -959,6 +959,12 @@ def home(request: Request):
     except HTTPException:
         return HTMLResponse(AUTH_HTML)
     return RedirectResponse("/app", status_code=303)
+
+
+@app.get("/prototype", response_class=HTMLResponse)
+def prototype():
+    """Public, static Release 0 interaction mockup with no product data or APIs."""
+    return HTMLResponse(PROTOTYPE_HTML)
 
 
 @app.get("/app", response_class=HTMLResponse)
