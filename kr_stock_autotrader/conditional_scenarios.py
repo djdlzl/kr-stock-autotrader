@@ -82,13 +82,24 @@ def _validate(data):
     return data
 
 def create(db,data,*,commit=True):
+    """Append only the exact server-derived candidate for the locked active card.
+
+    Callers may replay a complete payload, but never supply scenario source text,
+    provenance, labels, ordering, identity, or scalar facts of their own.
+    """
     d=_validate(data)
     ev=db.execute("SELECT * FROM material_evidence WHERE id=?",(d["evidence_id"],)).fetchone(); card=db.execute("SELECT * FROM decision_cards WHERE id=?",(d["card_id"],)).fetchone()
     if not ev or not card or card["evidence_id"]!=ev["id"] or card["invalidated_at"] or ev["status"] not in {"card_generated","decision_pending"}: raise HTTPException(409,"conditional scenario requires active current lineage")
-    if any(d[k]!=ev[src] for k,src in (("symbol","symbol"),("source_url","source_url"),("disclosed_at","announcement_at"),("known_at","known_at"))): raise HTTPException(409,"conditional payload must equal persisted evidence")
     if card["version"] != db.execute("SELECT MAX(version) FROM decision_cards WHERE lineage_key=? AND invalidated_at IS NULL",(card["lineage_key"],)).fetchone()[0]: raise HTTPException(409,"conditional card is not current head")
     collected=ev["collected_at"]
     if collected and _time(d["known_at"]) > _time(collected): raise HTTPException(422,"known_at must be at or before collected_at")
+    # Rebuild after every lineage/current-head check, in this same transaction.
+    # This comparison is deliberately before idempotency: immutable corrections
+    # require a changed persisted successor card/evidence lineage, never a client
+    # supplied replacement payload.
+    canonical=build_scenario_candidate(dict(ev), {**dict(card), "card": __import__("json").loads(card["card_json"])})
+    if canonical.get("status") != "COMPLETE" or d != canonical["payload"]:
+        raise HTTPException(409,"conditional payload must exactly equal current persisted candidate")
     body=canon({k:v for k,v in d.items() if k!="scenarios"}); scenarios=canon(d["scenarios"])
     exact=db.execute("SELECT * FROM event_conditional_scenario_sets WHERE card_id=? AND event_identity=? AND version=?",(d["card_id"],d["event_identity"],d["version"])).fetchone()
     if exact:

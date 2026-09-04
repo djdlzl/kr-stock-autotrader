@@ -47,7 +47,8 @@ def test_conditional_immutable_retry_successor_observation_refusal_and_no_highli
     with pytest.raises(HTTPException) as exc: create(db, mismatch)
     assert exc.value.status_code == 409
     successor = deepcopy(payload); successor["version"] = 2
-    assert create(db, successor)["version"] == 2
+    with pytest.raises(HTTPException) as exc: create(db, successor)
+    assert exc.value.status_code == 409  # corrections require a persisted successor lineage
     with pytest.raises(HTTPException) as exc:
         __import__("kr_stock_autotrader.event_scenarios", fromlist=["observe"]).observe(db, payload["event_identity"], {})
     assert exc.value.status_code == 422  # malformed observations fail before any write
@@ -80,10 +81,87 @@ def test_backfill_is_dry_by_default_apply_is_idempotent_and_skips_invalidated(mo
     monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "conditional.db"))
     db = dbmod.connect(); _, active = _hold(db); _, invalidated = _hold(db, symbol="012170", invalidated=True)
     dry = run(db)
-    assert dry["eligible_cards"] == 1 and dry["created"] == 0 and dry["items"] == [{"card_id": active["id"], "status": "WOULD_CREATE", "event_identity": f"CONDITIONAL:{active['evidence_id']}:{active['id']}"}]
+    assert dry["active_cards"] == 1 and dry["complete"] == 1 and dry["inputs_required"] == 0 and dry["created"] == 0
+    assert dry["items"] == [{"card_id": active["id"], "status": "COMPLETE", "action": "WOULD_CREATE", "event_identity": f"CONDITIONAL:{active['evidence_id']}:{active['id']}"}]
     assert db.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets").fetchone()[0] == 0
     applied = run(db, apply=True)
     assert applied["created"] == 1 and db.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets WHERE card_id=?", (invalidated["id"],)).fetchone()[0] == 0
     assert run(db, apply=True)["idempotent"] == 1
     assert all(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0 for table in ("order_plans", "order_fills", "positions"))
+    db.close()
+
+
+def test_conditional_create_and_internal_endpoint_reject_every_forged_field(monkeypatch, tmp_path):
+    """The direct API may replay, but cannot be an alternate source of truth."""
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "forged.db"))
+    db = dbmod.connect(); evidence, card = _hold(db)
+    payload = build_scenario_candidate(evidence, card)["payload"]
+    mutations = (
+        lambda p: p["scenarios"][0]["conditions"][0].update(text="INVENTED ATTACKER CONDITION"),
+        lambda p: p["scenarios"][0]["conditions"][0].update(provenance="forged.path"),
+        lambda p: p["scenarios"][0].update(label="GOOD"),
+        lambda p: p.update(scenarios=list(reversed(p["scenarios"]))),
+        lambda p: p.update(event_identity="CONDITIONAL:forged:identity"),
+        lambda p: p.update(source_url="https://attacker.example/forged"),
+    )
+    for mutate in mutations:
+        forged = deepcopy(payload); mutate(forged)
+        with pytest.raises(HTTPException): create(db, forged)
+        assert db.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets").fetchone()[0] == 0
+    monkeypatch.setenv("INTERNAL_API_KEY", "test-internal-key")
+    from fastapi.testclient import TestClient
+    from kr_stock_autotrader.api import app
+    forged = deepcopy(payload); forged["scenarios"][0]["conditions"][0]["text"] = "INVENTED ATTACKER CONDITION"
+    response = TestClient(app).post("/api/internal/scenario-sets", json=forged, headers={"X-Internal-API-Key": "test-internal-key"})
+    assert response.status_code == 409
+    assert db.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets").fetchone()[0] == 0
+    assert TestClient(app).post("/api/internal/scenario-sets", json=payload, headers={"X-Internal-API-Key": "test-internal-key"}).status_code == 200
+    assert create(db, payload)["idempotent"] is True
+    db.close()
+
+
+def test_conditional_timestamp_and_url_boundaries_are_executable(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "timestamps.db"))
+    db = dbmod.connect(); evidence, card = _hold(db)
+    payload = build_scenario_candidate(evidence, card)["payload"]
+    for field, value in (("known_at", "2026-08-30T09:00:00"), ("known_at", "2999-01-01T00:00:00+00:00"),
+                         ("disclosed_at", "2026-08-31T09:00:00+09:00"), ("source_url", "http://127.0.0.1/private"),
+                         ("source_url", "https://user:pass@example.test/private"), ("source_url", "file:///private")):
+        forged = deepcopy(payload); forged[field] = value
+        with pytest.raises(HTTPException): create(db, forged)
+        assert db.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets").fetchone()[0] == 0
+    db.close()
+
+
+def test_backfill_is_atomic_on_later_failure_and_exact_retry(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "batch.db"))
+    db = dbmod.connect(); _hold(db); _hold(db, symbol="012170")
+    import kr_stock_autotrader.conditional_scenario_backfill as backfill
+    real_create, calls = backfill.create, []
+    def fail_second(conn, payload, *, commit=True):
+        calls.append(payload["card_id"])
+        if len(calls) == 2: raise HTTPException(409, "forced later failure")
+        return real_create(conn, payload, commit=commit)
+    monkeypatch.setattr(backfill, "create", fail_second)
+    with pytest.raises(HTTPException, match="forced later failure"): backfill.run(db, apply=True)
+    assert db.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets").fetchone()[0] == 0
+    monkeypatch.setattr(backfill, "create", real_create)
+    applied = backfill.run(db, apply=True)
+    assert {key: applied[key] for key in ("active_cards", "complete", "inputs_required", "created", "idempotent")} == {"active_cards": 2, "complete": 2, "inputs_required": 0, "created": 2, "idempotent": 0}
+    rerun = backfill.run(db, apply=True)
+    assert rerun["created"] == 0 and rerun["idempotent"] == 2
+    db.close()
+
+
+def test_repeated_connect_preserves_legacy_quantitative_schema_customizations(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "legacy.db"))
+    db = dbmod.connect()
+    db.executescript("ALTER TABLE event_scenario_sets ADD COLUMN legacy_note TEXT; CREATE INDEX legacy_quant_idx ON event_scenario_sets(legacy_note); CREATE TRIGGER legacy_quant_trigger AFTER INSERT ON event_scenario_sets BEGIN SELECT 1; END;")
+    db.commit(); db.close()
+    for _ in range(2):
+        db = dbmod.connect(); db.close()
+    db = dbmod.connect()
+    assert "legacy_note" in db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='event_scenario_sets'").fetchone()[0]
+    assert db.execute("SELECT sql FROM sqlite_master WHERE name='legacy_quant_idx'").fetchone()[0] == "CREATE INDEX legacy_quant_idx ON event_scenario_sets(legacy_note)"
+    assert "CREATE TRIGGER legacy_quant_trigger" in db.execute("SELECT sql FROM sqlite_master WHERE name='legacy_quant_trigger'").fetchone()[0]
     db.close()
