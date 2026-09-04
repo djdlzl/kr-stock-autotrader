@@ -295,7 +295,7 @@ def test_release0_detail_request_ownership_rejects_late_switch_refresh_close_and
     script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
     ownership = re.search(r"function ownsDetail.*?(?=const today)", script, re.S).group(0)
     node = r'''
-let detailGeneration=0,detailAbort=null,detailOwner=null,opener=null;
+let detailGeneration=0,detailAbort=null,detailOwner=null,opener=null,sheetCloseTimer=0,sheetCloseFinish=null;
 const nodes={
   '#detail':{hidden:true}, '#app-main':{inert:false,removeAttribute:()=>{},setAttribute:()=>{}},
   '#detail-title':{textContent:''}, '#detail-content':{innerHTML:''}, '#detail-close':{focus:()=>{}},
@@ -376,3 +376,28 @@ def test_release0_persisted_blockers_keep_string_items_whole_and_fail_closed(mon
     assert "market cap outside range" not in primary
     assert "첫 항목 · 둘째 항목 · 7 · 셋째 항목" in controls
     assert "[object Object]" not in controls
+
+
+def test_release0_bottom_sheet_swipe_contract():
+    """EDD: shipped JS opens safely and only a qualifying handle drag closes once."""
+    html = authenticated_app_html()
+    for expected in ('id="detail-handle"', 'aria-label="아래로 밀어 상세 닫기"', 'transform:translateY(100%)', '.dialog.is-open .dialog-sheet{transform:translateY(0)', 'touch-action:pan-x'):
+        assert expected in html
+    script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+    motion = re.search(r"const sheetGesture=.*?(?=const today)", script, re.S).group(0)
+    node = r'''
+let closeCalls=0; const listeners={};
+const cls=()=>({items:new Set(),add(x){this.items.add(x)},remove(...x){x.forEach(y=>this.items.delete(y))},contains(x){return this.items.has(x)}});
+const sheet={style:{}}; const dialog={hidden:false,classList:cls(),querySelector:()=>sheet};
+const handle={addEventListener:(type,fn)=>listeners[type]=fn,setPointerCapture:()=>{},releasePointerCapture:()=>{}};
+const $=s=>s==='#detail'?dialog:handle; const window={innerHeight:600}; const closeDetail=()=>closeCalls++;
+''' + motion + r'''
+const fire=(type,e)=>listeners[type]({pointerType:'touch',isPrimary:true,pointerId:1,clientX:0,clientY:0,timeStamp:0,preventDefault:()=>{},...e,type});
+fire('pointerdown',{});fire('pointermove',{clientY:40,timeStamp:100});fire('pointerup',{clientY:40,timeStamp:120});const short={closeCalls,transform:sheet.style.transform,drag:dialog.classList.contains('is-dragging')};
+fire('pointerdown',{});fire('pointermove',{clientY:130,timeStamp:200});fire('pointerup',{clientY:130,timeStamp:220});const closed=closeCalls;
+fire('pointerdown',{});fire('pointermove',{clientX:140,clientY:20,timeStamp:300});fire('pointercancel',{clientX:140,clientY:20,timeStamp:320});
+fire('pointerdown',{isPrimary:false,pointerId:2});fire('pointerdown',{pointerId:3});fire('lostpointercapture',{pointerId:3,clientY:40,timeStamp:400});
+console.log(JSON.stringify({short,closed,after:{closeCalls,transform:sheet.style.transform,drag:dialog.classList.contains('is-dragging')}}));
+'''
+    state = json.loads(subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip())
+    assert state == {"short": {"closeCalls": 0, "transform": "", "drag": False}, "closed": 1, "after": {"closeCalls": 1, "transform": "", "drag": False}}
