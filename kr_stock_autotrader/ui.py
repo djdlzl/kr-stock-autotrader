@@ -16,4 +16,3 @@ const $=s=>document.querySelector(s),alertEl=$('#alert'),form=$('#auth-form'),pa
 </script></body></html>'''
 
 APP_HTML = Path(__file__).with_name('decision_card_app.html').read_text(encoding='utf-8')
-PROTOTYPE_HTML = Path(__file__).with_name('prototype.html').read_text(encoding='utf-8')
