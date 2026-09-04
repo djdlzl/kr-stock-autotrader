@@ -25,6 +25,16 @@ from .live_dry_run import existing_live_dry_run_receipt, persist_live_dry_run
 from .event_scenarios import create as create_scenario_set, detail as scenario_set_detail, observe as observe_scenario
 
 
+# Public prototype-only source pages.  These deliberately have no connection to
+# accounts, orders, APIs, or production data; the allowlist makes the mock scope explicit.
+MOCK_SOURCES = {
+    "hanbit-disclosure": ("한빛반도체 공시 목업", "납기 범위는 4분기까지입니다."),
+    "monobio-clinical": ("모노바이오 임상 발표 목업", "후속 결과는 추후 공개합니다."),
+    "donghae-official": ("동해전기 공식 자료 목업", "양산은 10월에 시작합니다."),
+    "donghae-press": ("동해전기 보도자료 목업", "양산은 11월에 시작합니다."),
+}
+
+
 class AuthIn(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=8, max_length=200)
@@ -965,6 +975,23 @@ def home(request: Request):
 def prototype():
     """Public, static Release 0 interaction mockup with no product data or APIs."""
     return HTMLResponse(PROTOTYPE_HTML)
+
+
+@app.get("/prototype/mock-source/{source_id}", response_class=HTMLResponse)
+def mock_source(source_id: str):
+    """Serve only an allowlisted, honestly labelled prototype source document."""
+    source = MOCK_SOURCES.get(source_id)
+    if source is None:
+        raise HTTPException(404, "mock source not found")
+    name, quote = source
+    return HTMLResponse(
+        "<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
+        f"<title>{name} · 목업 원문</title></head><body>"
+        "<p><strong>목업 원문 · 실제 자료 아님</strong></p>"
+        f"<h1>{name}</h1><p>“{quote}”</p>"
+        "<p>Release 0 상호작용 검증용 정적 목업이며 실제 출처, 투자 정보 또는 주문 데이터가 아닙니다.</p>"
+        "</body></html>"
+    )
 
 
 @app.get("/app", response_class=HTMLResponse)
