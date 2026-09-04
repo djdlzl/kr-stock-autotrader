@@ -442,3 +442,55 @@ console.log(JSON.stringify({upward,horizontal,badTime,rejectedTypes,qualified,af
         "qualified": 2,
         "after": {"closeCalls": 2, "transform": "", "drag": False},
     }
+
+
+def test_release0_bottom_sheet_retained_close_callbacks_have_no_authority():
+    """TDD: retained old close callbacks cannot close a replacement dialog."""
+    html = authenticated_app_html()
+    script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+    lifecycle = re.search(r"function animatedSheet.*?(?=function disclosure)", script, re.S).group(0)
+    node = r'''
+let sheetCloseTimer=0,sheetCloseFinish=null,sheetCloseNode=null,nextTimer=0;const timers=new Map(),focuses=[];
+const cls=()=>({items:new Set(),add(x){this.items.add(x)},remove(...x){x.forEach(y=>this.items.delete(y))},contains(x){return this.items.has(x)}});
+const sheetListeners={};const sheet={style:{},addEventListener:(type,fn)=>sheetListeners[type]=fn,removeEventListener:(type,fn)=>{if(sheetListeners[type]===fn)delete sheetListeners[type]}};
+const dialog={hidden:false,classList:cls(),querySelector:()=>sheet};const main={inert:false,aria:null,setAttribute:(k,v)=>main.aria=[k,v],removeAttribute:k=>{if(k==='aria-hidden')main.aria=null}};
+const close={focus:()=>focuses.push('close')};const nodes={'#detail':dialog,'#app-main':main,'#detail-close':close,'#detail-title':{textContent:''},'#detail-content':{innerHTML:''}};const $=s=>nodes[s];
+let opener={focus:()=>focuses.push('old')};const invalidateDetail=()=>{};const matchMedia=()=>({matches:false});const setTimeout=fn=>{const id=++nextTimer;timers.set(id,fn);return id};const clearTimeout=id=>timers.delete(id);const requestAnimationFrame=fn=>fn();
+''' + lifecycle + r'''
+const replacement={focus:()=>focuses.push('replacement')};closeDetail();const oldFinish=sheetCloseFinish,oldTimer=timers.get(sheetCloseTimer);showDetail('replacement','content',replacement);const before={hidden:dialog.hidden,inert:main.inert,aria:main.aria,focuses:[...focuses],currentFinish:sheetCloseFinish,currentTimer:sheetCloseTimer};oldFinish({target:sheet,propertyName:'transform'});oldTimer();const afterStale={hidden:dialog.hidden,inert:main.inert,aria:main.aria,focuses:[...focuses],currentFinish:sheetCloseFinish,currentTimer:sheetCloseTimer};showDetail('current','content',replacement);closeDetail();const currentFinish=sheetCloseFinish,currentTimer=timers.get(sheetCloseTimer);currentFinish({target:sheet,propertyName:'transform'});currentTimer();console.log(JSON.stringify({before:{...before,currentFinish:Boolean(before.currentFinish)},afterStale:{...afterStale,currentFinish:Boolean(afterStale.currentFinish)},afterCurrent:{hidden:dialog.hidden,inert:main.inert,aria:main.aria,focuses}}));
+'''
+    state = json.loads(subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip())
+    assert state == {
+        "before": {"hidden": False, "inert": True, "aria": ["aria-hidden", "true"], "focuses": ["close"], "currentFinish": False, "currentTimer": 0},
+        "afterStale": {"hidden": False, "inert": True, "aria": ["aria-hidden", "true"], "focuses": ["close"], "currentFinish": False, "currentTimer": 0},
+        "afterCurrent": {"hidden": True, "inert": False, "aria": None, "focuses": ["close", "close", "replacement"]},
+    }
+
+
+def test_release0_bottom_sheet_sync_lost_capture_is_reentrancy_safe():
+    """TDD: a synchronous lost capture release cannot recurse or double-close."""
+    html = authenticated_app_html()
+    script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+    motion = re.search(r"const sheetGesture=.*?(?=const today)", script, re.S).group(0)
+    node = r'''
+let closeCalls=0,captures=0,releases=0;const listeners={};
+const cls=()=>({items:new Set(),add(x){this.items.add(x)},remove(...x){x.forEach(y=>this.items.delete(y))},contains(x){return this.items.has(x)}});
+const sheet={style:{}};const dialog={hidden:false,classList:cls(),querySelector:()=>sheet};
+const handle={
+  addEventListener:(type,fn)=>listeners[type]=fn,
+  setPointerCapture:()=>captures++,
+  releasePointerCapture:id=>{
+    releases++;
+    listeners.lostpointercapture({pointerType:'touch',isPrimary:true,pointerId:id,clientX:0,clientY:130,timeStamp:120,type:'lostpointercapture',preventDefault:()=>{}});
+  },
+};
+const $=s=>s==='#detail'?dialog:handle;const window={innerHeight:600};const closeDetail=()=>closeCalls++;
+''' + motion + r'''
+const fire=(type,e={})=>listeners[type]({pointerType:'touch',isPrimary:true,pointerId:1,clientX:0,clientY:0,timeStamp:100,preventDefault:()=>{},...e,type});
+fire('pointerdown');fire('pointermove',{clientY:130,timeStamp:110});fire('pointerup',{clientY:130,timeStamp:120});const qualified={closeCalls,releases,transform:sheet.style.transform,drag:dialog.classList.contains('is-dragging')};fire('pointerdown',{timeStamp:200});fire('pointermove',{clientY:130,timeStamp:210});fire('pointercancel',{clientY:130,timeStamp:220});fire('pointerdown',{timeStamp:300});fire('pointermove',{clientY:130,timeStamp:310});fire('lostpointercapture',{clientY:130,timeStamp:320});console.log(JSON.stringify({qualified,after:{closeCalls,releases,transform:sheet.style.transform,drag:dialog.classList.contains('is-dragging')}}));
+'''
+    state = json.loads(subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip())
+    assert state == {
+        "qualified": {"closeCalls": 1, "releases": 1, "transform": "", "drag": False},
+        "after": {"closeCalls": 1, "releases": 2, "transform": "", "drag": False},
+    }
