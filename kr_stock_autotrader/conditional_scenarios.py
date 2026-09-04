@@ -84,32 +84,57 @@ def _validate(data):
 def create(db,data,*,commit=True):
     """Append only the exact server-derived candidate for the locked active card.
 
-    Callers may replay a complete payload, but never supply scenario source text,
-    provenance, labels, ordering, identity, or scalar facts of their own.
+    ``commit=True`` owns a new SQLite write reservation.  Nested callers must
+    pass ``commit=False`` from an active owner transaction; this function
+    acquires its no-op reservation in that owner before source reads.
     """
     d=_validate(data)
-    ev=db.execute("SELECT * FROM material_evidence WHERE id=?",(d["evidence_id"],)).fetchone(); card=db.execute("SELECT * FROM decision_cards WHERE id=?",(d["card_id"],)).fetchone()
-    if not ev or not card or card["evidence_id"]!=ev["id"] or card["invalidated_at"] or ev["status"] not in {"card_generated","decision_pending"}: raise HTTPException(409,"conditional scenario requires active current lineage")
-    if card["version"] != db.execute("SELECT MAX(version) FROM decision_cards WHERE lineage_key=? AND invalidated_at IS NULL",(card["lineage_key"],)).fetchone()[0]: raise HTTPException(409,"conditional card is not current head")
-    collected=ev["collected_at"]
-    if collected and _time(d["known_at"]) > _time(collected): raise HTTPException(422,"known_at must be at or before collected_at")
-    # Rebuild after every lineage/current-head check, in this same transaction.
-    # This comparison is deliberately before idempotency: immutable corrections
-    # require a changed persisted successor card/evidence lineage, never a client
-    # supplied replacement payload.
-    canonical=build_scenario_candidate(dict(ev), {**dict(card), "card": __import__("json").loads(card["card_json"])})
-    if canonical.get("status") != "COMPLETE" or d != canonical["payload"]:
-        raise HTTPException(409,"conditional payload must exactly equal current persisted candidate")
-    body=canon({k:v for k,v in d.items() if k!="scenarios"}); scenarios=canon(d["scenarios"])
-    exact=db.execute("SELECT * FROM event_conditional_scenario_sets WHERE card_id=? AND event_identity=? AND version=?",(d["card_id"],d["event_identity"],d["version"])).fetchone()
-    if exact:
-        if exact["scenario_json"]==body and exact["scenarios_json"]==scenarios: return _detail(exact,True)
-        raise HTTPException(409,"immutable conditional scenario identity/version payload mismatch")
-    head=db.execute("SELECT MAX(version) FROM event_conditional_scenario_sets WHERE card_id=? AND event_identity=?",(d["card_id"],d["event_identity"])).fetchone()[0]
-    if d["version"] != (1 if head is None else head+1): raise HTTPException(409,"conditional scenario parent is not current head")
-    try: row=db.execute("INSERT INTO event_conditional_scenario_sets(event_identity,version,symbol,evidence_id,card_id,disclosed_at,known_at,source_url,frozen_at,scenario_json,scenarios_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING *",(d["event_identity"],d["version"],d["symbol"],d["evidence_id"],d["card_id"],d["disclosed_at"],d["known_at"],d["source_url"],now(),body,scenarios)).fetchone()
-    except Exception as exc: raise HTTPException(409,"conditional scenario persistence conflict") from exc
-    if commit: db.commit()
-    return _detail(row,False)
+    owns_transaction=False
+    try:
+        if commit:
+            if db.in_transaction:
+                raise HTTPException(409,"conditional scenario requires a new owner transaction")
+            try:
+                db.execute("BEGIN IMMEDIATE")
+            except Exception as exc:
+                raise HTTPException(409,"conditional scenario write reservation unavailable") from exc
+            owns_transaction=True
+        elif not db.in_transaction:
+            raise HTTPException(409,"conditional scenario requires an active owner transaction")
+        else:
+            try:
+                # SQLite exposes no transaction-lock state.  A no-op UPDATE
+                # upgrades the caller-owned transaction before any source read.
+                db.execute("UPDATE event_conditional_scenario_sets SET frozen_at=frozen_at WHERE 0")
+            except Exception as exc:
+                raise HTTPException(409,"conditional scenario write reservation unavailable") from exc
+
+        ev=db.execute("SELECT * FROM material_evidence WHERE id=?",(d["evidence_id"],)).fetchone(); card=db.execute("SELECT * FROM decision_cards WHERE id=?",(d["card_id"],)).fetchone()
+        if not ev or not card or card["evidence_id"]!=ev["id"] or card["invalidated_at"] or ev["status"] not in {"card_generated","decision_pending"}: raise HTTPException(409,"conditional scenario requires active current lineage")
+        if card["version"] != db.execute("SELECT MAX(version) FROM decision_cards WHERE lineage_key=? AND invalidated_at IS NULL",(card["lineage_key"],)).fetchone()[0]: raise HTTPException(409,"conditional card is not current head")
+        collected=ev["collected_at"]
+        if collected and _time(d["known_at"]) > _time(collected): raise HTTPException(422,"known_at must be at or before collected_at")
+        # All authoritative reads, canonical rebuild, replay lookup, and insert
+        # occur under the same write reservation.
+        canonical=build_scenario_candidate(dict(ev), {**dict(card), "card": __import__("json").loads(card["card_json"])})
+        if canonical.get("status") != "COMPLETE" or d != canonical["payload"]:
+            raise HTTPException(409,"conditional payload must exactly equal current persisted candidate")
+        body=canon({k:v for k,v in d.items() if k!="scenarios"}); scenarios=canon(d["scenarios"])
+        exact=db.execute("SELECT * FROM event_conditional_scenario_sets WHERE card_id=? AND event_identity=? AND version=?",(d["card_id"],d["event_identity"],d["version"])).fetchone()
+        if exact:
+            if exact["scenario_json"]==body and exact["scenarios_json"]==scenarios:
+                result=_detail(exact,True)
+                if owns_transaction: db.commit()
+                return result
+            raise HTTPException(409,"immutable conditional scenario identity/version payload mismatch")
+        head=db.execute("SELECT MAX(version) FROM event_conditional_scenario_sets WHERE card_id=? AND event_identity=?",(d["card_id"],d["event_identity"])).fetchone()[0]
+        if d["version"] != (1 if head is None else head+1): raise HTTPException(409,"conditional scenario parent is not current head")
+        try: row=db.execute("INSERT INTO event_conditional_scenario_sets(event_identity,version,symbol,evidence_id,card_id,disclosed_at,known_at,source_url,frozen_at,scenario_json,scenarios_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING *",(d["event_identity"],d["version"],d["symbol"],d["evidence_id"],d["card_id"],d["disclosed_at"],d["known_at"],d["source_url"],now(),body,scenarios)).fetchone()
+        except Exception as exc: raise HTTPException(409,"conditional scenario persistence conflict") from exc
+        if owns_transaction: db.commit()
+        return _detail(row,False)
+    except Exception:
+        if owns_transaction and db.in_transaction: db.rollback()
+        raise
 def _detail(row,idempotent=False):
     return {"id":row["id"],"version":row["version"],"scenario_kind":KIND,"expected_value_krw":None,"scenarios":__import__("json").loads(row["scenarios_json"]),"idempotent":idempotent}

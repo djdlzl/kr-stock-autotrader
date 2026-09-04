@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import uuid
 
 from .conditional_scenarios import build_scenario_candidate, create
 from .db import connect
@@ -18,39 +19,60 @@ def run(db, *, apply: bool = False) -> dict:
     ``create(..., commit=False)`` and commits once, so a later error rolls back
     every earlier insert and a retry is safe.
     """
-    rows = list(db.execute("""SELECT c.id FROM decision_cards c JOIN material_evidence e ON e.id=c.evidence_id
-        WHERE c.invalidated_at IS NULL AND e.invalidated_at IS NULL AND e.status != 'invalidated' AND c.verdict='판단 보류'
-        ORDER BY c.id"""))
-    report = {"dry_run": not apply, "active_cards": len(rows), "complete": 0,
-              "inputs_required": 0, "created": 0, "idempotent": 0, "items": []}
-    complete = []
-    for row in rows:
-        card = card_detail(db, row["id"])
-        candidate = build_scenario_candidate(evidence_detail(db, card["evidence_id"]), card)
-        if candidate["status"] != "COMPLETE":
-            report["inputs_required"] += 1
-            report["items"].append({"card_id": card["id"], "status": candidate["status"], "missing": candidate["missing"]})
-            continue
-        report["complete"] += 1
-        complete.append((card["id"], candidate["payload"]))
-        if not apply:
-            report["items"].append({"card_id": card["id"], "status": "COMPLETE", "action": "WOULD_CREATE", "event_identity": candidate["payload"]["event_identity"]})
-    if not apply:
-        return report
-    db.execute("SAVEPOINT conditional_scenario_backfill")
+    caller_owns = db.in_transaction
+    savepoint = None
+    if apply:
+        try:
+            if caller_owns:
+                savepoint = f"conditional_scenario_backfill_{uuid.uuid4().hex}"
+                db.execute(f"SAVEPOINT {savepoint}")
+                db.execute("UPDATE event_conditional_scenario_sets SET frozen_at=frozen_at WHERE 0")
+            else:
+                db.execute("BEGIN IMMEDIATE")
+        except Exception as exc:
+            if caller_owns and savepoint:
+                db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise RuntimeError("conditional scenario backfill write reservation unavailable") from exc
     try:
+        # Apply takes its write reservation before every authoritative read;
+        # caller-owned apply uses the caller's pre-acquired reservation.
+        rows = list(db.execute("""SELECT c.id FROM decision_cards c JOIN material_evidence e ON e.id=c.evidence_id
+            WHERE c.invalidated_at IS NULL AND e.invalidated_at IS NULL AND e.status != 'invalidated' AND c.verdict='판단 보류'
+            ORDER BY c.id"""))
+        report = {"dry_run": not apply, "active_cards": len(rows), "complete": 0,
+                  "inputs_required": 0, "created": 0, "idempotent": 0, "items": []}
+        complete = []
+        for row in rows:
+            card = card_detail(db, row["id"])
+            candidate = build_scenario_candidate(evidence_detail(db, card["evidence_id"]), card)
+            if candidate["status"] != "COMPLETE":
+                report["inputs_required"] += 1
+                report["items"].append({"card_id": card["id"], "status": candidate["status"], "missing": candidate["missing"]})
+                continue
+            report["complete"] += 1
+            complete.append((card["id"], candidate["payload"]))
+            if not apply:
+                report["items"].append({"card_id": card["id"], "status": "COMPLETE", "action": "WOULD_CREATE", "event_identity": candidate["payload"]["event_identity"]})
+        if not apply:
+            return report
         for card_id, payload in complete:
             saved = create(db, payload, commit=False)
             report["idempotent" if saved["idempotent"] else "created"] += 1
             report["items"].append({"card_id": card_id, "status": "IDEMPOTENT" if saved["idempotent"] else "CREATED", "scenario_set_id": saved["id"]})
-        db.execute("RELEASE SAVEPOINT conditional_scenario_backfill")
-        db.commit()
+        if caller_owns:
+            db.execute(f"RELEASE SAVEPOINT {savepoint}")
+        else:
+            db.commit()
+        return report
     except Exception:
-        db.execute("ROLLBACK TO SAVEPOINT conditional_scenario_backfill")
-        db.execute("RELEASE SAVEPOINT conditional_scenario_backfill")
-        db.rollback()
+        if apply:
+            if caller_owns:
+                db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            elif db.in_transaction:
+                db.rollback()
         raise
-    return report
 
 
 def main(argv=None):

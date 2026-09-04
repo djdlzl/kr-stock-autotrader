@@ -427,10 +427,14 @@ def _safe_source_url(value):
     if parsed.netloc != canonical_authority:
         return None
     try:
-        ipaddress.ip_address(host)
+        address = ipaddress.ip_address(host)
     except ValueError:
         labels = host.split(".")
         if not labels or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels):
+            return None
+    else:
+        if any((address.is_loopback, address.is_private, address.is_link_local,
+                address.is_multicast, address.is_reserved, address.is_unspecified)):
             return None
     return value
 

@@ -1,5 +1,6 @@
 """RED/GREEN contracts for evidence-only conditional judgment-hold scenarios."""
 from copy import deepcopy
+import threading
 
 import pytest
 from fastapi import HTTPException
@@ -150,6 +151,100 @@ def test_backfill_is_atomic_on_later_failure_and_exact_retry(monkeypatch, tmp_pa
     assert {key: applied[key] for key in ("active_cards", "complete", "inputs_required", "created", "idempotent")} == {"active_cards": 2, "complete": 2, "inputs_required": 0, "created": 2, "idempotent": 0}
     rerun = backfill.run(db, apply=True)
     assert rerun["created"] == 0 and rerun["idempotent"] == 2
+    db.close()
+
+
+def test_conditional_create_write_reservation_blocks_racing_evidence_change(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "race.db"))
+    seed = dbmod.connect(); evidence, card = _hold(seed)
+    payload = build_scenario_candidate(evidence, card)["payload"]; seed.close()
+    import kr_stock_autotrader.conditional_scenarios as conditional
+    original_builder, canonical_checked, allow_insert = conditional.build_scenario_candidate, threading.Event(), threading.Event()
+
+    def pause_after_authoritative_read(*args):
+        canonical_checked.set()
+        assert allow_insert.wait(2)
+        return original_builder(*args)
+
+    monkeypatch.setattr(conditional, "build_scenario_candidate", pause_after_authoritative_read)
+    outcome = {}
+    def create_in_owner_connection():
+        owner = dbmod.connect()
+        try:
+            outcome["saved"] = create(owner, payload)
+        except Exception as exc:  # assertion below reports an unexpected lock failure
+            outcome["error"] = exc
+        finally:
+            owner.close()
+
+    worker = threading.Thread(target=create_in_owner_connection)
+    worker.start(); assert canonical_checked.wait(2)
+    racer = dbmod.connect(); racer.execute("PRAGMA busy_timeout=0")
+    with pytest.raises(Exception):
+        racer.execute("UPDATE material_evidence SET summary='RACE_REPLACED_SOURCE' WHERE id=?", (evidence["id"],))
+    assert racer.execute("SELECT summary FROM material_evidence WHERE id=?", (evidence["id"],)).fetchone()[0] == "확인된 계약 사실"
+    racer.rollback()  # release the failed writer/read transaction before owner commit
+    allow_insert.set(); worker.join(2)
+    assert not worker.is_alive() and "error" not in outcome and outcome["saved"]["idempotent"] is False
+    assert racer.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets").fetchone()[0] == 1
+    assert racer.execute("SELECT summary FROM material_evidence WHERE id=?", (evidence["id"],)).fetchone()[0] == "확인된 계약 사실"
+    racer.close()
+
+
+def test_persisted_nonpublic_ip_urls_require_inputs_and_never_persist(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "private-urls.db"))
+    db = dbmod.connect(); evidence, card = _hold(db)
+    safe_payload = build_scenario_candidate(evidence, card)["payload"]
+    for source_url in ("http://127.0.0.1/x", "http://10.0.0.1/x", "http://[::1]/x",
+                       "http://169.254.1.1/x", "http://[fe80::1]/x", "http://[fc00::1]/x",
+                       "http://[::]/x", "http://[ff00::1]/x", "http://240.0.0.1/x"):
+        db.execute("UPDATE material_evidence SET source_url=? WHERE id=?", (source_url, evidence["id"])); db.commit()
+        candidate = build_scenario_candidate(evidence_detail(db, evidence["id"]), card_detail(db, card["id"]))
+        assert candidate["status"] == "SCENARIO_INPUTS_REQUIRED"
+        assert "evidence.source_url" in candidate["missing"]
+        forged = deepcopy(safe_payload); forged["source_url"] = source_url
+        with pytest.raises(HTTPException, match="invalid conditional scenario source fields"):
+            create(db, forged)
+        assert db.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets").fetchone()[0] == 0
+    db.close()
+
+
+def test_conditional_create_commit_false_requires_owner_transaction(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "create-owner.db"))
+    db = dbmod.connect(); evidence, card = _hold(db)
+    payload = build_scenario_candidate(evidence, card)["payload"]
+    with pytest.raises(HTTPException, match="owner transaction"):
+        create(db, payload, commit=False)
+    assert db.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets").fetchone()[0] == 0
+    db.close()
+
+
+def test_backfill_preserves_caller_owned_transaction_on_success_and_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "caller-owned.db"))
+    db = dbmod.connect(); _hold(db)
+    db.execute("BEGIN IMMEDIATE")
+    db.execute("INSERT INTO users(email,password) VALUES('outer-success@example.test','p')")
+    saved = run(db, apply=True)
+    assert saved["created"] == 1 and db.in_transaction
+    assert db.execute("SELECT COUNT(*) FROM users WHERE email='outer-success@example.test'").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets").fetchone()[0] == 1
+    db.rollback()
+    assert db.execute("SELECT COUNT(*) FROM users WHERE email='outer-success@example.test'").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets").fetchone()[0] == 0
+
+    db.execute("BEGIN IMMEDIATE")
+    db.execute("INSERT INTO users(email,password) VALUES('outer-failure@example.test','p')")
+    import kr_stock_autotrader.conditional_scenario_backfill as backfill
+    real_create = backfill.create
+    monkeypatch.setattr(backfill, "create", lambda *args, **kwargs: (_ for _ in ()).throw(HTTPException(409, "forced failure")))
+    with pytest.raises(HTTPException, match="forced failure"):
+        run(db, apply=True)
+    assert db.in_transaction
+    assert db.execute("SELECT COUNT(*) FROM users WHERE email='outer-failure@example.test'").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets").fetchone()[0] == 0
+    monkeypatch.setattr(backfill, "create", real_create)
+    db.commit()
+    assert db.execute("SELECT COUNT(*) FROM users WHERE email='outer-failure@example.test'").fetchone()[0] == 1
     db.close()
 
 

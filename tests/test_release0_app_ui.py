@@ -273,7 +273,7 @@ def test_release0_persisted_naive_timestamp_and_ipv6_renderer_regressions(monkey
     rendered = subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip()
     assert "원문 보기" in rendered and "신뢰 상태: 확인됨" not in rendered and "신뢰 상태: 확인 필요" in rendered and "2026" not in rendered
 
-    ipv6 = "https://[2001:db8::1]:8443/path?q=one"
+    ipv6 = "https://[2606:4700:4700::1111]:8443/path?q=one"
     db = dbmod.connect()
     db.execute("UPDATE material_evidence SET source_url=?, known_at=?, collected_at=? WHERE id=?", (ipv6, "2026-09-04T10:00:00+09:00", "2026-09-04T10:01:00+09:00", evidence["id"]))
     db.commit(); db.close()
