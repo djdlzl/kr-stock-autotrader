@@ -362,12 +362,17 @@ def test_release0_persisted_blockers_keep_string_items_whole_and_fail_closed(mon
         + "renderDetail({card:{unknowns:['첫 항목','둘째 항목',null,7,{}]},filter:{reasons:['셋째 항목',false,{}]}})]));"
     )
     persisted, controls = json.loads(subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip())
-    assert unknowns in persisted
-    assert "원 · 가" not in persisted
-    assert "시 · 가" not in persisted
-    assert "시가·갭·거래량" in persisted
-    assert "시가 · 갭" not in persisted
-    assert "시가총액이 조건 범위를 벗어남" in persisted
-    assert "market cap outside range" not in persisted
+    primary = re.search(r"<h3>판단을 막는 누락·충돌</h3><p>(.*?)</p>", persisted).group(1)
+    expected = "원가, 마진, 실제 매출 인식 시점, 당일 시가·갭·거래량; 시스템 단기 기준값·근거 정보 누락 · 시가총액이 조건 범위를 벗어남"
+    assert primary == expected
+    assert "backend" not in primary
+    assert "short-term" not in primary
+    assert "provenance" not in primary
+    assert "원 · 가" not in primary
+    assert "시 · 가" not in primary
+    assert "시가·갭·거래량" in primary
+    assert "시가 · 갭" not in primary
+    assert "시가총액이 조건 범위를 벗어남" in primary
+    assert "market cap outside range" not in primary
     assert "첫 항목 · 둘째 항목 · 7 · 셋째 항목" in controls
     assert "[object Object]" not in controls
