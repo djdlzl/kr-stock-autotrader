@@ -469,9 +469,9 @@ console.log(JSON.stringify({top,interactive,scrolled,shortPrevented,cancelPreven
 '''
     state = json.loads(subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip())
     assert state == {
-        "top": {"closeCalls": 1, "captures": 1, "releases": 1, "prevented": True, "transform": "", "drag": False},
+        "top": {"closeCalls": 1, "captures": 1, "releases": 1, "prevented": True, "transform": "translateY(130px)", "drag": False},
         "interactive": {"closed": 0, "prevented": False, "captures": 1},
-        "scrolled": {"closed": 0, "prevented": False, "captures": 1, "transform": ""},
+        "scrolled": {"closed": 0, "prevented": False, "captures": 1, "transform": "translateY(130px)"},
         "shortPrevented": True,
         "cancelPrevented": True,
         "after": {"closeCalls": 1, "transform": "", "drag": False},
@@ -517,6 +517,40 @@ fire('pointerdown');fire('pointermove',{clientY:130,timeStamp:110});fire('pointe
 '''
     state = json.loads(subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip())
     assert state == {
-        "qualified": {"closeCalls": 1, "releases": 1, "transform": "", "drag": False},
+        "qualified": {"closeCalls": 1, "releases": 1, "transform": "translateY(130px)", "drag": False},
         "after": {"closeCalls": 1, "releases": 2, "transform": "", "drag": False},
     }
+
+
+def test_release0_committed_drag_hands_partial_position_to_canonical_close():
+    """EDD/TDD: shipped JS keeps a committed drag position through canonical close takeover."""
+    html = authenticated_app_html()
+    script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+    lifecycle = re.search(r"function animatedSheet.*?(?=function disclosure)", script, re.S).group(0)
+    motion = re.search(r"const sheetGesture=.*?(?=const today)", script, re.S).group(0)
+    node = r'''
+let sheetCloseTimer=0,sheetCloseFinish=null,sheetCloseNode=null,nextTimer=0;const timers=new Map(),listeners={},trace=[];
+const cls=()=>({items:new Set(['is-open','is-dragging']),add(x){this.items.add(x);trace.push(`class.add=${x}`)},remove(...x){x.forEach(y=>{this.items.delete(y);trace.push(`class.remove=${y}`)})},contains(x){return this.items.has(x)}});
+let transform='';const style={get transform(){return transform},set transform(v){transform=v;trace.push(`transform=${v}`)},get opacity(){return ''},set opacity(v){trace.push(`opacity=${v}`)},get transition(){return ''},set transition(v){trace.push(`transition=${v}`)}};
+const sheet={style,scrollTop:0,get offsetHeight(){trace.push(`layout=${style.transform}`);return 400},addEventListener:(type,fn)=>listeners[type]=fn,removeEventListener:(type,fn)=>{if(listeners[type]===fn)delete listeners[type]},setPointerCapture:()=>trace.push('capture=1'),releasePointerCapture:id=>trace.push(`release=${id}`)};
+const dialog={hidden:false,classList:cls(),querySelector:()=>sheet};const main={inert:false,setAttribute:()=>{},removeAttribute:()=>{}};const close={focus:()=>{}};const nodes={'#detail':dialog,'#app-main':main,'#detail-close':close,'#detail-title':{textContent:''},'#detail-content':{innerHTML:''}};const $=s=>nodes[s];
+let opener={focus:()=>{}};const invalidateDetail=()=>{};const matchMedia=()=>({matches:false});const setTimeout=fn=>{const id=++nextTimer;timers.set(id,fn);return id};const clearTimeout=id=>timers.delete(id);const requestAnimationFrame=fn=>fn();const window={innerHeight:600};
+''' + lifecycle + motion + r'''
+const fire=(type,e={})=>listeners[type]({pointerType:'touch',isPrimary:true,pointerId:1,clientX:0,clientY:0,timeStamp:100,cancelable:true,preventDefault:()=>{},target:{closest:()=>null},...e,type});
+fire('pointerdown');fire('pointermove',{clientY:130,timeStamp:110});fire('pointerup',{clientY:130,timeStamp:120});
+const beforeFinish={transform:style.transform,drag:dialog.classList.contains('is-dragging'),open:dialog.classList.contains('is-open')};listeners.transitionend({target:sheet,propertyName:'transform'});console.log(JSON.stringify({trace,beforeFinish,afterFinish:{transform:style.transform,hidden:dialog.hidden}}));
+'''
+    state = json.loads(subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip())
+    trace = state["trace"]
+    close_start = trace.index("class.remove=is-open")
+    assert trace[:close_start] == [
+        "capture=1",
+        "class.add=is-dragging",
+        "transform=translateY(130px)",
+        "release=1",
+        "class.remove=is-dragging",
+        "layout=translateY(130px)",
+    ]
+    assert trace[close_start:close_start + 2] == ["class.remove=is-open", "transform=translateY(100%)"]
+    assert state["beforeFinish"] == {"transform": "translateY(100%)", "drag": False, "open": False}
+    assert state["afterFinish"] == {"transform": "", "hidden": True}
