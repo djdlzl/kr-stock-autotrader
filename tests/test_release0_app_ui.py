@@ -329,3 +329,45 @@ const card=name=>({evidence:{name}});
     assert state["refreshed"] == {"title": "B 판단 상세", "body": "<h2>B</h2>", "aborted": True}
     assert state["closed"] == {"hidden": True, "body": "<h2>B</h2>", "aborted": True}
     assert state["error"] == "" and state["owner"] == "D"
+
+
+def test_release0_persisted_blockers_keep_string_items_whole_and_fail_closed(monkeypatch, tmp_path):
+    """Legacy string unknowns must survive the authenticated API-to-renderer path intact."""
+    from kr_stock_autotrader import db as dbmod
+    from tests.test_date_lifecycle import _seed
+
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "blocker-normalization.db"))
+    db = dbmod.connect()
+    evidence, saved = _seed(db, "hanwha-ocean-blockers", "2026-08-31T10:00:00+09:00")
+    unknowns = "원가, 마진, 실제 매출 인식 시점, 당일 시가·갭·거래량; backend short-term 임계값·provenance 누락"
+    db.execute("UPDATE decision_cards SET card_json=json_set(card_json, '$.unknowns', json(?)) WHERE id=?", (json.dumps(unknowns, ensure_ascii=False), saved["id"]))
+    db.execute("UPDATE deterministic_filter_results SET reasons=? WHERE id=?", (json.dumps(["market cap outside range"]), saved["filter_id"]))
+    db.commit(); db.close()
+
+    client = TestClient(app)
+    assert client.post("/api/signup", json={"email": "blocker-normalization@test.com", "password": "long-password"}).status_code == 200
+    detail = client.get(f"/api/cards/{saved['id']}")
+    assert detail.status_code == 200
+    assert detail.json()["card"]["unknowns"] == unknowns
+    assert detail.json()["filter"]["reasons"] == ["market cap outside range"]
+
+    script = re.search(r"<script>(.*?)</script>", client.get("/app").text, re.S).group(1)
+    korean = re.search(r"function korean.*?(?=function blockerItems)", script, re.S).group(0)
+    normalizer = re.search(r"function blockerItems.*?(?=function kst)", script, re.S).group(0)
+    renderer = re.search(r"function renderDetail.*?(?=function visibleFocusable)", script, re.S).group(0)
+    node = (
+        "const esc=v=>String(v??'');const scenarios=()=>'';const sourceFacts=()=>'';"
+        + korean + normalizer + renderer
+        + "\nconsole.log(JSON.stringify([renderDetail(" + json.dumps(detail.json()) + "),"
+        + "renderDetail({card:{unknowns:['첫 항목','둘째 항목',null,7,{}]},filter:{reasons:['셋째 항목',false,{}]}})]));"
+    )
+    persisted, controls = json.loads(subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip())
+    assert unknowns in persisted
+    assert "원 · 가" not in persisted
+    assert "시 · 가" not in persisted
+    assert "시가·갭·거래량" in persisted
+    assert "시가 · 갭" not in persisted
+    assert "시가총액이 조건 범위를 벗어남" in persisted
+    assert "market cap outside range" not in persisted
+    assert "첫 항목 · 둘째 항목 · 7 · 셋째 항목" in controls
+    assert "[object Object]" not in controls
