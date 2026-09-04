@@ -685,9 +685,12 @@ def submit_tick(data: TickIn, request: Request):
 
 @app.post('/api/internal/scenario-sets')
 async def internal_scenario_set_create(request: Request, _: None = Depends(require_internal_api_key)):
-    """Freeze a server-calculated scenario set; this endpoint cannot create trading artifacts."""
-    db=connect()
-    try: return create_scenario_set(db, await request.json())
+    """Freeze a scenario set; conditional sets never create trading artifacts."""
+    data = await request.json(); db=connect()
+    try:
+        if isinstance(data, dict) and data.get("kind") == "CONDITIONAL":
+            return __import__("kr_stock_autotrader.conditional_scenarios", fromlist=["create"]).create(db, data)
+        return create_scenario_set(db, data)
     finally: db.close()
 
 @app.get('/api/internal/scenario-sets/{identity}')

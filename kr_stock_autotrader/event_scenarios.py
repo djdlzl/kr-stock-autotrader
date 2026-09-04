@@ -252,6 +252,8 @@ def observe(db, identity, data):
     if not isinstance(data, dict) or set(data) != OBSERVATION_KEYS:
         fail("invalid observation fields")
     scenario = detail_by_event_identity(db, identity)
+    if scenario.get("scenario_kind") == "CONDITIONAL":
+        raise HTTPException(409, "conditional scenario sets are not observable")
     frozen = ts(scenario["frozen_at"], "frozen_at")
     known = ts(data.get("known_at"), "observation known_at", now_kst())
     retrieved = ts(data.get("retrieved_at"), "retrieved_at", now_kst())

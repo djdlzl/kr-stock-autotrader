@@ -316,7 +316,17 @@ def save_card(db,data):
             invalidate_lineage(db, card_id=old_id, reason="new_card")
     r=db.execute("INSERT INTO decision_cards(lineage_key,version,evidence_id,filter_id,prompt_version,prompt_hash,model,provider,card_json,schema_version,verdict,confidence,generated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",(lineage,version,ev["id"],fi["id"],data.get("prompt_version","decision-card-v1"),prompt_hash(),data["model"],data["provider"],canon(card),card["schema_version"],card["verdict"],float(card["confidence"]),now())).fetchone()
     db.execute("UPDATE material_evidence SET status='card_generated',updated_at=? WHERE id=?",(now(),ev["id"]))
-    audit(db,"internal","save","decision_card",r["id"]);db.commit();return card_detail(db,r["id"])
+    audit(db,"internal","save","decision_card",r["id"]);db.commit()
+    result = card_detail(db,r["id"])
+    # Post-persistence only: an incomplete evidence-only candidate leaves the
+    # immutable card untouched.  A complete judgment-hold candidate is a
+    # separate append-only scenario set, never a valuation or order artifact.
+    if result["card"].get("verdict") == "판단 보류":
+        from .conditional_scenarios import build_scenario_candidate, create as create_conditional_scenario
+        candidate = build_scenario_candidate(evidence_detail(db, ev["id"]), result)
+        if candidate["status"] == "COMPLETE":
+            create_conditional_scenario(db, candidate["payload"])
+    return result
 def card_detail(db,ident):
     d=dict(row(db,"decision_cards",ident));d["card"]=json.loads(d.pop("card_json"));return d
 def user_fill_summary(db, card_id, user_id):
@@ -497,14 +507,15 @@ def user_card_view(db, ident, user_id):
         plan_view["position"]=dict(db.execute("SELECT symbol,qty,avg_price,status FROM positions WHERE order_plan_id=?",(plan["id"],)).fetchone() or {})
         plan_view["exit_lineage"]=[dict(x) for x in db.execute("SELECT rule,quote_known_at,created_at FROM exit_lineage WHERE order_plan_id=? ORDER BY id",(plan["id"],))]
     result["event_scenarios"]=[]
-    for scenario in db.execute("SELECT id,version,frozen_at,expected_value_krw,scenarios_json FROM event_scenario_sets WHERE card_id=? ORDER BY id DESC",(ident,)):
-        observations=[dict(x) for x in db.execute("""SELECT known_at,retrieved_at,provider,source,
+    for scenario in db.execute("SELECT id,version,frozen_at,expected_value_krw,scenario_kind,scenario_schema_version,scenarios_json FROM event_scenario_sets WHERE card_id=? ORDER BY id DESC",(ident,)):
+        is_conditional = scenario["scenario_kind"] == "CONDITIONAL"
+        observations=[] if is_conditional else [dict(x) for x in db.execute("""SELECT known_at,retrieved_at,provider,source,
             CASE WHEN provider='KIS' THEN 'network_retrieved_at' ELSE NULL END AS timestamp_source,
             price_krw,best_bid,best_ask,volume_ratio,benchmark_excess_pct,
             sector_excess_pct,market_context_status,spread_pct,imbalance,match,action,active_scenario_label
             FROM event_scenario_observations WHERE scenario_set_id=? ORDER BY id DESC LIMIT 1""",(scenario["id"],))]
         current = observations[0] if observations else {"match":"UNOBSERVED","action":"NO_ACTION","active_scenario_label":None}
-        result["event_scenarios"].append({"version":scenario["version"],"frozen_at":scenario["frozen_at"],"expected_value_krw":scenario["expected_value_krw"],"scenarios":json.loads(scenario["scenarios_json"]),"current":current,"trust":_scenario_trust(current, invalidated=bool(result.get("invalidated_at"))),"tracking_state":"ACTIVE" if not result.get("invalidated_at") else "INACTIVE"})
+        result["event_scenarios"].append({"kind":scenario["scenario_kind"],"schema_version":scenario["scenario_schema_version"],"version":scenario["version"],"frozen_at":scenario["frozen_at"],"expected_value_krw":scenario["expected_value_krw"],"scenarios":json.loads(scenario["scenarios_json"]),"current":current,"trust":_scenario_trust(current, invalidated=bool(result.get("invalidated_at"))),"tracking_state":"UNOBSERVABLE" if is_conditional else ("ACTIVE" if not result.get("invalidated_at") else "INACTIVE")})
     result["user_state"]={"decision":dict(decision) if decision else None,"order_plan":plan_view,"draft":({**dict(draft),"snapshot":json.loads(draft["snapshot_json"])} if draft else None),"default_paper_amount":_default_paper_amount(db, user_id)}
     return result
 
