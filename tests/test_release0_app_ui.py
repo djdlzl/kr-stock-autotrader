@@ -378,26 +378,67 @@ def test_release0_persisted_blockers_keep_string_items_whole_and_fail_closed(mon
     assert "[object Object]" not in controls
 
 
+def test_release0_bottom_sheet_transition_lifecycle_contract():
+    """EDD: only the sheet transform can finish one animated close; reopen cancels stale completion."""
+    html = authenticated_app_html()
+    script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+    lifecycle = re.search(r"function animatedSheet.*?(?=function disclosure)", script, re.S).group(0)
+    node = r'''
+let sheetCloseTimer=0,sheetCloseFinish=null,sheetCloseNode=null,focuses=0,nextTimer=0;const timers=new Map();
+const cls=()=>({items:new Set(),add(x){this.items.add(x)},remove(...x){x.forEach(y=>this.items.delete(y))},contains(x){return this.items.has(x)}});
+const sheetListeners={},dialogListeners={};const sheet={style:{},addEventListener:(type,fn)=>sheetListeners[type]=fn,removeEventListener:(type,fn)=>{if(sheetListeners[type]===fn)delete sheetListeners[type]}};
+const dialog={hidden:false,classList:cls(),querySelector:()=>sheet,addEventListener:(type,fn)=>dialogListeners[type]=fn,removeEventListener:(type,fn)=>{if(dialogListeners[type]===fn)delete dialogListeners[type]}};const main={inert:false,setAttribute:()=>{},removeAttribute:()=>{}};
+const close={focus:()=>focuses++};const nodes={'#detail':dialog,'#app-main':main,'#detail-close':close,'#detail-title':{textContent:''},'#detail-content':{innerHTML:''}};const $=s=>nodes[s];
+let opener={focus:()=>focuses++};const invalidateDetail=()=>{};let reduced=false;const matchMedia=()=>({matches:reduced});
+const setTimeout=(fn)=>{const id=++nextTimer;timers.set(id,fn);return id};const clearTimeout=id=>timers.delete(id);const requestAnimationFrame=fn=>fn();
+''' + lifecycle + r'''
+closeDetail();const descendant=sheetListeners.transitionend||dialogListeners.transitionend;descendant({target:{},propertyName:'opacity'});const afterDescendant={hidden:dialog.hidden,focuses,listener:Boolean(sheetListeners.transitionend)};
+descendant({target:sheet,propertyName:'transform'});const afterTransform={hidden:dialog.hidden,focuses,listener:Boolean(sheetListeners.transitionend)};
+dialog.hidden=false;showDetail('timer','content',opener);closeDetail();const timerListener=sheetListeners.transitionend,timer=timers.get(sheetCloseTimer);timer();timerListener({target:sheet,propertyName:'transform'});const singleShot={hidden:dialog.hidden,focuses};
+dialog.hidden=false;showDetail('new','content',opener);closeDetail();const oldTimer=sheetCloseTimer;showDetail('replacement','content',opener);const staleListener=sheetListeners.transitionend;const staleTimer=timers.get(oldTimer);if(staleListener)staleListener({target:sheet,propertyName:'transform'});if(staleTimer)staleTimer();const reopened={hidden:dialog.hidden,focuses,listener:Boolean(sheetListeners.transitionend),timer:sheetCloseTimer};
+reduced=true;showDetail('reduced','content',opener);closeDetail();const reducedMotion={hidden:dialog.hidden,focuses,listener:Boolean(sheetListeners.transitionend),timer:sheetCloseTimer};
+console.log(JSON.stringify({afterDescendant,afterTransform,singleShot,reopened,reducedMotion}));
+'''
+    state = json.loads(subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip())
+    assert state == {
+        "afterDescendant": {"hidden": False, "focuses": 0, "listener": True},
+        "afterTransform": {"hidden": True, "focuses": 1, "listener": False},
+        "singleShot": {"hidden": True, "focuses": 3},
+        "reopened": {"hidden": False, "focuses": 5, "listener": False, "timer": 0},
+        "reducedMotion": {"hidden": True, "focuses": 7, "listener": False, "timer": 0},
+    }
+
+
 def test_release0_bottom_sheet_swipe_contract():
-    """EDD: shipped JS opens safely and only a qualifying handle drag closes once."""
+    """TDD: shipped JS uses terminal touch/pen coordinates and monotonic timestamps only."""
     html = authenticated_app_html()
     for expected in ('id="detail-handle"', 'aria-label="아래로 밀어 상세 닫기"', 'transform:translateY(100%)', '.dialog.is-open .dialog-sheet{transform:translateY(0)', 'touch-action:pan-x'):
         assert expected in html
     script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
     motion = re.search(r"const sheetGesture=.*?(?=const today)", script, re.S).group(0)
     node = r'''
-let closeCalls=0; const listeners={};
+let closeCalls=0,captures=0;const listeners={};
 const cls=()=>({items:new Set(),add(x){this.items.add(x)},remove(...x){x.forEach(y=>this.items.delete(y))},contains(x){return this.items.has(x)}});
-const sheet={style:{}}; const dialog={hidden:false,classList:cls(),querySelector:()=>sheet};
-const handle={addEventListener:(type,fn)=>listeners[type]=fn,setPointerCapture:()=>{},releasePointerCapture:()=>{}};
-const $=s=>s==='#detail'?dialog:handle; const window={innerHeight:600}; const closeDetail=()=>closeCalls++;
+const sheet={style:{}};const dialog={hidden:false,classList:cls(),querySelector:()=>sheet};
+const handle={addEventListener:(type,fn)=>listeners[type]=fn,setPointerCapture:()=>captures++,releasePointerCapture:()=>{}};
+const $=s=>s==='#detail'?dialog:handle;const window={innerHeight:600};const closeDetail=()=>closeCalls++;
 ''' + motion + r'''
-const fire=(type,e)=>listeners[type]({pointerType:'touch',isPrimary:true,pointerId:1,clientX:0,clientY:0,timeStamp:0,preventDefault:()=>{},...e,type});
-fire('pointerdown',{});fire('pointermove',{clientY:40,timeStamp:100});fire('pointerup',{clientY:40,timeStamp:120});const short={closeCalls,transform:sheet.style.transform,drag:dialog.classList.contains('is-dragging')};
-fire('pointerdown',{});fire('pointermove',{clientY:130,timeStamp:200});fire('pointerup',{clientY:130,timeStamp:220});const closed=closeCalls;
-fire('pointerdown',{});fire('pointermove',{clientX:140,clientY:20,timeStamp:300});fire('pointercancel',{clientX:140,clientY:20,timeStamp:320});
-fire('pointerdown',{isPrimary:false,pointerId:2});fire('pointerdown',{pointerId:3});fire('lostpointercapture',{pointerId:3,clientY:40,timeStamp:400});
-console.log(JSON.stringify({short,closed,after:{closeCalls,transform:sheet.style.transform,drag:dialog.classList.contains('is-dragging')}}));
+const fire=(type,e={})=>listeners[type]({pointerType:'touch',isPrimary:true,pointerId:1,clientX:0,clientY:0,timeStamp:100,preventDefault:()=>{},...e,type});
+const drag=(type,up)=>{fire('pointerdown',{pointerType:type,timeStamp:100});fire('pointermove',{clientY:24,timeStamp:110});fire('pointerup',{...up,pointerType:type})};
+drag('touch',{clientY:-100,timeStamp:111});const upward=closeCalls;
+drag('touch',{clientX:140,clientY:20,timeStamp:120});const horizontal=closeCalls;
+drag('touch',{clientY:24,timeStamp:50});drag('touch',{clientY:24,timeStamp:NaN});const badTime=closeCalls;
+const capturesBeforeRejected=captures;for(const type of ['unknown','','mouse']){fire('pointerdown',{pointerType:type,pointerId:2});fire('pointermove',{pointerId:2,clientY:130,timeStamp:110});fire('pointerup',{pointerType:type,pointerId:2,clientY:130,timeStamp:120})}const rejectedTypes={closeCalls,captures:captures-capturesBeforeRejected};
+drag('touch',{clientY:130,timeStamp:250});drag('pen',{clientY:130,timeStamp:250});const qualified=closeCalls;
+fire('pointerdown',{timeStamp:300});fire('pointermove',{clientY:130,timeStamp:310});fire('pointercancel',{clientY:130,timeStamp:320});fire('pointerdown',{timeStamp:400});fire('pointermove',{clientY:130,timeStamp:410});fire('lostpointercapture',{clientY:130,timeStamp:420});
+console.log(JSON.stringify({upward,horizontal,badTime,rejectedTypes,qualified,after:{closeCalls,transform:sheet.style.transform,drag:dialog.classList.contains('is-dragging')}}));
 '''
     state = json.loads(subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip())
-    assert state == {"short": {"closeCalls": 0, "transform": "", "drag": False}, "closed": 1, "after": {"closeCalls": 1, "transform": "", "drag": False}}
+    assert state == {
+        "upward": 0,
+        "horizontal": 0,
+        "badTime": 0,
+        "rejectedTypes": {"closeCalls": 0, "captures": 0},
+        "qualified": 2,
+        "after": {"closeCalls": 2, "transform": "", "drag": False},
+    }
