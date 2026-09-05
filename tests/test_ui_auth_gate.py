@@ -51,7 +51,7 @@ def test_app_shell_source_has_responsive_accessibility_and_record_only_controls(
         "--graphite:#161b25", "--porcelain:#f4f6f8", "--cobalt:#2457d6", "min-height:44px", ":focus-visible",
         "@media(max-width:390px)", "prefers-reduced-motion", "role=\"dialog\"", "aria-modal=\"true\"",
         "세션이 만료되었습니다", "현재 단계: 기록 전용", "주문 기능 없음", "투자 판단 오피스",
-        "누적 판단 규모", "오늘 변경", "아직 미확인", "Provenance · 원문과 변경 이력",
+        "카드 생성", "판단 보류", "카드 미생성", "Provenance · 원문과 변경 이력",
     ):
         assert required in html
     for forbidden in ("디버그 JSON", "새 매수 계획", "매수 승인", "수동 매도"):
