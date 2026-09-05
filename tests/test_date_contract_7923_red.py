@@ -43,5 +43,5 @@ def test_ui_load_uses_operation_date_for_all_three_requests(monkeypatch, tmp_pat
     assert client.post("/api/signup", json={"email": "ui-axes@test.com", "password": "long-password"}).status_code == 200
     html = client.get("/app").text
     assert "q=`?operation_date=${day}`" in html
-    assert "api('cards/summary'+q),api('cards'+q),api('cards/missing'+q)" in html
+    assert "api('cards/summary'+q,{sessionNotice:false}),api('cards'+q,{sessionNotice:false}),api('cards/missing'+q,{sessionNotice:false})" in html
     assert "선택 운영일" in html

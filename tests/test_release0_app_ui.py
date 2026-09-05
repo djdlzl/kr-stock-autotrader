@@ -47,7 +47,7 @@ def test_release0_primary_surface_is_change_first_and_record_only():
         "inert",
         "visibleFocusable",
         "operation_date=${day}",
-        "api('cards/summary'+q),api('cards'+q),api('cards/missing'+q)",
+        "api('cards/summary'+q,{sessionNotice:false}),api('cards'+q,{sessionNotice:false}),api('cards/missing'+q,{sessionNotice:false})",
         "min-height:44px",
         ":focus-visible",
         "prefers-reduced-motion",
@@ -305,7 +305,7 @@ def test_release0_detail_request_ownership_rejects_late_switch_refresh_close_and
     script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
     ownership = re.search(r"function ownsDetail.*?(?=const today)", script, re.S).group(0)
     node = r'''
-let detailGeneration=0,detailAbort=null,detailOwner=null,opener=null,sheetCloseTimer=0,sheetCloseFinish=null;
+let loadGeneration=0,detailGeneration=0,detailAbort=null,detailOwner=null,opener=null,sheetCloseTimer=0,sheetCloseFinish=null;
 const nodes={
   '#detail':{hidden:true}, '#app-main':{inert:false,removeAttribute:()=>{},setAttribute:()=>{}},
   '#detail-title':{textContent:''}, '#detail-content':{innerHTML:''}, '#detail-close':{focus:()=>{}},

@@ -18,7 +18,7 @@ def _run_load_for_operation_date(summary: dict, cards: list[dict], missing: list
     node = f"""
 const values = {{'date': {{value: '2026-08-30'}}, 'reviewable-count': {{textContent: ''}}, 'changed-count': {{textContent: ''}}, 'unverified-count': {{textContent: ''}}, 'cards': {{innerHTML: '', querySelectorAll: () => []}}, 'error': {{hidden: false, textContent: ''}}}};
 const $ = selector => values[selector.slice(1)];
-let summary = null, cards = [], missing = [], lastGood = [];
+let summary = null, cards = [], missing = [], lastGood = [], loadGeneration = 0;
 const calls = [];
 const api = async path => {{ calls.push(path); return {{'cards/summary?operation_date=2026-08-30': {json.dumps(summary, ensure_ascii=False)}, 'cards?operation_date=2026-08-30': {json.dumps(cards, ensure_ascii=False)}, 'cards/missing?operation_date=2026-08-30': {json.dumps(missing, ensure_ascii=False)}}}[path]; }};
 const invalidateDetail = () => {{}};
@@ -64,7 +64,7 @@ def test_failed_operation_date_refresh_never_reuses_another_dates_summary():
     node = f"""
 const values = {{'date': {{value: '2026-08-30'}}, 'reviewable-count': {{textContent: ''}}, 'changed-count': {{textContent: ''}}, 'unverified-count': {{textContent: ''}}, 'cards': {{innerHTML: '', querySelectorAll: () => []}}, 'error': {{hidden: true, textContent: ''}}}};
 const $ = selector => values[selector.slice(1)];
-let summary = null, cards = [], missing = [], lastGood = [];
+let summary = null, cards = [], missing = [], lastGood = [], loadGeneration = 0;
 const api = async path => {{
   if (path.includes('2026-08-31')) throw new Error('refresh failed');
   return {{
@@ -111,7 +111,7 @@ def test_session_expired_operation_date_refresh_fails_closed_without_overwriting
     node = f"""
 const values = {{'date': {{value: '2026-08-30'}}, 'reviewable-count': {{textContent: ''}}, 'changed-count': {{textContent: ''}}, 'unverified-count': {{textContent: ''}}, 'cards': {{innerHTML: '', querySelectorAll: () => []}}, 'error': {{hidden: true, textContent: '', innerHTML: ''}}}};
 const $ = selector => values[selector.slice(1)];
-let summary = null, cards = [], missing = [], lastGood = [];
+let summary = null, cards = [], missing = [], lastGood = [], loadGeneration = 0;
 const fetch = async url => {{
   if (url.includes('2026-08-31')) return {{status: 401, ok: false, json: async () => ({{}})}};
   const path = url.slice('/api/'.length);
@@ -148,6 +148,96 @@ const emptyState = () => '<article>empty</article>';
         "rendered": "<article>prior-row</article>",
         "errorHidden": False,
         "notice": '세션이 만료되었습니다. <a class="session-link" href="/?expired=1">로그인 화면으로 이동</a>',
+    }
+
+
+def test_late_success_for_stale_operation_date_cannot_replace_current_expiry_state():
+    """The selected B expiry state owns the UI after delayed A succeeds."""
+    script = re.search(r"<script>(.*?)</script>", APP_HTML, re.S).group(1)
+    api = re.search(r"async function api\(path,options=\{\}\)\{.*?\}(?=\s*function statusFor)", script, re.S).group(0)
+    draw = re.search(r"function draw\(\)\{.*?\}(?=\s*function missingDetail)", script, re.S).group(0)
+    load = re.search(r"async function load\(\)\{.*?\}(?=\s*const sheetGesture)", script, re.S).group(0)
+    node = f"""
+const values = {{'date': {{value: '2026-08-30'}}, 'reviewable-count': {{textContent: ''}}, 'changed-count': {{textContent: ''}}, 'unverified-count': {{textContent: ''}}, 'cards': {{innerHTML: '', querySelectorAll: () => []}}, 'error': {{hidden: true, textContent: '', innerHTML: ''}}}};
+const $ = selector => values[selector.slice(1)];
+let summary = null, cards = [], missing = [], lastGood = [], loadGeneration = 0;
+const pendingA = [];
+const fetch = url => {{
+  if (url.includes('2026-08-31')) return Promise.resolve({{status: 401, ok: false, json: async () => ({{}})}});
+  return new Promise(resolve => pendingA.push(() => resolve({{status: 200, ok: true, json: async () => ({{
+    'cards/summary?operation_date=2026-08-30': {{'카드 생성': 9, '판단 보류': 4, '카드 미생성': 2}},
+    'cards?operation_date=2026-08-30': [{{id: 'stale-A'}}],
+    'cards/missing?operation_date=2026-08-30': []
+  }}[url.slice('/api/'.length)])}})));
+}};
+const invalidateDetail = () => {{}};
+const resetSheetMotion = () => {{}};
+const row = item => `<article>${{item.id}}</article>`;
+const emptyState = () => '<article>empty</article>';
+{api}
+{draw}
+{load}
+(async () => {{
+  const loadA = load();
+  values.date.value = '2026-08-31';
+  await load();
+  pendingA.forEach(resolve => resolve());
+  await loadA;
+  console.log(JSON.stringify({{date: values.date.value, summary: [values['reviewable-count'].textContent, values['changed-count'].textContent, values['unverified-count'].textContent], rendered: values.cards.innerHTML, errorHidden: values.error.hidden, notice: values.error.innerHTML}}));
+}})();
+"""
+    rendered = json.loads(subprocess.check_output(["node", "-e", node], text=True))
+    assert rendered == {
+        "date": "2026-08-31",
+        "summary": ["—", "—", "—"],
+        "rendered": "<article>empty</article>",
+        "errorHidden": False,
+        "notice": '세션이 만료되었습니다. <a class="session-link" href="/?expired=1">로그인 화면으로 이동</a>',
+    }
+
+
+def test_late_expiry_for_stale_operation_date_cannot_replace_current_success_state():
+    """A delayed A 401 must not write a notice after B has loaded successfully."""
+    script = re.search(r"<script>(.*?)</script>", APP_HTML, re.S).group(1)
+    api = re.search(r"async function api\(path,options=\{\}\)\{.*?\}(?=\s*function statusFor)", script, re.S).group(0)
+    draw = re.search(r"function draw\(\)\{.*?\}(?=\s*function missingDetail)", script, re.S).group(0)
+    load = re.search(r"async function load\(\)\{.*?\}(?=\s*const sheetGesture)", script, re.S).group(0)
+    node = f"""
+const values = {{'date': {{value: '2026-08-30'}}, 'reviewable-count': {{textContent: ''}}, 'changed-count': {{textContent: ''}}, 'unverified-count': {{textContent: ''}}, 'cards': {{innerHTML: '', querySelectorAll: () => []}}, 'error': {{hidden: true, textContent: '', innerHTML: ''}}}};
+const $ = selector => values[selector.slice(1)];
+let summary = null, cards = [], missing = [], lastGood = [], loadGeneration = 0;
+const pendingA = [];
+const fetch = url => {{
+  if (url.includes('2026-08-31')) return Promise.resolve({{status: 200, ok: true, json: async () => ({{
+    'cards/summary?operation_date=2026-08-31': {{'카드 생성': 7, '판단 보류': 3, '카드 미생성': 1}},
+    'cards?operation_date=2026-08-31': [{{id: 'current-B'}}],
+    'cards/missing?operation_date=2026-08-31': []
+  }}[url.slice('/api/'.length)])}});
+  return new Promise(resolve => pendingA.push(() => resolve({{status: 401, ok: false, json: async () => ({{}})}})));
+}};
+const invalidateDetail = () => {{}};
+const resetSheetMotion = () => {{}};
+const row = item => `<article>${{item.id}}</article>`;
+const emptyState = () => '<article>empty</article>';
+{api}
+{draw}
+{load}
+(async () => {{
+  const loadA = load();
+  values.date.value = '2026-08-31';
+  await load();
+  pendingA.forEach(resolve => resolve());
+  await loadA;
+  console.log(JSON.stringify({{date: values.date.value, summary: [values['reviewable-count'].textContent, values['changed-count'].textContent, values['unverified-count'].textContent], rendered: values.cards.innerHTML, errorHidden: values.error.hidden, notice: values.error.innerHTML}}));
+}})();
+"""
+    rendered = json.loads(subprocess.check_output(["node", "-e", node], text=True))
+    assert rendered == {
+        "date": "2026-08-31",
+        "summary": ["7", "3", "1"],
+        "rendered": "<article>current-B</article>",
+        "errorHidden": True,
+        "notice": "",
     }
 
 
