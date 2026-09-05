@@ -1,102 +1,37 @@
 {
-  "version": 1,
+  "version": 2,
   "project": {
     "name": "Giraffe",
-    "productType": "authenticated paper-trading planner",
-    "stack": [
-      "FastAPI",
-      "server-rendered HTML",
-      "vanilla CSS",
-      "vanilla JavaScript"
-    ]
+    "productType": "authenticated Korean paper-trading decision office",
+    "stack": ["FastAPI", "server-rendered HTML", "vanilla CSS", "vanilla JavaScript"]
   },
   "sources": {
-    "tokens": ["kr_stock_autotrader/ui.py"],
+    "tokens": ["kr_stock_autotrader/ui.py", "kr_stock_autotrader/decision_card_app.html"],
     "components": ["AUTH_HTML", "APP_HTML"],
     "assets": [],
-    "instructions": ["README.md"]
+    "instructions": [".21st/DESIGN.md"]
   },
   "design": {
+    "language": "Private Investment Office / Quiet Authority",
+    "dials": {"variance": 6, "motion": 4, "density": 7},
     "colorMode": "light",
-    "colors": {
-      "primary": "#2563eb",
-      "primaryLow": "#eff6ff",
-      "paper": "#f8fafc",
-      "sheet": "#ffffff",
-      "ink": "#172033",
-      "inkLow": "#64748b",
-      "divider": "#dbe3ef",
-      "success": "#126b49",
-      "warning": "#a95b00",
-      "danger": "#c73524"
-    },
-    "typography": {
-      "family": "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
-      "roles": ["caption", "body", "title", "heading"]
-    },
+    "colors": {"graphite": "#161b25", "porcelain": "#f4f6f8", "sheet": "#ffffff", "ink": "#1d2735", "inkLow": "#667286", "divider": "#d8dee8", "cobalt": "#2457d6", "cobaltLow": "#edf2ff", "success": "#126b49", "warning": "#9a6200", "danger": "#b9382f"},
+    "typography": {"family": "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif", "numeric": "tabular-nums", "roles": ["eyebrow", "body", "data", "heading"]},
     "spacing": {"base": "8px"},
-    "radius": {"input": "12px", "card": "16px", "shell": "20px", "badge": "pill"},
-    "shadows": {"card": "warm tinted low elevation"},
-    "motion": {"intensity": 2, "rule": "feedback and state transitions only; honor reduced motion"},
-    "density": "daily app / medium"
+    "radius": {"control": "10px", "surface": "14px", "sheet": "18px"},
+    "motion": {"intensity": 4, "rule": "CSS/WAAPI only for sheet and state transitions; honor reduced motion"},
+    "hierarchy": ["purpose and current state", "accumulated review scale", "today changes", "unverified items", "provenance disclosure"]
   },
   "components": {
     "installed": [],
-    "preferredPrimitives": [
-      "semantic HTML",
-      "labeled inputs",
-      "segmented authentication button group",
-      "wizard step navigation",
-      "status summary",
-      "disclosure details",
-      "inline notices"
-    ],
-    "patterns": [
-      "server-enforced auth shell",
-      "authenticated dashboard",
-      "progressive task panels",
-      "human-readable plan cards",
-      "empty/loading/error states"
-    ]
+    "preferredPrimitives": ["semantic HTML", "office shell", "operational summary strip", "evidence-led decision rows", "disclosure", "keyboard-safe bottom sheet", "inline notices"],
+    "patterns": ["server-enforced auth shell", "authenticated decision dashboard", "truthful empty/loading/error states", "record-only automation boundary"]
   },
   "constraints": {
-    "must": [
-      "Unauthenticated root contains auth shell only",
-      "Authenticated app requires a valid session",
-      "Paper-only: no broker adapter or live order",
-      "SEED-inspired semantic tokens without Daangn assets or affiliation",
-      "Korean plain-language copy",
-      "44px minimum touch targets",
-      "Visible focus and reduced-motion handling",
-      "Mobile single-column fallback"
-    ],
-    "avoid": [
-      "Official Daangn logos, characters, or implied affiliation",
-      "CDN or frontend build dependency",
-      "Decorative gradients, glass effects, or excessive animation",
-      "Raw debug JSON in the user interface",
-      "Private plan or quote controls in unauthenticated HTML",
-      "Replacing existing project primitives with React-only 21st components"
-    ]
+    "must": ["Unauthenticated root contains auth shell only", "Authenticated app requires a valid session", "Paper-only: no broker adapter or live order", "Korean plain-language copy", "44px minimum touch targets", "Visible focus, ARIA live feedback, and reduced motion", "390px mobile single-column fallback", "Uncertainty, stale state, and missing provenance remain visible"],
+    "avoid": ["Gold or fake wealth/PnL/win-rate cues", "Glass, neon, gradients, ticker motion, or repeated reveal", "Card-in-card inflation", "Raw debug JSON or permanently exposed provenance", "CDN or frontend build dependency", "Replacing vanilla components with React-only components"]
   },
-  "decisions": [
-    {
-      "decision": "Trust-first Giraffe product UI with SEED-inspired semantic color roles and restrained motion",
-      "rationale": "Paper trading requires calm hierarchy, explicit safety boundaries, and low cognitive load."
-    },
-    {
-      "decision": "Use 21st sign-in, dashboard, form, tabs, card, and empty-state patterns as composition references only",
-      "rationale": "The project is server-rendered vanilla HTML; React/shadcn code would add unnecessary infrastructure."
-    },
-    {
-      "decision": "Taste dials: variance 3, motion 2, density 6",
-      "rationale": "This is a trust-first financial planning product; accessibility and clarity override marketing-page theatrics."
-    }
-  ],
-  "evidence": [
-    {"source": "https://seed-design.io", "note": "semantic token and interaction principles"},
-    {"source": "https://21st.dev/community/components", "note": "public sign-in, dashboard, form, tabs, card, and empty-state pattern library; CLI search requires account login"},
-    {"source": "https://github.com/21st-dev/skill", "note": "official 21st UI build and review workflow"}
-  ],
-  "generatedAt": "2026-08-30T12:04:15.448Z"
+  "decisions": [{"decision": "Private Investment Office / Quiet Authority", "rationale": "A selective, controlled decision surface is more truthful than performance theatre."}, {"decision": "Graphite/porcelain/cobalt tokens with semantic-only status colors", "rationale": "Preserves Giraffe blue lineage while making state and uncertainty legible."}, {"decision": "Native FastAPI SSR and vanilla implementation", "rationale": "Avoids dependency churn and preserves the working auth and decision contracts."}],
+  "evidence": [{"source": "Decision-Giraffe-Premium-Investor-UI-System", "note": "canonical design decision"}, {"source": "Evidence-Giraffe-Premium-UI-Tool-Review", "note": "implementation and review evidence"}],
+  "generatedAt": "2026-09-05T00:00:00+09:00"
 }

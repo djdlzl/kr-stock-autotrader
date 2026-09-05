@@ -133,11 +133,11 @@ print("signup-disabled-runtime-ok")
     assert probe.stdout.strip() == "signup-disabled-runtime-ok"
 
 
-def test_blue_primary_replaces_orange_primary_in_authenticated_shell():
+def test_quiet_authority_tokens_replace_prior_primary_in_authenticated_shell():
     client = TestClient(app)
     assert client.post("/api/signup", json={"email":"blue-theme@test.com","password":"long-password"}).status_code == 200
     html=client.get('/app').text
-    assert '--primary:#2563eb' in html and '--primary-low:#eff6ff' in html
+    assert '--graphite:#161b25' in html and '--porcelain:#f4f6f8' in html and '--cobalt:#2457d6' in html
 
 def signed_token(payload: dict) -> str:
     from kr_stock_autotrader.config import SESSION_SECRET
@@ -209,7 +209,7 @@ def test_ui_exposes_release0_read_only_decision_surface():
     client = TestClient(app)
     assert client.post("/api/signup", json={"email":"ui-controls@test.com","password":"long-password"}).status_code == 200
     html=client.get('/app').text
-    for required in ('id="logout"', '오늘 판단이 필요한 종목', '현재 단계: 기록 전용', '주문 기능 없음'):
+    for required in ('id="logout"', '투자 판단 오피스', '현재 단계: 기록 전용', '주문 기능 없음'):
         assert required in html
     for forbidden in ('새 매수 계획', '시세 입력', '수동 전량 매도', '매수 승인'):
         assert forbidden not in html

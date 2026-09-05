@@ -1,47 +1,42 @@
-<!-- Curated from 21st design context plus Giraffe product constraints. -->
-# Giraffe Design Context
+# Giraffe — Quiet Authority Design Contract
 
-## Design read
+## Product read
+Giraffe is a **Private Investment Office** for Korean paper-trading decisions. It must feel like a calm, selective operating surface: the user sees what is known, what changed, and what remains unverified—not invented wealth or performance.
 
-A trust-first Korean paper-trading product for non-expert users, using a calm SEED-inspired product language rather than a marketing-page aesthetic.
+- Taste dials: **variance 6 / motion 4 / density 7**.
+- Stack: FastAPI SSR + semantic HTML + CSS custom properties + small vanilla JS. No React, CDN, or new build system.
+- Visual language: cold-luxury **graphite**, **porcelain**, and one Giraffe **cobalt** accent. Korean-readable sans and tabular numeric settings.
 
-- Taste dials: variance 3, motion 2, density 5.
-- One warm orange accent and warm-neutral paper surfaces.
-- Motion is limited to feedback and state transitions.
-- Paper-only safety and authentication boundaries outrank decoration.
+## Information hierarchy
+1. Purpose and current investment-decision state.
+2. Accumulated review scale (reviewable cards, holds, evidence needing refresh).
+3. Today’s evidence and judgment changes.
+4. Items that are still unverified and cannot support a conclusion.
+5. Provenance and raw technical detail only behind an explicit disclosure.
 
-## Stack and reuse rule
+## Tokens
+- Graphite `#161b25`; porcelain `#f4f6f8`; sheet `#ffffff`; ink `#1d2735`; muted `#667286`; divider `#d8dee8`.
+- Cobalt `#2457d6`, cobalt low `#edf2ff`; semantic success `#126b49`, warning `#9a6200`, danger `#b9382f`.
+- 8px spatial rhythm; controls at least 44px; surface radius 14px; controls radius 10px; restrained elevation and separators.
+- Focus is a clearly visible cobalt outline. Respect `prefers-reduced-motion`; animation only explains a sheet or state transition.
 
-- FastAPI with server-rendered HTML, vanilla CSS, and vanilla JavaScript.
-- Reuse the project shells and semantic tokens before adding primitives.
-- 21st.dev sign-in, dashboard, form, button-group, wizard, card, and empty-state collections are composition references only.
-- Do not import React/shadcn components into this app solely to imitate a reference.
+## Components and behavior
+- Authenticated and unauthenticated views share the same graphite/porcelain/cobalt shell and compact office wordmark.
+- Dashboard summary is a single operational strip, not decorative KPI cards. Use real counts only and label unknown/stale states plainly.
+- Rows are evidence-led: identity, actual state, change, and next review. GOOD/BAD/warning colors are semantic only.
+- Detail is a keyboard-safe bottom sheet. Scenario, provenance, and raw detail use disclosures; focus trap, Escape, opener restoration, and mobile sheet behavior remain intact.
+- Loading, empty, error, session expiry, and unavailable evidence must be explicit Korean text states.
 
-## Required product patterns
-
-- Public root: authentication shell only.
-- Authenticated app: status summary, plan list, progressive create/tick panels.
-- Labels above inputs, explicit helper/error text, disabled/loading states.
-- Human-readable Korean status and condition copy.
-- Empty, loading, error, session-expired, and destructive-confirmation states.
-- 44px minimum touch targets, visible focus, reduced-motion support, mobile single column.
-
-## Visual tokens
-
-- Primary: `#ff6f0f`; primary low: `#fff0e5`.
-- Paper: `#fffaf6`; sheet: `#ffffff`.
-- Ink: `#1f1d1b`; low ink: `#6d6863`; divider: `#e9e1da`.
-- Semantic status: success `#126b49`, warning `#a95b00`, danger `#c73524`.
-- Base spacing: 8px. Inputs 12px radius, cards 16px, authentication shell 20px.
+## Non-negotiable constraints
+- Presentation only: do not alter API, database, authentication, card, evidence, scenario, order, or allocation semantics.
+- `SIGNUP_ENABLED=false` exposes neither signup UI/client code nor `/api/signup`; `LIVE_TRADING=false` remains unchanged.
+- Preserve logical focus order, ARIA live feedback, 200% zoom, 390px single-column layout, and 44px touch targets.
+- Do not fabricate PnL, win rate, holdings, performance, or certainty.
 
 ## Avoid
+- Gold wealth cues, neon, glassmorphism, gradients, ticker motion, repeated list reveals, parallax, or fake market pulses.
+- Card-in-card inflation, oversized marketing headlines, and permanently exposed raw/debug data.
+- Any implication of broker execution: this remains record-only paper trading.
 
-- Official Daangn logos, characters, or implied affiliation.
-- Private controls or data in unauthenticated HTML.
-- Raw debug JSON.
-- Decorative gradients, glass effects, excessive motion, card inflation, or oversized headlines.
-- New frontend build infrastructure without a direct requirement.
-
-## Evidence limits
-
-`21st search` requires an authenticated 21st account in this environment. Public 21st category pages and the official 21st build/review skills were used. Local `21st review` reports zero reviewed files for Python-embedded HTML, so manual source and Safari runtime review remains authoritative.
+## Evidence
+Canonical decision: `Decision-Giraffe-Premium-Investor-UI-System`. Tool review confirms project-native CSS/vanilla implementation and Better-style accessibility/layout review as the final quality bar.

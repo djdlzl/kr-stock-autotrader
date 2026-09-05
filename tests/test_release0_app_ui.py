@@ -22,14 +22,14 @@ def authenticated_app_html() -> str:
 def test_release0_primary_surface_is_change_first_and_record_only():
     html = authenticated_app_html()
     for expected in (
-        "오늘 판단이 필요한 종목",
-        "마지막 확인 이후 중요한 변화가 있는 종목만 표시합니다.",
+        "투자 판단 오피스",
+        "오늘 바뀐 근거와 아직 결론을 낼 수 없는 항목을 먼저 확인합니다.",
         "무엇이 달라졌나",
         "현재 판단",
         "지금 할 일과 다음 확인 항목",
         "판단을 막는 누락·충돌",
         "조건별 시나리오",
-        "출처와 변경 이력",
+        "Provenance · 원문과 변경 이력",
         "현재 단계: 기록 전용",
         "주문 기능 없음",
         "role=\"dialog\"",

@@ -58,7 +58,7 @@ def test_release0_dashboard_is_change_first_and_has_no_execution_controls():
     client = TestClient(app)
     assert client.post("/api/signup", json={"email":"aria-stepper@test.com","password":"long-password"}).status_code == 200
     html = client.get("/app").text
-    for required in ('오늘 판단이 필요한 종목', '마지막 확인 이후 중요한 변화가 있는 종목만 표시합니다.', 'role="dialog"', 'aria-modal="true"'):
+    for required in ('투자 판단 오피스', '오늘 변경', '아직 미확인', 'role="dialog"', 'aria-modal="true"'):
         assert required in html
     for forbidden in ('새 매수 계획', '시세 입력', '매수 승인', '수동 매도'):
         assert forbidden not in html
