@@ -83,7 +83,7 @@ def _js_renderer(payload):
 
 
 def test_extracted_js_dom_runtime_renders_v1_adapter_and_v2_actions_safely():
-    payload={"v2":{"situation":{"text":"<상황>","provenance":"card.proof_point"},"judgment":{"text":"판단","provenance":"derived.policy_v2"},"actions":{"no_position":"100원 이하에서만 신규 진입 검토","holding":"120원 이상 분할매도 검토"},"price_criterion":{"value_krw":100,"basis":"진입 상한","provenance":"card.price_cap"},"checks":[{"text":"<확인>","provenance":"card.next_check"}]},"v1":{"label":"GOOD","conditions":[{"text":"<미확인>","provenance":"card.unknowns"},{"text":"가짜 상방","provenance":"card.proof_point"}]},"bad":{"label":"BAD","conditions":[{"text":"계약 취소","provenance":"card.evidence_invalidation"}]},"base":{"label":"BASE","conditions":[{"text":"<확정 사실>","provenance":"evidence.summary"}]}}
+    payload={"v2":{"situation":{"text":"<상황>","provenance":"card.proof_point"},"judgment":{"text":"판단","provenance":"derived.policy_v2"},"actions":{"no_position":"100원 이하에서만 신규 진입 검토","holding":"120원 이상 분할매도 검토"},"price_criterion":{"value_krw":100,"basis":"진입 상한","provenance":"card.price_cap"},"checks":[{"text":"<확인>","provenance":"card.next_check"}]},"v1":{"label":"GOOD","conditions":[{"text":"<미확인>","provenance":"card.unknowns"},{"text":"<목록 미확인>","provenance":"card.unknowns[0]"},{"text":"<중첩 미확인>","provenance":"card.unknowns.items[0]"},{"text":"가짜 미확인 1","provenance":"card.unknownship"},{"text":"가짜 미확인 2","provenance":"card.unknownsFake"},{"text":"가짜 미확인 3","provenance":"card.unknowns_extra"},{"text":"가짜 상방","provenance":"card.proof_point"}]},"bad":{"label":"BAD","conditions":[{"text":"계약 취소","provenance":"card.evidence_invalidation"}]},"base":{"label":"BASE","conditions":[{"text":"<확정 사실>","provenance":"evidence.summary"}]}}
     # Feed the real extracted script without a browser; renderer input is only data.
     html=open("kr_stock_autotrader/decision_card_app.html", encoding="utf-8").read(); source=html.split("<script>",1)[1].split("</script>",1)[0]
     start=source.index("const $="); end=source.index("function scenarios")
@@ -96,4 +96,6 @@ def test_extracted_js_dom_runtime_renders_v1_adapter_and_v2_actions_safely():
     assert "구형 시나리오" in rendered["v1"] and "상방 시나리오 미생성" in rendered["v1"] and "가격 미설정" in rendered["v1"]
     assert "계약 취소" in rendered["bad"] and "&lt;확정 사실&gt;" in rendered["base"]
     assert "가짜 상방" not in rendered["v1"] and "&lt;미확인&gt;" in rendered["v1"]
+    assert "&lt;목록 미확인&gt;" in rendered["v1"] and "&lt;중첩 미확인&gt;" in rendered["v1"]
+    assert all(value not in rendered["v1"] for value in ("가짜 미확인 1", "가짜 미확인 2", "가짜 미확인 3"))
     assert ".scenario-actionable" in html and "overflow-wrap:anywhere" in html and "@media(max-width:520px)" in html
