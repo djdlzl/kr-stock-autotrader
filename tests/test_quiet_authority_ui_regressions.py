@@ -266,7 +266,7 @@ def test_scenario_renderer_groups_provenance_with_literal_escaped_fallbacks():
     }
     node = "const korean=v=>String(v??'');const esc=v=>String(v??'').replace(/[&<>\\\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\\\"':'&quot;',\"'\":'&#39;'}[c]));" + renderer + "\nconsole.log(scenarios(" + json.dumps(payload, ensure_ascii=False) + "));"
     rendered = subprocess.check_output(["node", "-e", node], text=True).strip()
-    for label in ("확인된 사실", "카드 판단", "성립 신호", "다음 확인", "미확인", "오탐 위험", "무효화 조건", "조건"):
+    for label in ("확인된 사실", "카드 판단", "성립 신호", "다음 확인", "오탐 위험", "무효화 조건", "조건"):
         assert label in rendered
     for literal in ("계약 &lt;확정&gt;", "공시 제목", "카드의 판단", "성립할 신호", "다음 공시", "원가 확인 전", "납기 지연", "계약 취소", "기존 수치 조건", "근거 없는 조건"):
         assert literal in rendered
@@ -274,6 +274,27 @@ def test_scenario_renderer_groups_provenance_with_literal_escaped_fallbacks():
     assert "evidence.summary" not in rendered and "card.headline" not in rendered and "legacy.price_krw" not in rendered
     assert " · " not in rendered
     assert "<dl" in rendered and "<dt" in rendered and "<dd" in rendered
+
+
+def test_scenario_renderer_classifies_nested_provenance_by_boundary_safe_root():
+    """Nested source leaves retain their parent category without accepting lookalikes."""
+    script = re.search(r"<script>(.*?)</script>", APP_HTML, re.S).group(1)
+    category = re.search(r"function scenarioCategory.*?(?=function scenarioConditions)", script, re.S).group(0)
+    cases = {
+        "evidence.summary.detail": "확인된 사실",
+        "evidence.title[0]": "확인된 사실",
+        "card.headline.reason": "카드 판단",
+        "card.proof_point[0]": "성립 신호",
+        "card.next_check.items[0]": "다음 확인",
+        "card.unknowns[0]": "조건",
+        "card.false_positive.risk": "오탐 위험",
+        "card.evidence_invalidation.reason": "무효화 조건",
+        "card.unknownship": "조건",
+        "card.headline_extra": "조건",
+        "evidence.summaryFake": "조건",
+    }
+    node = category + "\nconsole.log(JSON.stringify(Object.fromEntries(Object.keys(" + json.dumps(cases, ensure_ascii=False) + ").map(key => [key, scenarioCategory(key)]))));"
+    assert json.loads(subprocess.check_output(["node", "-e", node], text=True)) == cases
 
 
 def _relative_luminance(hex_color: str) -> float:
