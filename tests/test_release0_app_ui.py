@@ -454,6 +454,32 @@ console.log(JSON.stringify({upward,horizontal,badTime,rejectedTypes,qualified,af
     }
 
 
+def test_release0_bottom_sheet_hands_touch_compatibility_to_legacy_owner():
+    """TDD: a Safari touch fallback survives pointer cancellation and closes once."""
+    html = authenticated_app_html()
+    script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+    lifecycle = re.search(r"function animatedSheet.*?(?=function disclosure)", script, re.S).group(0)
+    gesture = re.search(r"const sheetGesture=.*?(?=const today)", script, re.S).group(0)
+    node = r'''
+let sheetCloseTimer=0,sheetCloseFinish=null,sheetCloseNode=null,nextTimer=0;const timers=new Map(),listeners={};
+const cls=()=>({items:new Set(['is-open']),add(...x){x.forEach(y=>this.items.add(y))},remove(...x){x.forEach(y=>this.items.delete(y))},contains(x){return this.items.has(x)}});
+const sheet={style:{},scrollTop:0,addEventListener:(type,fn)=>listeners[type]=fn,removeEventListener:(type,fn)=>{if(listeners[type]===fn)delete listeners[type]},setPointerCapture:()=>{},releasePointerCapture:id=>{if(listeners.lostpointercapture)listeners.lostpointercapture({type:'lostpointercapture',pointerType:'touch',isPrimary:true,pointerId:id,clientX:0,clientY:20,timeStamp:102,target:body})}};
+const dialog={hidden:false,classList:cls(),querySelector:()=>sheet};const main={inert:true,attrs:{'aria-hidden':'true'},setAttribute:(k,v)=>main.attrs[k]=v,removeAttribute:k=>delete main.attrs[k]};
+let restoredFocuses=0;const opener={focus:()=>restoredFocuses++},close={focus:()=>{}};const nodes={'#detail':dialog,'#app-main':main,'#detail-close':close,'#detail-title':{textContent:''},'#detail-content':{innerHTML:''}};const $=s=>nodes[s];
+const body={closest:()=>null};let invalidateCalls=0;const invalidateDetail=()=>invalidateCalls++;const matchMedia=()=>({matches:false});const setTimeout=fn=>{const id=++nextTimer;timers.set(id,fn);return id};const clearTimeout=id=>timers.delete(id);const requestAnimationFrame=fn=>fn();const window={innerHeight:600};
+''' + lifecycle + gesture + r'''
+const pointer=(type,e={})=>listeners[type]({type,pointerType:'touch',isPrimary:true,pointerId:1,clientX:0,clientY:0,timeStamp:100,target:body,cancelable:true,preventDefault:()=>{},...e});
+const touch=(type,y)=>{const point={identifier:7,clientX:0,clientY:y};listeners[type]({type,target:body,touches:type==='touchend'?[]:[point],changedTouches:[point],cancelable:true,preventDefault:()=>{}})};
+pointer('pointerdown',{clientY:0,timeStamp:100});touch('touchstart',0);pointer('pointercancel',{clientY:20,timeStamp:102});touch('touchmove',140);touch('touchend',140);pointer('pointerup',{clientY:140,timeStamp:130});
+const beforeFinish={hidden:dialog.hidden,inert:main.inert,aria:main.attrs['aria-hidden'],focuses:restoredFocuses,closeReady:Boolean(sheetCloseFinish),invalidateCalls};if(sheetCloseFinish)sheetCloseFinish({target:sheet,propertyName:'transform'});const afterFinish={hidden:dialog.hidden,inert:main.inert,aria:Object.hasOwn(main.attrs,'aria-hidden'),focuses:restoredFocuses,invalidateCalls};console.log(JSON.stringify({beforeFinish,afterFinish}));
+'''
+    state = json.loads(subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip())
+    assert state == {
+        "beforeFinish": {"hidden": False, "inert": True, "aria": "true", "focuses": 0, "closeReady": True, "invalidateCalls": 1},
+        "afterFinish": {"hidden": True, "inert": False, "aria": False, "focuses": 1, "invalidateCalls": 1},
+    }
+
+
 def test_release0_sheet_wide_swipe_at_scroll_top_contains_overscroll():
     """TDD: shipped handlers claim only top-of-scroll body drags and contain Safari overscroll."""
     html = authenticated_app_html()
