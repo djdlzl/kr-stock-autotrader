@@ -23,6 +23,10 @@
 - KST 실행일 `YYYY-MM-DD`와 `run_key=card-YYYY-MM-DD-0800-kst`를 만든다.
 - 이 KST 실행일이 scheduler run date이자 operation run date다. summary/detail/readback에서 날짜 축을 혼동하지 않는다.
 - `python -m kr_stock_autotrader.cli scheduler-start "$run_key" card`를 호출한다.
+- **처리 전에** `python -m kr_stock_autotrader.cli scheduler-latest research --date YYYY-MM-DD`로 같은 KST 실행일의 same-day latest `research` run을 조회한다.
+- 조회 결과의 `status=done`만 통과한다. `count=0`은 검증된 조사 완료이므로 통과하며, evidence가 반드시 1건 이상일 필요는 없다.
+- research run이 missing/error/not done이거나 조회 자체가 실패하면 fail-closed: `today-evidence`, `pending-cards`, filter, card 생성/저장을 시작하지 않는다. `scheduler-finish ... error`로 card run의 detail에 `stage=research_dependency`, research run 조회 결과 또는 오류, KST 실행일을 기록하고 최종 보고에도 같은 오류를 기록한 뒤 종료한다.
+- research dependency가 `done`으로 readback된 경우에만 아래 조회·처리를 계속한다.
 - `today-evidence --date YYYY-MM-DD`와 `pending-cards`를 모두 조회한다.
 - `today-evidence`는 원문 공개일(`known_at`) 기준 교차검증용이다. 07:00 수집 작업은 전날 장후 공개 재료도 오늘 저장할 수 있으므로 이것만으로 처리 대상을 정하지 않는다.
 - 처리 대상은 `pending-cards` 중 `collected_at`의 KST 날짜가 실행일과 같고, `status != invalidated`이며 현재 evidence version에 카드가 없는 항목이다.

@@ -20,6 +20,7 @@ def main(argv=None):
     a=s.add_parser('market-snapshot');a.add_argument('symbol');a.add_argument('as_of');a.add_argument('--announcement-at')
     a=s.add_parser('scheduler-start');a.add_argument('run_key');a.add_argument('kind')
     a=s.add_parser('scheduler-finish');a.add_argument('run_key');a.add_argument('status');a.add_argument('--count',type=int,default=0);a.add_argument('--detail',default='{}')
+    a=s.add_parser('scheduler-latest');a.add_argument('kind');a.add_argument('--date',required=True)
     x=p.parse_args(argv)
     if x.cmd=='today-evidence': out=call('GET','/api/internal/evidence?'+urlencode({'date':x.date}))
     elif x.cmd=='evidence-detail': out=call('GET','/api/internal/evidence/'+x.evidence_id)
@@ -36,6 +37,7 @@ def main(argv=None):
     elif x.cmd=='card-request': out=call('POST','/api/internal/cards/generate',json.loads(x.json))
     elif x.cmd=='card-save-result': out=call('POST','/api/internal/cards/results',json.loads(x.json))
     elif x.cmd=='scheduler-start': out=call('POST',f'/api/internal/scheduler-runs/{x.run_key}/start',{'kind':x.kind})
+    elif x.cmd=='scheduler-latest': out=call('GET','/api/internal/scheduler-runs/latest?'+urlencode({'kind':x.kind,'date':x.date}))
     else: out=call('POST',f'/api/internal/scheduler-runs/{x.run_key}/finish',{'status':x.status,'count':x.count,'detail':json.loads(x.detail)})
     print(json.dumps(out,ensure_ascii=False,sort_keys=True));return 0
 if __name__=='__main__': raise SystemExit(main())
