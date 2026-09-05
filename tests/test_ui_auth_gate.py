@@ -4,16 +4,20 @@ from fastapi.testclient import TestClient
 from app import app
 
 
-def test_unauthenticated_root_is_login_only_shell_without_private_controls():
+def test_unauthenticated_root_exposes_temporary_signup_when_enabled_without_private_controls():
     response = TestClient(app).get("/")
     assert response.status_code == 200
     html = response.text
-    for expected in ("모의투자 계획을 시작하세요", "로그인", "autocomplete=\"current-password\""):
+    for expected in (
+        "모의투자 계획을 시작하세요", "로그인", "회원가입", "id=\"login-mode\"",
+        "id=\"signup-mode\"", "role=\"group\"", "autocomplete=\"current-password\"",
+        "'/api/signup'", "new-password", "min-height:44px",
+    ):
         assert expected in html
-    for forbidden in ("회원가입", "signup", "login-tab", "signup-tab", "role=\"group\"", "내 계획", "시세 입력", "새 매수 계획", "감사 로그", "디버그 JSON"):
+    for forbidden in ("내 계획", "시세 입력", "새 매수 계획", "감사 로그", "디버그 JSON"):
         assert forbidden not in html
     assert html.count('type="submit"') == 1
-    assert "fetch('/api/login'" in html
+    assert "'/api/login'" in html
     assert TestClient(app).get("/app", follow_redirects=False).status_code == 303
 
 
@@ -21,6 +25,10 @@ def test_signup_login_logout_navigation_and_json_contracts():
     client = TestClient(app)
     signup = client.post("/api/signup", json={"email": "ux-gate@test.com", "password": "long-password"})
     assert signup.status_code == 200 and signup.json() == {"ok": True}
+    duplicate = client.post("/api/signup", json={"email": "ux-gate@test.com", "password": "long-password"})
+    assert duplicate.status_code == 409 and duplicate.json()["detail"] == "이미 가입된 이메일입니다"
+    short_password = TestClient(app).post("/api/signup", json={"email": "short@test.com", "password": "short"})
+    assert short_password.status_code == 422 and short_password.json()["detail"] == "입력 내용을 확인하세요"
     assert client.get("/", follow_redirects=False).headers["location"] == "/app"
     app_page = client.get("/app")
     assert app_page.status_code == 200

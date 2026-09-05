@@ -45,11 +45,12 @@ def test_session_sensitive_routes_and_auth_posts_are_private_and_vary_by_cookie(
     assert_private_response(anonymous.post("/api/logout"))
 
 
-def test_auth_shell_is_login_only_without_signup_controls_or_code():
+def test_enabled_auth_shell_has_signup_mode_without_tab_panels():
     html = TestClient(app).get("/").text
     assert html.count('type="submit"') == 1
-    assert "fetch('/api/login'" in html
-    for forbidden in ("회원가입", "signup", "login-tab", "signup-tab", "role=\"group\"", "role=\"tablist\"", "role=\"tab\"", "aria-controls=\"login-panel\"", "aria-controls=\"signup-panel\""):
+    for required in ("회원가입", "'/api/login'", "'/api/signup'", "id=\"login-mode\"", "id=\"signup-mode\"", "role=\"group\""):
+        assert required in html
+    for forbidden in ("login-tab", "signup-tab", "role=\"tablist\"", "role=\"tab\"", "aria-controls=\"login-panel\"", "aria-controls=\"signup-panel\""):
         assert forbidden not in html
 
 
