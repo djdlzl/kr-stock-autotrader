@@ -141,7 +141,7 @@ def test_nonbuy_cards_preserve_honest_null_order_fields_but_cannot_trade(db):
         "holding_until": "", "review_at": None, "valid_until": "", "expires": None,
         "order_type": None,
     }
-    pending = save_card(db, card(item["id"], fail["id"], filter_verdict="FAIL", verdict="판단 보류", **unavailable))
+    pending = save_card(db, card(item["id"], fail["id"], filter_verdict="FAIL", verdict="판단 보류", proof_point="시장 재개 확인", next_check="다음 시장 데이터 확인", **unavailable))
     assert pending["card"]["price_cap"] is None and pending["card"]["take_profit"] == []
     db.execute("INSERT INTO users(email,password) VALUES('null-order@test','p')"); db.commit()
     with pytest.raises(HTTPException): edit_draft(db, pending["id"], 1, {})

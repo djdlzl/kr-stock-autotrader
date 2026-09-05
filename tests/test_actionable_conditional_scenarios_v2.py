@@ -74,6 +74,74 @@ def test_incomplete_and_noneligible_cards_do_not_generate(monkeypatch, tmp_path)
     db.close()
 
 
+@pytest.mark.parametrize("verdict", ("판단 보류", "매수 검토 가능"))
+@pytest.mark.parametrize("field, bad", (("proof_point", "missing"), ("proof_point", None), ("proof_point", "   "), ("next_check", "missing"), ("next_check", None), ("next_check", "   ")))
+def test_new_scenario_eligible_save_rejects_missing_scenario_material_atomically(monkeypatch, tmp_path, verdict, field, bad):
+    """New eligible cards fail before any card, scenario, or order write."""
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / f"{verdict}-{field}-{bad}.db"))
+    from tests.test_decision_cards import card as card_payload, evidence as create_evidence, inputs
+    from kr_stock_autotrader.decision_cards import save_card, save_filter
+
+    db = dbmod.connect()
+    evidence = create_evidence(db)
+    filt = save_filter(db, evidence["id"], inputs(), "2026-08-31T09:00:00+09:00", "2026-08-31T08:00:00+09:00")
+    payload = card_payload(evidence["id"], filt["id"])
+    payload["card"].update({"verdict": verdict, "proof_point": "계약 이행 확인", "next_check": "다음 공시 확인"})
+    if verdict == "판단 보류":
+        payload["card"].update({"price_cap": None, "window": None, "max_amount": None, "max_qty": None, "stop_loss": None, "take_profit": None, "holding_until": None, "review_at": None, "valid_until": None, "expires": None, "order_type": None})
+    if bad == "missing":
+        del payload["card"][field]
+    else:
+        payload["card"][field] = bad
+
+    with pytest.raises(Exception) as raised:
+        save_card(db, payload)
+    assert getattr(raised.value, "status_code", None) == 422
+    assert {table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("decision_cards", "event_conditional_scenario_sets", "order_plans", "order_fills", "positions")} == {"decision_cards": 0, "event_conditional_scenario_sets": 0, "order_plans": 0, "order_fills": 0, "positions": 0}
+    db.close()
+
+
+def test_authenticated_api_rejects_new_incomplete_scenario_card_without_writes(monkeypatch, tmp_path):
+    """The internal save endpoint returns 422 before the save transaction starts."""
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "api-incomplete.db"))
+    monkeypatch.setenv("INTERNAL_API_KEY", "scenario-save-key")
+    from tests.test_decision_cards import card as card_payload, evidence as create_evidence, inputs
+    from kr_stock_autotrader.decision_cards import save_filter
+    from kr_stock_autotrader.api import app
+
+    db = dbmod.connect()
+    evidence = create_evidence(db)
+    filt = save_filter(db, evidence["id"], inputs(), "2026-08-31T09:00:00+09:00", "2026-08-31T08:00:00+09:00")
+    payload = card_payload(evidence["id"], filt["id"])
+    payload["card"].update({"proof_point": "계약 이행 확인", "next_check": None})
+    db.close()
+
+    response = TestClient(app).post("/api/internal/cards/results", json=payload, headers={"X-Internal-API-Key": "scenario-save-key"})
+    assert response.status_code == 422
+    db = dbmod.connect()
+    assert {table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("decision_cards", "event_conditional_scenario_sets", "order_plans", "order_fills", "positions")} == {"decision_cards": 0, "event_conditional_scenario_sets": 0, "order_plans": 0, "order_fills": 0, "positions": 0}
+    db.close()
+
+
+@pytest.mark.parametrize("verdict", ("관찰", "제외"))
+def test_new_noneligible_card_keeps_optional_scenario_material(monkeypatch, tmp_path, verdict):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / f"noneligible-{verdict}.db"))
+    from tests.test_decision_cards import card as card_payload, evidence as create_evidence, inputs
+    from kr_stock_autotrader.decision_cards import save_card, save_filter
+
+    db = dbmod.connect()
+    evidence = create_evidence(db)
+    filt = save_filter(db, evidence["id"], inputs(), "2026-08-31T09:00:00+09:00", "2026-08-31T08:00:00+09:00")
+    payload = card_payload(evidence["id"], filt["id"])
+    payload["card"].update({"verdict": verdict, "price_cap": None, "window": None, "max_amount": None, "max_qty": None, "stop_loss": None, "take_profit": None, "holding_until": None, "review_at": None, "valid_until": None, "expires": None, "order_type": None})
+    del payload["card"]["proof_point"]
+    del payload["card"]["next_check"]
+
+    assert save_card(db, payload)["card"]["verdict"] == verdict
+    assert db.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets").fetchone()[0] == 0
+    db.close()
+
+
 def _js_renderer(payload):
     html=open("kr_stock_autotrader/decision_card_app.html", encoding="utf-8").read()
     source=html.split("<script>",1)[1].split("</script>",1)[0]

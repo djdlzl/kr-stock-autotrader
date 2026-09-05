@@ -162,7 +162,11 @@ class DecisionCard(BaseModel):
 
     @model_validator(mode='after')
     def buy_review_requires_concrete_order_plan(self):
-        """Never let a buy-review card turn missing evidence into an order."""
+        """Keep new scenario-eligible saves complete before persistence."""
+        if self.verdict in {'판단 보류', '매수 검토 가능'} and (
+            not self.proof_point or not self.next_check
+        ):
+            raise ValueError('scenario-eligible verdict requires proof_point and next_check')
         if self.verdict != '매수 검토 가능':
             if isinstance(self.window, dict) and self.window:
                 raise ValueError('non-buy window may only be null or empty')

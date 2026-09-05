@@ -65,7 +65,7 @@ def test_conditional_immutable_retry_successor_observation_refusal_and_no_highli
     db.close()
 
 
-def test_card_save_orchestrates_only_complete_judgment_hold_candidate(monkeypatch, tmp_path):
+def test_card_save_orchestrates_complete_judgment_hold_candidate(monkeypatch, tmp_path):
     monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "orchestration.db"))
     from tests.test_decision_cards import card as card_payload, evidence as create_evidence, inputs
     from kr_stock_autotrader.decision_cards import save_card, save_filter
@@ -75,7 +75,7 @@ def test_card_save_orchestrates_only_complete_judgment_hold_candidate(monkeypatc
     saved_payload = card_payload(evidence["id"], filt["id"])
     saved_payload["card"].update({"verdict": "판단 보류", "filter_verdict": "PASS", "price_cap": None, "window": None, "max_amount": None, "max_qty": None, "stop_loss": None, "take_profit": None, "holding_until": None, "review_at": None, "valid_until": None, "expires": None, "order_type": None})
     saved = save_card(db, saved_payload)
-    assert db.execute("SELECT scenarios_json FROM event_conditional_scenario_sets WHERE card_id=?", (saved["id"],)).fetchone() is None
+    assert db.execute("SELECT scenarios_json FROM event_conditional_scenario_sets WHERE card_id=?", (saved["id"],)).fetchone() is not None
     assert db.execute("SELECT COUNT(*) FROM order_plans").fetchone()[0] == 0
     db.close()
 
