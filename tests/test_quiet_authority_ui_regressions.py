@@ -266,3 +266,59 @@ def test_quiet_authority_buttons_are_44px_and_focus_token_meets_nontext_contrast
         token = re.search(r"--focus:(#[0-9a-fA-F]{6})", source).group(1) if focus == "var(--focus)" else focus
         assert _contrast(token, "#ffffff") >= 3
         assert _contrast(token, "#f4f6f8") >= 3
+
+
+def test_mobile_sheet_is_viewport_anchored_and_touch_content_drag_closes_once():
+    """Content-origin iOS touch drags close only when they genuinely claim the sheet."""
+    sheet_rule = re.search(r"\.dialog-sheet\{([^}]*)\}", APP_HTML).group(1)
+    assert "margin:0 auto" in sheet_rule
+
+    script = re.search(r"<script>(.*?)</script>", APP_HTML, re.S).group(1)
+    motion = re.search(r"let sheetCloseGeneration=0;.*?(?=function disclosure)", script, re.S).group(0)
+    gesture = re.search(r"const sheetGesture=.*?(?=const today)", script, re.S).group(0)
+    node = """
+const listeners = {{}};
+const classes = () => {{ const values = new Set(); return {{add: (...names) => names.forEach(name => values.add(name)), remove: (...names) => names.forEach(name => values.delete(name)), contains: name => values.has(name)}}; }};
+const sheet = {{scrollTop: 0, style: {{}}, classList: classes(), addEventListener: (name, handler) => (listeners[name] ||= []).push(handler), removeEventListener: () => {{}}, setPointerCapture: () => {{}}, releasePointerCapture: () => {{}}, offsetHeight: 1}};
+const openerButton = {{focusCount: 0, focus() {{ this.focusCount++; }}}};
+const detail = {{hidden: false, classList: classes(), querySelector: selector => selector === '.dialog-sheet' ? sheet : null}};
+const main = {{inert: true, attrs: {{'aria-hidden': 'true'}}, setAttribute(name, value) {{ this.attrs[name] = value; }}, removeAttribute(name) {{ delete this.attrs[name]; }}};
+const values = {{detail, 'app-main': main}};
+const $ = selector => values[selector.slice(1)];
+let opener = openerButton;
+const matchMedia = () => ({{matches: false}});
+const window = {{innerHeight: 600}};
+const setTimeout = callback => {{ callback(); return 1; }};
+const clearTimeout = () => {{}};
+const invalidateDetail = () => {{}};
+const animatedSheet = () => true;
+let sheetCloseTimer = 0, sheetCloseFinish = null, sheetCloseNode = null;
+{motion}
+{gesture}
+const target = {{closest: () => null}};
+const button = {{closest: selector => selector.includes('button') ? {{}} : null}};
+const touch = (type, y, eventTarget = target) => {{
+  const point = {{identifier: 7, clientX: 20, clientY: y}};
+  for (const handler of listeners[type] || []) handler({{type, target: eventTarget, touches: type === 'touchend' || type === 'touchcancel' ? [] : [point], changedTouches: [point], cancelable: true, preventDefault() {{ this.prevented = true; }}});
+}};
+const resetDialog = () => {{ detail.hidden = false; main.inert = true; main.attrs['aria-hidden'] = 'true'; sheet.scrollTop = 0; sheet.style = {{}}; sheetGesture.reset(); }};
+const state = () => ({{hidden: detail.hidden, restored: !main.inert && !('aria-hidden' in main.attrs), focus: openerButton.focusCount}});
+resetDialog(); touch('touchstart', 0); touch('touchmove', 140); touch('touchend', 140); const closes = state();
+touch('pointerup', 140); const compatibilityPointerDidNotDoubleClose = openerButton.focusCount === 1;
+resetDialog(); touch('touchstart', 0); touch('touchmove', 40); touch('touchcancel', 40); const cancel = !detail.hidden;
+resetDialog(); touch('touchstart', 100); touch('touchmove', 20); touch('touchend', 20); const upward = !detail.hidden;
+resetDialog(); touch('touchstart', 0); const sideways = {{identifier: 7, clientX: 180, clientY: 20}}; for (const handler of listeners.touchmove || []) handler({{type: 'touchmove', target, touches: [sideways], changedTouches: [sideways], cancelable: true, preventDefault() {{}}}}); touch('touchend', 20); const horizontal = !detail.hidden;
+resetDialog(); touch('touchstart', 0, button); touch('touchmove', 140, button); touch('touchend', 140, button); const control = !detail.hidden;
+resetDialog(); sheet.scrollTop = 12; touch('touchstart', 0); touch('touchmove', 140); touch('touchend', 140); const scrolled = !detail.hidden;
+console.log(JSON.stringify({{closes, compatibilityPointerDidNotDoubleClose, cancel, upward, horizontal, control, scrolled}}));
+""".replace("{{", "{").replace("}}", "}").replace("{motion}", motion).replace("{gesture}", gesture)
+    result = json.loads(subprocess.check_output(["node", "-e", node], text=True))
+    assert result == {
+        "closes": {"hidden": True, "restored": True, "focus": 1},
+        "compatibilityPointerDidNotDoubleClose": True,
+        "cancel": True,
+        "upward": True,
+        "horizontal": True,
+        "control": True,
+        "scrolled": True,
+    }
