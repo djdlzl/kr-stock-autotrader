@@ -241,6 +241,41 @@ const emptyState = () => '<article>empty</article>';
     }
 
 
+def test_scenario_renderer_groups_provenance_with_literal_escaped_fallbacks():
+    """Scenario conditions are grouped for reading without changing their source text."""
+    script = re.search(r"<script>(.*?)</script>", APP_HTML, re.S).group(1)
+    renderer = re.search(r"function trustedScenario.*?(?=function renderDetail)", script, re.S).group(0)
+    payload = {
+        "event_scenarios": [{
+            "scenarios": [{
+                "label": "GOOD",
+                "conditions": [
+                    {"text": "계약 <확정>", "provenance": "evidence.summary"},
+                    {"text": "공시 제목", "provenance": "evidence.title"},
+                    {"text": "카드의 판단", "provenance": "card.headline"},
+                    {"text": "성립할 신호", "provenance": "card.proof_point"},
+                    {"text": "다음 공시", "provenance": "card.next_check"},
+                    {"text": "원가 확인 전", "provenance": "card.unknowns"},
+                    {"text": "납기 지연", "provenance": "card.false_positive"},
+                    {"text": "계약 취소", "provenance": "card.evidence_invalidation"},
+                    {"text": "기존 수치 조건", "provenance": "legacy.price_krw"},
+                    {"text": "근거 없는 조건", "provenance": None},
+                ],
+            }],
+        }],
+    }
+    node = "const korean=v=>String(v??'');const esc=v=>String(v??'').replace(/[&<>\\\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\\\"':'&quot;',\"'\":'&#39;'}[c]));" + renderer + "\nconsole.log(scenarios(" + json.dumps(payload, ensure_ascii=False) + "));"
+    rendered = subprocess.check_output(["node", "-e", node], text=True).strip()
+    for label in ("확인된 사실", "카드 판단", "성립 신호", "다음 확인", "미확인", "오탐 위험", "무효화 조건", "조건"):
+        assert label in rendered
+    for literal in ("계약 &lt;확정&gt;", "공시 제목", "카드의 판단", "성립할 신호", "다음 공시", "원가 확인 전", "납기 지연", "계약 취소", "기존 수치 조건", "근거 없는 조건"):
+        assert literal in rendered
+    assert rendered.count("확인된 사실") == 1
+    assert "evidence.summary" not in rendered and "card.headline" not in rendered and "legacy.price_krw" not in rendered
+    assert " · " not in rendered
+    assert "<dl" in rendered and "<dt" in rendered and "<dd" in rendered
+
+
 def _relative_luminance(hex_color: str) -> float:
     channels = [int(hex_color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
     linear = [value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4 for value in channels]
