@@ -19,6 +19,16 @@ def authenticated_app_html() -> str:
     return response.text
 
 
+def test_hidden_detail_dialog_cannot_be_overridden_by_grid_layout_css():
+    html = authenticated_app_html()
+    assert re.search(r'<section id="detail" class="dialog"[^>]*\bhidden>', html)
+    style_match = re.search(r"<style>(.*?)</style>", html, re.S)
+    assert style_match is not None
+    css = style_match.group(1)
+    assert re.search(r"\.dialog\s*\{[^}]*display\s*:\s*grid", css, re.S)
+    assert re.search(r"\.dialog\[hidden\]\s*\{\s*display\s*:\s*none\s*;?\s*\}", css)
+
+
 def test_release0_primary_surface_is_change_first_and_record_only():
     html = authenticated_app_html()
     for expected in (
