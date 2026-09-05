@@ -18,7 +18,7 @@ def _hold(db, *, symbol="277880", invalidated=False):
     evidence_id, card_id = _lineage(db, symbol)
     db.execute("""UPDATE material_evidence SET title=?,summary=?,source_url=?,announcement_at=?,status='card_generated' WHERE id=?""", (
         "믹싱시스템 공급 계약", "확인된 계약 사실", "https://example.test/dart", "2026-08-30T09:00:00+09:00", evidence_id))
-    card = {"symbol": symbol, "headline": "확인된 계약 사실", "unknowns": "원가와 마진", "false_positive": "납기 지연 또는 비용 증가", "evidence_invalidation": "계약 취소"}
+    card = {"symbol": symbol, "headline": "확인된 계약 사실", "proof_point": "계약 이행 확인", "next_check": "다음 공시 확인", "unknowns": "원가와 마진", "false_positive": "납기 지연 또는 비용 증가", "evidence_invalidation": "계약 취소"}
     db.execute("UPDATE decision_cards SET verdict='판단 보류',card_json=?,invalidated_at=? WHERE id=?", (
         dbmod.json.dumps(card, ensure_ascii=False), "2026-08-31T09:00:00+09:00" if invalidated else None, card_id))
     db.commit()
@@ -46,7 +46,7 @@ def test_conditional_immutable_retry_successor_observation_refusal_and_no_highli
     first = create(db, payload)
     assert first["expected_value_krw"] is None and first["scenario_kind"] == "CONDITIONAL"
     assert create(db, payload)["idempotent"] is True
-    mismatch = deepcopy(payload); mismatch["scenarios"][0]["conditions"].append({"text": "새 문장", "provenance": "test"})
+    mismatch = deepcopy(payload); mismatch["scenarios"][0]["situation"].update(text="새 문장")
     with pytest.raises(HTTPException) as exc: create(db, mismatch)
     assert exc.value.status_code == 409
     successor = deepcopy(payload); successor["version"] = 2
@@ -80,6 +80,29 @@ def test_card_save_orchestrates_only_complete_judgment_hold_candidate(monkeypatc
     db.close()
 
 
+def test_card_save_creates_v2_and_detail_read_model(monkeypatch, tmp_path):
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "save-v2.db"))
+    from tests.test_decision_cards import card as card_payload, evidence as create_evidence, inputs
+    from kr_stock_autotrader.decision_cards import save_card, save_filter, user_card_view
+    db = dbmod.connect(); evidence = create_evidence(db)
+    db.execute("UPDATE material_evidence SET source_url=?,announcement_at=? WHERE id=?", ("https://example.test/dart", "2026-08-30T09:00:00+09:00", evidence["id"])); db.commit()
+    filt = save_filter(db, evidence["id"], inputs(), "2026-08-31T09:00:00+09:00", "2026-08-31T08:00:00+09:00")
+    payload = card_payload(evidence["id"], filt["id"])
+    payload["card"].update({"verdict":"판단 보류", "price_cap":None, "window":None, "max_amount":None, "max_qty":None, "stop_loss":None, "take_profit":None, "holding_until":None, "review_at":None, "valid_until":None, "expires":None, "order_type":None, "proof_point":"계약 이행 확인", "next_check":"다음 공시 확인"})
+    saved = save_card(db, payload)
+    db.execute("INSERT INTO users(email,password) VALUES('saved-v2@example.test','p')"); db.commit()
+    item = user_card_view(db, saved["id"], 1)["event_scenarios"][0]
+    assert item["schema_version"] == 2 and [x["label"] for x in item["scenarios"]] == ["BAD", "BASE", "GOOD"]
+    from fastapi.testclient import TestClient
+    from kr_stock_autotrader.api import app
+    client = TestClient(app)
+    assert client.post("/api/signup", json={"email":"save-v2-api@example.test","password":"long-password"}).status_code == 200
+    response = client.get(f"/api/cards/{saved['id']}")
+    assert response.status_code == 200
+    assert response.json()["event_scenarios"][0]["schema_version"] == 2
+    assert all(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0 for table in ("order_plans", "order_fills", "positions"))
+    db.close()
+
 def test_backfill_is_dry_by_default_apply_is_idempotent_and_skips_invalidated(monkeypatch, tmp_path):
     monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "conditional.db"))
     db = dbmod.connect(); _, active = _hold(db); _, invalidated = _hold(db, symbol="012170", invalidated=True)
@@ -100,8 +123,8 @@ def test_conditional_create_and_internal_endpoint_reject_every_forged_field(monk
     db = dbmod.connect(); evidence, card = _hold(db)
     payload = build_scenario_candidate(evidence, card)["payload"]
     mutations = (
-        lambda p: p["scenarios"][0]["conditions"][0].update(text="INVENTED ATTACKER CONDITION"),
-        lambda p: p["scenarios"][0]["conditions"][0].update(provenance="forged.path"),
+        lambda p: p["scenarios"][0]["situation"].update(text="INVENTED ATTACKER CONDITION"),
+        lambda p: p["scenarios"][0]["situation"].update(provenance="forged.path"),
         lambda p: p["scenarios"][0].update(label="GOOD"),
         lambda p: p.update(scenarios=list(reversed(p["scenarios"]))),
         lambda p: p.update(event_identity="CONDITIONAL:forged:identity"),
@@ -114,7 +137,7 @@ def test_conditional_create_and_internal_endpoint_reject_every_forged_field(monk
     monkeypatch.setenv("INTERNAL_API_KEY", "test-internal-key")
     from fastapi.testclient import TestClient
     from kr_stock_autotrader.api import app
-    forged = deepcopy(payload); forged["scenarios"][0]["conditions"][0]["text"] = "INVENTED ATTACKER CONDITION"
+    forged = deepcopy(payload); forged["scenarios"][0]["situation"]["text"] = "INVENTED ATTACKER CONDITION"
     response = TestClient(app).post("/api/internal/scenario-sets", json=forged, headers={"X-Internal-API-Key": "test-internal-key"})
     assert response.status_code == 409
     assert db.execute("SELECT COUNT(*) FROM event_conditional_scenario_sets").fetchone()[0] == 0

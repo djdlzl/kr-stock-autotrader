@@ -16,7 +16,7 @@ REQUIRED_CARD_FIELDS = frozenset({
     'schema_version', 'symbol', 'headline', 'conclusion', 'change', 'source_evidence', 'source_urls',
     'business_value', 'certainty', 'priced_in', 'filter_verdict', 'price_cap', 'window',
     'max_amount', 'max_qty', 'stop_loss', 'take_profit', 'evidence_invalidation',
-    'holding_until', 'review_at', 'false_positive', 'unknowns', 'verdict', 'confidence'
+    'holding_until', 'review_at', 'false_positive', 'unknowns', 'proof_point', 'next_check', 'verdict', 'confidence'
 })
 
 
@@ -111,6 +111,9 @@ class DecisionCard(BaseModel):
     review_at: str | None = None
     false_positive: str = Field(min_length=1)
     unknowns: str = Field(min_length=1)
+    # Optional for v1 card compatibility; when supplied, these are strict source-bound v2 scenario material.
+    proof_point: str | None = None
+    next_check: str | None = None
     verdict: Literal['매수 검토 가능', '관찰', '제외', '판단 보류']
     confidence: float = Field(ge=0, le=1)
     valid_until: str | None = None
@@ -123,6 +126,12 @@ class DecisionCard(BaseModel):
     def nonblank(cls, value: str) -> str:
         if not value.strip(): raise ValueError('must be nonempty')
         return value.strip()
+
+    @field_validator('proof_point', 'next_check')
+    @classmethod
+    def optional_nonblank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip(): raise ValueError('must be nonempty when supplied')
+        return value.strip() if value is not None else None
 
     @field_validator('source_urls')
     @classmethod

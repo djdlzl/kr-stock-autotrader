@@ -524,16 +524,20 @@ def user_card_view(db, ident, user_id):
         "SELECT id,version,frozen_at,expected_value_krw," + quantitative_projection + ",scenarios_json "
         "FROM event_scenario_sets WHERE card_id=?", (ident,)
     ))
-    scenarios += list(db.execute("SELECT id,version,frozen_at,NULL AS expected_value_krw,'CONDITIONAL' AS scenario_kind,1 AS scenario_schema_version,scenarios_json FROM event_conditional_scenario_sets WHERE card_id=?",(ident,)))
+    scenarios += list(db.execute("SELECT id,version,frozen_at,NULL AS expected_value_krw,'CONDITIONAL' AS scenario_kind,1 AS scenario_schema_version,scenario_json,scenarios_json FROM event_conditional_scenario_sets WHERE card_id=?",(ident,)))
     for scenario in sorted(scenarios, key=lambda item: (item["scenario_kind"] == "CONDITIONAL", item["version"], item["frozen_at"], item["id"]), reverse=True):
         is_conditional = scenario["scenario_kind"] == "CONDITIONAL"
+        conditional_schema_version = 1
+        if is_conditional:
+            try: conditional_schema_version = json.loads(scenario["scenario_json"]).get("schema_version", 1)
+            except (TypeError, ValueError, AttributeError): conditional_schema_version = 1
         observations=[] if is_conditional else [dict(x) for x in db.execute("""SELECT known_at,retrieved_at,provider,source,
             CASE WHEN provider='KIS' THEN 'network_retrieved_at' ELSE NULL END AS timestamp_source,
             price_krw,best_bid,best_ask,volume_ratio,benchmark_excess_pct,
             sector_excess_pct,market_context_status,spread_pct,imbalance,match,action,active_scenario_label
             FROM event_scenario_observations WHERE scenario_set_id=? ORDER BY id DESC LIMIT 1""",(scenario["id"],))]
         current = observations[0] if observations else {"match":"UNOBSERVED","action":"NO_ACTION","active_scenario_label":None}
-        result["event_scenarios"].append({"kind":scenario["scenario_kind"],"schema_version":scenario["scenario_schema_version"],"version":scenario["version"],"frozen_at":scenario["frozen_at"],"expected_value_krw":scenario["expected_value_krw"],"scenarios":json.loads(scenario["scenarios_json"]),"current":current,"trust":_scenario_trust(current, invalidated=bool(result.get("invalidated_at"))),"tracking_state":"UNOBSERVABLE" if is_conditional else ("ACTIVE" if not result.get("invalidated_at") else "INACTIVE")})
+        result["event_scenarios"].append({"kind":scenario["scenario_kind"],"schema_version":conditional_schema_version if is_conditional else scenario["scenario_schema_version"],"version":scenario["version"],"frozen_at":scenario["frozen_at"],"expected_value_krw":scenario["expected_value_krw"],"scenarios":json.loads(scenario["scenarios_json"]),"current":current,"trust":_scenario_trust(current, invalidated=bool(result.get("invalidated_at"))),"tracking_state":"UNOBSERVABLE" if is_conditional else ("ACTIVE" if not result.get("invalidated_at") else "INACTIVE")})
     result["user_state"]={"decision":dict(decision) if decision else None,"order_plan":plan_view,"draft":({**dict(draft),"snapshot":json.loads(draft["snapshot_json"])} if draft else None),"default_paper_amount":_default_paper_amount(db, user_id)}
     return result
 
