@@ -102,6 +102,55 @@ const emptyState = () => '<article>empty</article>';
     }
 
 
+def test_session_expired_operation_date_refresh_fails_closed_without_overwriting_notice():
+    """A selected date must never display counts retrieved for a prior date after expiry."""
+    script = re.search(r"<script>(.*?)</script>", APP_HTML, re.S).group(1)
+    api = re.search(r"async function api\(path,options=\{\}\)\{.*?\}(?=\s*function statusFor)", script, re.S).group(0)
+    draw = re.search(r"function draw\(\)\{.*?\}(?=\s*function missingDetail)", script, re.S).group(0)
+    load = re.search(r"async function load\(\)\{.*?\}(?=\s*const sheetGesture)", script, re.S).group(0)
+    node = f"""
+const values = {{'date': {{value: '2026-08-30'}}, 'reviewable-count': {{textContent: ''}}, 'changed-count': {{textContent: ''}}, 'unverified-count': {{textContent: ''}}, 'cards': {{innerHTML: '', querySelectorAll: () => []}}, 'error': {{hidden: true, textContent: '', innerHTML: ''}}}};
+const $ = selector => values[selector.slice(1)];
+let summary = null, cards = [], missing = [], lastGood = [];
+const fetch = async url => {{
+  if (url.includes('2026-08-31')) return {{status: 401, ok: false, json: async () => ({{}})}};
+  const path = url.slice('/api/'.length);
+  return {{status: 200, ok: true, json: async () => ({{
+    'cards/summary?operation_date=2026-08-30': {{'카드 생성': 9, '판단 보류': 4, '카드 미생성': 2}},
+    'cards?operation_date=2026-08-30': [{{id: 'prior-row'}}],
+    'cards/missing?operation_date=2026-08-30': []
+  }}[path])}};
+}};
+const invalidateDetail = () => {{}};
+const resetSheetMotion = () => {{}};
+const row = item => `<article>${{item.id}}</article>`;
+const emptyState = () => '<article>empty</article>';
+{api}
+{draw}
+{load}
+(async () => {{
+  await load();
+  values.date.value = '2026-08-31';
+  await load();
+  console.log(JSON.stringify({{
+    date: values.date.value,
+    summary: [values['reviewable-count'].textContent, values['changed-count'].textContent, values['unverified-count'].textContent],
+    rendered: values.cards.innerHTML,
+    errorHidden: values.error.hidden,
+    notice: values.error.innerHTML
+  }}));
+}})();
+"""
+    rendered = json.loads(subprocess.check_output(["node", "-e", node], text=True))
+    assert rendered == {
+        "date": "2026-08-31",
+        "summary": ["—", "—", "—"],
+        "rendered": "<article>prior-row</article>",
+        "errorHidden": False,
+        "notice": '세션이 만료되었습니다. <a class="session-link" href="/?expired=1">로그인 화면으로 이동</a>',
+    }
+
+
 def _relative_luminance(hex_color: str) -> float:
     channels = [int(hex_color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
     linear = [value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4 for value in channels]
