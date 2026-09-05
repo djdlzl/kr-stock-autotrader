@@ -321,7 +321,7 @@ def save_card(db,data):
         # Mark active inside the same owner transaction before validating the
         # conditional lineage; a failure below rolls this status back too.
         db.execute("UPDATE material_evidence SET status='card_generated',updated_at=? WHERE id=?",(now(),ev["id"]))
-        if result["card"].get("verdict") == "판단 보류":
+        if result["card"].get("verdict") in {"판단 보류", "매수 검토 가능"} and result["card"].get("proof_point"):
             from .conditional_scenarios import build_scenario_candidate, create as create_conditional_scenario
             candidate=build_scenario_candidate(evidence_detail(db,ev["id"]),result)
             if candidate["status"] == "COMPLETE": create_conditional_scenario(db,candidate["payload"],commit=False)

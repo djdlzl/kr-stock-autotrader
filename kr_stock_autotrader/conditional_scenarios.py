@@ -7,13 +7,16 @@ from fastapi import HTTPException
 from .decision_cards import canon, now, _safe_source_url
 
 KIND="CONDITIONAL"; SCHEMA_VERSION=2; LABELS=("BAD","BASE","GOOD")
-
+_POLICY={
+    "BAD":"투자 논지가 약화되거나 무효화되었습니다.",
+    "BASE":"확인된 사실 범위에서 현재 판단을 유지합니다.",
+    "GOOD":"긍정적 증거가 확인될 때에만 투자 논지가 강화됩니다.",
+}
 
 def _fail(reason): return {"status":"SCENARIO_INPUTS_REQUIRED","missing":[reason]}
 def _leaves(value: Any, path: str) -> list[dict[str,str]]:
     if isinstance(value,str): return [{"text":value.strip(),"path":path}] if value.strip() else []
-    if isinstance(value,(list,tuple)):
-        return [leaf for i,item in enumerate(value) for leaf in _leaves(item,f"{path}[{i}]")]
+    if isinstance(value,(list,tuple)): return [leaf for i,item in enumerate(value) for leaf in _leaves(item,f"{path}[{i}]")]
     if isinstance(value,dict):
         out=[]
         for key,item in value.items():
@@ -40,9 +43,14 @@ def _price(card: dict[str,Any], label: str) -> dict[str,Any]:
         if _positive(card.get(key)): return {"value_krw":float(card[key]),"basis":basis,"provenance":path}
     return {"value_krw":None,"basis":"가격 미설정","provenance":None}
 
-def _actions(label: str, has_invalidation: bool) -> dict[str,str]:
-    holding=("무효화 조건이 확인되면 보유분을 검토·축소; 자동 매도 지시 없음" if has_invalidation and label=="BAD" else "자동 매도 지시 없음; 보유 지속 여부 검토")
-    return {"no_position":"신규 진입 안 함","holding":holding}
+def _actions(label: str, price: dict[str,Any], has_invalidation: bool) -> dict[str,str]:
+    value=price["value_krw"]
+    amount=f"{value:g}원" if value is not None else "가격 미설정"
+    if label == "BAD":
+        return {"no_position":"신규 진입 안 함", "holding":f"{amount} 이하 축소·매도 검토" if value is not None else ("무효화 조건 확인 시 축소·매도 검토 · 가격 미설정" if has_invalidation else "보유 지속 여부 확인 · 가격 미설정")}
+    if label == "BASE":
+        return {"no_position":f"{amount} 이하에서만 신규 진입 검토" if value is not None else "신규 진입 안 함 · 가격 미설정", "holding":"확인된 사실 범위에서 보유 유지·다음 확인"}
+    return {"no_position":"긍정 증거 확인 전 신규 진입 안 함", "holding":f"{amount} 이상 분할매도 검토" if value is not None else "긍정 증거와 보유 기준 확인 · 가격 미설정"}
 
 def build_scenario_candidate(evidence: dict[str,Any], card: dict[str,Any]) -> dict[str,Any]:
     evidence=evidence if isinstance(evidence,dict) else {}; wrapped=card.get("card") if isinstance(card,dict) and isinstance(card.get("card"),dict) else card
@@ -55,6 +63,7 @@ def build_scenario_candidate(evidence: dict[str,Any], card: dict[str,Any]) -> di
     except ValueError: return _fail("malformed_source_material")
     missing=[]
     if not proof: missing.append("card.proof_point")
+    if not checks or not any(x["provenance"].startswith("card.next_check") for x in checks): missing.append("card.next_check")
     if not base: missing.append("evidence.confirmed_summary_or_title")
     if not bad: missing.append("card.false_positive_or_evidence_invalidation")
     if not _safe_source_url(evidence.get("source_url")): missing.append("evidence.source_url")
@@ -63,13 +72,13 @@ def build_scenario_candidate(evidence: dict[str,Any], card: dict[str,Any]) -> di
     sets=[_normal(x) for x in (bad,base,proof)]
     if all(sets) and len({frozenset(x) for x in sets}) != 3: missing.append("distinct_source_conditions")
     if missing: return {"status":"SCENARIO_INPUTS_REQUIRED","missing":sorted(set(missing))}
-    scenario_sources={"BAD":bad,"BASE":base,"GOOD":proof}
-    scenarios=[]
+    scenario_sources={"BAD":bad,"BASE":base,"GOOD":proof}; scenarios=[]
+    has_invalidation=any(x["provenance"].startswith("card.evidence_invalidation") for x in bad)
     for label in LABELS:
         situation=_one(scenario_sources[label],"상황 확인 필요")
-        judgment={"text":f"{label} 조건: {situation['text']}","provenance":situation["provenance"]}
+        price=_price(wrapped,label)
         scenario_checks=_dedupe((bad if label=="BAD" else [])+checks)
-        scenarios.append({"label":label,"situation":situation,"judgment":judgment,"actions":_actions(label,any(x["provenance"].startswith("card.evidence_invalidation") for x in bad)),"price_criterion":_price(wrapped,label),"checks":scenario_checks})
+        scenarios.append({"label":label,"situation":situation,"judgment":{"text":_POLICY[label],"provenance":"derived.policy_v2"},"actions":_actions(label,price,has_invalidation),"price_criterion":price,"checks":scenario_checks})
     return {"status":"COMPLETE","payload":{"kind":KIND,"schema_version":SCHEMA_VERSION,"event_identity":f"CONDITIONAL:{evidence['id']}:{card['id']}","version":1,"symbol":evidence["symbol"],"event_type":KIND,"evidence_id":evidence["id"],"card_id":card["id"],"disclosed_at":evidence["announcement_at"],"known_at":evidence["known_at"],"source_url":evidence["source_url"],"scenarios":scenarios}}
 
 def _time(value):
@@ -81,14 +90,16 @@ def _time(value):
 
 def _source(value): return isinstance(value,dict) and set(value)=={"text","provenance"} and all(isinstance(value.get(k),str) and value[k].strip() for k in value)
 def _validate_v2_item(item):
-    if not isinstance(item,dict) or list(item)!=["label","situation","judgment","actions","price_criterion","checks"] or not _source(item["situation"]) or not _source(item["judgment"]): raise HTTPException(422,"invalid actionable conditional scenario")
+    if not isinstance(item,dict) or list(item)!=["label","situation","judgment","actions","price_criterion","checks"] or item.get("label") not in LABELS or not _source(item["situation"]) or not _source(item["judgment"]): raise HTTPException(422,"invalid actionable conditional scenario")
+    if item["judgment"] != {"text":_POLICY[item["label"]],"provenance":"derived.policy_v2"}: raise HTTPException(422,"invalid actionable conditional judgment")
     if not isinstance(item["actions"],dict) or set(item["actions"])!={"no_position","holding"} or not all(isinstance(x,str) and x.strip() for x in item["actions"].values()): raise HTTPException(422,"invalid actionable conditional actions")
     price=item["price_criterion"]
+    allowed={"BAD":"card.stop_loss","BASE":"card.price_cap","GOOD":"card.take_profit[0].price"}[item["label"]]
     if not isinstance(price,dict) or set(price)!={"value_krw","basis","provenance"} or not isinstance(price.get("basis"),str) or not price["basis"].strip(): raise HTTPException(422,"invalid actionable conditional price")
     value=price.get("value_krw")
     if value is None:
         if price.get("basis")!="가격 미설정" or price.get("provenance") is not None: raise HTTPException(422,"invalid unavailable conditional price")
-    elif not _positive(value) or not isinstance(price.get("provenance"),str) or not price["provenance"].startswith("card."): raise HTTPException(422,"invalid grounded conditional price")
+    elif not _positive(value) or price.get("provenance") != allowed: raise HTTPException(422,"invalid grounded conditional price")
     if not isinstance(item["checks"],list) or any(not _source(x) for x in item["checks"]): raise HTTPException(422,"invalid actionable conditional checks")
 
 def _validate(data):

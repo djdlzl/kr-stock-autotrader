@@ -241,8 +241,8 @@ const emptyState = () => '<article>empty</article>';
     }
 
 
-def test_scenario_renderer_groups_provenance_with_literal_escaped_fallbacks():
-    """Scenario conditions are grouped for reading without changing their source text."""
+def test_legacy_scenario_renderer_adapts_provenance_fail_closed_with_escaping():
+    """Historical v1 rows use the actionable adapter without inventing GOOD facts."""
     script = re.search(r"<script>(.*?)</script>", APP_HTML, re.S).group(1)
     renderer = re.search(r"function trustedScenario.*?(?=function renderDetail)", script, re.S).group(0)
     payload = {
@@ -266,13 +266,11 @@ def test_scenario_renderer_groups_provenance_with_literal_escaped_fallbacks():
     }
     node = "const korean=v=>String(v??'');const esc=v=>String(v??'').replace(/[&<>\\\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\\\"':'&quot;',\"'\":'&#39;'}[c]));" + renderer + "\nconsole.log(scenarios(" + json.dumps(payload, ensure_ascii=False) + "));"
     rendered = subprocess.check_output(["node", "-e", node], text=True).strip()
-    for label in ("확인된 사실", "카드 판단", "성립 신호", "다음 확인", "오탐 위험", "무효화 조건", "조건"):
-        assert label in rendered
-    for literal in ("계약 &lt;확정&gt;", "공시 제목", "카드의 판단", "성립할 신호", "다음 공시", "원가 확인 전", "납기 지연", "계약 취소", "기존 수치 조건", "근거 없는 조건"):
-        assert literal in rendered
-    assert rendered.count("확인된 사실") == 1
+    assert "구형 시나리오" in rendered and "상방 시나리오 미생성" in rendered and "가격 미설정" in rendered
+    assert "원가 확인 전" in rendered and "계약 &lt;확정&gt;" not in rendered
+    for literal in ("공시 제목", "카드의 판단", "성립할 신호", "다음 공시", "납기 지연", "계약 취소", "기존 수치 조건", "근거 없는 조건"):
+        assert literal not in rendered
     assert "evidence.summary" not in rendered and "card.headline" not in rendered and "legacy.price_krw" not in rendered
-    assert " · " not in rendered
     assert "<dl" in rendered and "<dt" in rendered and "<dd" in rendered
 
 
