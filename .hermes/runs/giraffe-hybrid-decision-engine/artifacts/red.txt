@@ -1,0 +1,13 @@
+Targeted RED run:
+
+- Command: `/Users/jaewoo/_workspace/giraffe-0905-market-context/.venv/bin/python -m pytest -q tests/test_hybrid_decision_engine.py`
+- Result: 4 failed, 0 passed
+
+Primary missing contracts:
+- `/api/internal/scenario-sets/{identity}/hybrid-outcomes` returned 404 because the hybrid outcome ledger endpoint does not exist yet.
+- `/api/internal/hybrid/calibrations` returned 404 because calibration snapshot creation/readback does not exist yet.
+- `/api/internal/cards/{card_id}/hybrid-evaluation` returned 404 because second-stage evaluation does not exist yet.
+- Card readback does not yet expose `hybrid_decision`.
+
+Fixture note:
+- The 09:05 market-context path was initially brittle in the test harness; the fixture was adjusted to persist a verified context directly through the existing evaluator so the RED signal stays on the missing hybrid slice.

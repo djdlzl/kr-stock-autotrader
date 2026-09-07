@@ -231,6 +231,66 @@ def connect() -> sqlite3.Connection:
       broker_mode TEXT NOT NULL CHECK(broker_mode='read_only_dry_run'), network_order_calls INTEGER NOT NULL CHECK(network_order_calls=0),
       UNIQUE(order_plan_id,user_id,dry_run_key)
     );
+    CREATE TABLE IF NOT EXISTS hybrid_policy_specs (
+      id INTEGER PRIMARY KEY,
+      policy_identity TEXT NOT NULL,
+      policy_version INTEGER NOT NULL,
+      policy_hash TEXT NOT NULL UNIQUE,
+      policy_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(policy_identity, policy_version)
+    );
+    CREATE TABLE IF NOT EXISTS hybrid_outcome_ledger (
+      id INTEGER PRIMARY KEY,
+      scenario_set_id INTEGER NOT NULL REFERENCES event_scenario_sets(id),
+      policy_id INTEGER NOT NULL REFERENCES hybrid_policy_specs(id),
+      idempotency_key TEXT NOT NULL,
+      observation_cutoff_at TEXT NOT NULL,
+      observed_at TEXT NOT NULL,
+      realized_label TEXT NOT NULL CHECK(realized_label IN ('GOOD','BASE','BAD')),
+      realized_reason TEXT NOT NULL,
+      input_sha256 TEXT NOT NULL CHECK(length(input_sha256)=64),
+      outcome_json TEXT NOT NULL,
+      bars_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(scenario_set_id, policy_id, idempotency_key)
+    );
+    CREATE TABLE IF NOT EXISTS hybrid_calibration_snapshots (
+      id INTEGER PRIMARY KEY,
+      scenario_set_id INTEGER NOT NULL REFERENCES event_scenario_sets(id),
+      policy_id INTEGER NOT NULL REFERENCES hybrid_policy_specs(id),
+      holdout_key TEXT NOT NULL,
+      cutoff_at TEXT NOT NULL,
+      input_sha256 TEXT NOT NULL CHECK(length(input_sha256)=64),
+      snapshot_json TEXT NOT NULL,
+      eligible INTEGER NOT NULL CHECK(eligible IN (0,1)),
+      failure_reasons TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS hybrid_second_stage_evaluations (
+      id INTEGER PRIMARY KEY,
+      card_id INTEGER NOT NULL REFERENCES decision_cards(id),
+      scenario_set_id INTEGER NOT NULL REFERENCES event_scenario_sets(id),
+      scenario_set_version INTEGER NOT NULL,
+      market_context_run_id INTEGER NOT NULL REFERENCES intraday_market_context_runs(id),
+      calibration_snapshot_id INTEGER NOT NULL REFERENCES hybrid_calibration_snapshots(id),
+      policy_id INTEGER NOT NULL REFERENCES hybrid_policy_specs(id),
+      policy_identity TEXT NOT NULL,
+      policy_version INTEGER NOT NULL,
+      policy_hash TEXT NOT NULL,
+      probability REAL NOT NULL,
+      lower_bound REAL NOT NULL,
+      denominator INTEGER NOT NULL,
+      final_state TEXT NOT NULL CHECK(final_state IN ('GOOD','BASE','BAD','HOLD')),
+      recommendation TEXT NOT NULL CHECK(recommendation IN ('BUY_REVIEW','WATCH','REDUCE_REVIEW','NO_ACTION','HOLD_INSUFFICIENT_EVIDENCE')),
+      recommendation_only INTEGER NOT NULL CHECK(recommendation_only IN (0,1)),
+      reason_codes_json TEXT NOT NULL,
+      lineage_hash TEXT NOT NULL UNIQUE,
+      known_at TEXT NOT NULL,
+      costs_json TEXT NOT NULL,
+      evaluation_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
     """)
     # Existing local databases predate cumulative-notional accounting.
     if "bought_amount" not in {col["name"] for col in db.execute("PRAGMA table_info(order_plans)")}:
@@ -252,6 +312,15 @@ def connect() -> sqlite3.Connection:
       ON deterministic_filter_results(evidence_id,as_of,known_at,evidence_version,evaluator_version,input_sha256)""")
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_filter_parent
       ON deterministic_filter_results(parent_filter_id) WHERE parent_filter_id IS NOT NULL""")
+    db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_outcome_idempotency
+      ON hybrid_outcome_ledger(scenario_set_id, policy_id, idempotency_key)""")
+    db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_calibration_cutoff
+      ON hybrid_calibration_snapshots(scenario_set_id, policy_id, holdout_key, cutoff_at, input_sha256)""")
+    db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_evaluation_lineage
+      ON hybrid_second_stage_evaluations(lineage_hash)""")
+    for table in ("hybrid_policy_specs", "hybrid_outcome_ledger", "hybrid_calibration_snapshots", "hybrid_second_stage_evaluations"):
+        db.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_no_update BEFORE UPDATE ON {table} BEGIN SELECT RAISE(ABORT,'immutable {table}'); END;")
+        db.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_no_delete BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'immutable {table}'); END;")
     # Conditional records deliberately use a separate append-only table. Do not
     # alter/rebuild quantitative event_scenario_sets: legacy schemas may contain
     # user-owned columns, indexes, triggers and observations.

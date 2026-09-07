@@ -756,6 +756,17 @@ async def internal_scenario_observation_append(identity: str, request: Request, 
     try: return observe_scenario(db, identity, await request.json())
     finally: db.close()
 
+
+@app.post('/api/internal/scenario-sets/{identity}/hybrid-outcomes')
+async def internal_hybrid_outcome_append(identity: str, request: Request, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try:
+        from .hybrid_recommendations import record_outcome
+
+        return record_outcome(db, identity, await request.json())
+    finally:
+        db.close()
+
 @app.post('/api/internal/evidence')
 async def internal_evidence_create(request: Request, _: None = Depends(require_internal_api_key)):
     data = await request.json(); db = connect()
@@ -837,6 +848,49 @@ async def internal_card_save(request: Request, _: None = Depends(require_interna
     db=connect()
     try:return save_card(db,await request.json())
     finally:db.close()
+
+
+@app.post('/api/internal/hybrid/calibrations')
+async def internal_hybrid_calibration_create(request: Request, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try:
+        from .hybrid_recommendations import create_calibration_snapshot
+
+        return create_calibration_snapshot(db, await request.json())
+    finally:
+        db.close()
+
+
+@app.get('/api/internal/hybrid/calibrations/{snapshot_id}')
+def internal_hybrid_calibration_detail(snapshot_id: int, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try:
+        from .hybrid_recommendations import read_calibration_snapshot
+
+        detail = read_calibration_snapshot(db, snapshot_id)
+        return {
+            **detail["snapshot"],
+            "id": detail["id"],
+            "policy_id": detail["policy_id"],
+            "holdout_key": detail["holdout_key"],
+            "cutoff_at": detail["cutoff_at"],
+            "eligible": bool(detail["eligible"]),
+            "failure_reasons": detail["failure_reasons"],
+            "created_at": detail["created_at"],
+        }
+    finally:
+        db.close()
+
+
+@app.post('/api/internal/cards/{card_id}/hybrid-evaluation')
+async def internal_hybrid_evaluation_create(card_id: int, request: Request, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try:
+        from .hybrid_recommendations import create_evaluation
+
+        return create_evaluation(db, card_id, await request.json())
+    finally:
+        db.close()
 
 @app.post('/api/internal/cards/{card_id}/market-context')
 async def internal_card_market_context(card_id: int, request: Request, _: None = Depends(require_internal_api_key)):
@@ -999,7 +1053,16 @@ def internal_cards(missing: bool = False, _: None = Depends(require_internal_api
 @app.get('/api/internal/cards/{card_id}')
 def internal_card_detail(card_id: int, _: None = Depends(require_internal_api_key)):
     db=connect()
-    try:return card_detail(db,card_id)
+    try:
+        detail = card_detail(db, card_id)
+        try:
+            from .hybrid_recommendations import latest_evaluation_for_card
+
+            latest = latest_evaluation_for_card(db, card_id)
+        except Exception:
+            latest = None
+        detail["hybrid_decision"] = latest["evaluation"] if latest else None
+        return detail
     finally:db.close()
 
 def _business_date(value: str | None) -> str:

@@ -562,6 +562,13 @@ def user_card_view(db, ident, user_id):
         }
     else:
         result["market_context"] = None
+    try:
+        from .hybrid_recommendations import latest_evaluation_for_card
+
+        latest = latest_evaluation_for_card(db, ident)
+    except Exception:
+        latest = None
+    result["hybrid_decision"] = latest["evaluation"] if latest else None
     return result
 
 def list_cards(db, missing=False, date=None, current_only=False, operation_date=False):
