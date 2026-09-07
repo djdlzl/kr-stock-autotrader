@@ -5,6 +5,7 @@ import tempfile
 from copy import deepcopy
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
@@ -60,11 +61,17 @@ def _make_lineage(db, *, symbol="005930", name="삼성전자", key="hybrid-evide
     return evidence, filt, saved
 
 
-def _scenario_payload(evidence_id, card_id, *, version=1):
+def _scenario_payload(evidence_id, card_id, *, version=1, probabilities=None, baseline_price=None):
     payload = deepcopy(scenario_payload(evidence_id, card_id))
     payload["event_identity"] = "DART:2026-09-03:hybrid"
     payload["version"] = version
     payload["symbol"] = "005930"
+    if baseline_price is not None:
+        payload["baseline"]["price_krw"] = baseline_price
+        payload["baseline"]["market_cap_krw"] = baseline_price * payload["baseline"]["shares_outstanding"]
+    if probabilities is not None:
+        for item in payload["scenarios"]:
+            item["probability"] = probabilities[item["label"]]
     return payload
 
 
@@ -186,7 +193,7 @@ def _case_timestamp(offset_days: int) -> str:
     return (BASE_CASE_AT + timedelta(days=offset_days)).isoformat()
 
 
-def _register_case(app, client, *, index, key="hybrid-cohort", version=1, event_identity_prefix="DART:2026-09-03:hybrid", known_at=None, row=None):
+def _register_case(app, client, *, index, key="hybrid-cohort", version=1, event_identity_prefix="DART:2026-09-03:hybrid", known_at=None, row=None, probabilities=None, baseline_price=None):
     db = dbmod.connect()
     evidence, filt, saved = _make_lineage(db, key=f"{key}-{index}")
     db.commit()
@@ -194,7 +201,7 @@ def _register_case(app, client, *, index, key="hybrid-cohort", version=1, event_
     scenario = client.post(
         "/api/internal/scenario-sets",
         headers=INTERNAL,
-        json=_scenario_payload(evidence["id"], saved["id"], version=version),
+        json=_scenario_payload(evidence["id"], saved["id"], version=version, probabilities=probabilities, baseline_price=baseline_price),
     )
     assert scenario.status_code == 200, scenario.text
     body = scenario.json()
@@ -215,13 +222,13 @@ def _register_case(app, client, *, index, key="hybrid-cohort", version=1, event_
     return body, outcome.json()
 
 
-def _create_plan(client, scenario_set_id, *, idempotency_key="plan-a", frozen_at="2026-09-07T09:00:00+09:00", is_start="2026-09-08T00:00:00+09:00", is_end="2026-09-18T00:00:00+09:00", oos_start="2026-09-18T00:00:00+09:00", oos_end="2026-10-08T00:00:00+09:00", cutoff_at="2026-10-15T15:30:00+09:00"):
+def _create_plan(client, scenario_set_id, *, idempotency_key="plan-a", holdout_key="holdout-a", frozen_at="2026-09-07T09:00:00+09:00", is_start="2026-09-08T00:00:00+09:00", is_end="2026-09-18T00:00:00+09:00", oos_start="2026-09-18T00:00:00+09:00", oos_end="2026-10-08T00:00:00+09:00", cutoff_at="2026-10-15T15:30:00+09:00"):
     payload = {
         "idempotency_key": idempotency_key,
         "scenario_set_id": scenario_set_id,
         "policy_identity": POLICY_ID,
         "policy_version": 1,
-        "holdout_key": "holdout-a",
+        "holdout_key": holdout_key,
         "is_window": {"start": is_start, "end": is_end},
         "oos_window": {"start": oos_start, "end": oos_end},
         "cutoff_at": cutoff_at,
@@ -242,7 +249,11 @@ def test_hybrid_outcomes_exclude_future_rows_and_close_on_same_bar_ambiguity(app
     db.commit()
     db.close()
 
-    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    scenario = client.post(
+        "/api/internal/scenario-sets",
+        headers=INTERNAL,
+        json=_scenario_payload(evidence["id"], saved["id"]),
+    )
     assert scenario.status_code == 200, scenario.text
     out = scenario.json()
 
@@ -294,7 +305,11 @@ def test_hybrid_missing_scenario_and_empty_bars_are_controlled_4xx(app_client):
     evidence, filt, saved = _make_lineage(db, key="hybrid-empty-bars")
     db.commit()
     db.close()
-    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    scenario = client.post(
+        "/api/internal/scenario-sets",
+        headers=INTERNAL,
+        json=_scenario_payload(evidence["id"], saved["id"]),
+    )
     assert scenario.status_code == 200
     out = scenario.json()
     empty = client.post(f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes", headers=INTERNAL, json={"idempotency_key": "empty", "observation_cutoff_at": "2026-09-11T15:30:00+09:00", "bars": []})
@@ -313,7 +328,11 @@ def test_hybrid_calibration_plan_idempotency_and_collision(app_client):
     evidence, filt, saved = _make_lineage(db, key="hybrid-plan")
     db.commit()
     db.close()
-    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    scenario = client.post(
+        "/api/internal/scenario-sets",
+        headers=INTERNAL,
+        json=_scenario_payload(evidence["id"], saved["id"]),
+    )
     assert scenario.status_code == 200, scenario.text
     out = scenario.json()
     first = _create_plan(client, out["id"], idempotency_key="plan-key")
@@ -323,6 +342,216 @@ def test_hybrid_calibration_plan_idempotency_and_collision(app_client):
     assert duplicate.json()["id"] == first.json()["id"]
     collision = _create_plan(client, out["id"], idempotency_key="plan-key", is_start="2026-09-09T00:00:00+09:00")
     assert collision.status_code == 409
+
+
+def test_hybrid_calibration_plans_are_db_immutable(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-plan-immutable")
+    db.commit()
+    db.close()
+    scenario = client.post(
+        "/api/internal/scenario-sets",
+        headers=INTERNAL,
+        json=_scenario_payload(evidence["id"], saved["id"], baseline_price=1000.0),
+    )
+    assert scenario.status_code == 200, scenario.text
+    plan = _create_plan(client, scenario.json()["id"], idempotency_key="immutable-plan")
+    assert plan.status_code == 200, plan.text
+    plan_id = plan.json()["id"]
+    db = dbmod.connect()
+    with pytest.raises(sqlite3.IntegrityError, match="immutable hybrid_calibration_plans"):
+        db.execute("UPDATE hybrid_calibration_plans SET holdout_key=? WHERE id=?", ("mutated", plan_id))
+    with pytest.raises(sqlite3.IntegrityError, match="immutable hybrid_calibration_plans"):
+        db.execute("DELETE FROM hybrid_calibration_plans WHERE id=?", (plan_id,))
+    db.close()
+
+
+def test_hybrid_holdout_reuse_blocks_distinct_plans_and_exact_replay_is_idempotent(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-holdout")
+    db.commit()
+    db.close()
+    scenario = client.post(
+        "/api/internal/scenario-sets",
+        headers=INTERNAL,
+        json=_scenario_payload(evidence["id"], saved["id"], baseline_price=1000.0),
+    )
+    assert scenario.status_code == 200, scenario.text
+    body = scenario.json()
+    plan1 = _create_plan(client, body["id"], idempotency_key="plan-a", holdout_key="holdout-shared")
+    assert plan1.status_code == 200, plan1.text
+    snapshot1 = _create_snapshot(client, plan1.json()["id"], idempotency_key="snapshot-a")
+    assert snapshot1.status_code == 200, snapshot1.text
+    assert snapshot1.json()["holdout_identity"]["use_count"] == 1
+    assert snapshot1.json()["holdout_identity"]["reuse_count"] == 0
+    replay = _create_snapshot(client, plan1.json()["id"], idempotency_key="snapshot-a")
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["id"] == snapshot1.json()["id"]
+    assert replay.json()["idempotent"] is True
+    plan2 = _create_plan(client, body["id"], idempotency_key="plan-b", holdout_key="holdout-shared")
+    assert plan2.status_code == 200, plan2.text
+    blocked = _create_snapshot(client, plan2.json()["id"], idempotency_key="snapshot-b")
+    assert blocked.status_code == 409
+    db = dbmod.connect()
+    try:
+        assert db.execute("SELECT COUNT(*) FROM hybrid_calibration_snapshots").fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_hybrid_snapshot_controls_use_case_specific_priors_and_full_denominator(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-controls")
+    db.commit()
+    db.close()
+    scenario = client.post(
+        "/api/internal/scenario-sets",
+        headers=INTERNAL,
+        json=_scenario_payload(evidence["id"], saved["id"], baseline_price=1000.0),
+    )
+    assert scenario.status_code == 200, scenario.text
+    body = scenario.json()
+    good_case, _ = _register_case(
+        app,
+        client,
+        index=1,
+        key="hybrid-controls",
+        known_at="2026-09-09T15:30:00+09:00",
+        probabilities={"BAD": 0.1, "BASE": 0.2, "GOOD": 0.7},
+    )
+    base_case, _ = _register_case(
+        app,
+        client,
+        index=2,
+        key="hybrid-controls",
+        known_at="2026-09-10T15:30:00+09:00",
+        probabilities={"BAD": 0.2, "BASE": 0.6, "GOOD": 0.2},
+    )
+    plan = _create_plan(
+        client,
+        body["id"],
+        idempotency_key="controls-plan",
+        holdout_key="holdout-controls",
+        is_start="2026-09-08T00:00:00+09:00",
+        is_end="2026-09-09T00:00:00+09:00",
+        oos_start="2026-09-09T00:00:00+09:00",
+        oos_end="2026-09-11T23:59:59+09:00",
+    )
+    assert plan.status_code == 200, plan.text
+    snapshot = _create_snapshot(client, plan.json()["id"], idempotency_key="controls-snapshot")
+    assert snapshot.status_code == 200, snapshot.text
+    controls = snapshot.json()["controls"]
+    assert controls["structural_prior_only"]["denominator"] == controls["hybrid_candidate"]["denominator"] == 2
+    assert controls["structural_prior_only"]["costs"]["round_trip_cost_bps"] == 16
+    assert controls["hybrid_candidate"]["costs"]["transaction_cost_bps"] == 8
+    structural_cases = {case["case_id"]: case for case in controls["structural_prior_only"]["cases"]}
+    assert structural_cases[good_case["id"]]["prior_label"] == "GOOD"
+    assert structural_cases[base_case["id"]]["prior_label"] == "BASE"
+    assert len(controls["structural_prior_only"]["case_ids"]) == len(set(controls["structural_prior_only"]["case_ids"]))
+    assert len(controls["hybrid_candidate"]["case_ids"]) == len(set(controls["hybrid_candidate"]["case_ids"]))
+    assert snapshot.json()["holdout_identity"]["use_count"] == 1
+    assert snapshot.json()["holdout_identity"]["reuse_count"] == 0
+
+
+def test_hybrid_ineligible_when_good_probability_is_high_but_candidate_return_is_non_positive(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-negative-return")
+    db.commit()
+    db.close()
+    scenario = client.post(
+        "/api/internal/scenario-sets",
+        headers=INTERNAL,
+        json=_scenario_payload(evidence["id"], saved["id"], baseline_price=1000.0),
+    )
+    assert scenario.status_code == 200, scenario.text
+    body = scenario.json()
+    good_band = next(item["per_share_value_range_krw"] for item in body["scenarios"] if item["label"] == "GOOD")
+    good_price = (good_band["low"] + good_band["high"]) / 2
+    for index in range(30):
+        if index < 21:
+            row = _case_row(
+                exchange_at=_case_timestamp(index),
+                known_at=_case_timestamp(index),
+                open_krw=good_price,
+                high_krw=good_price + 0.1,
+                low_krw=good_price - 0.1,
+                close_krw=good_price,
+                volume=1000.0,
+            )
+        else:
+            row = _case_row(
+                exchange_at=_case_timestamp(index),
+                known_at=_case_timestamp(index),
+                open_krw=2.0,
+                high_krw=3.0,
+                low_krw=1.0,
+                close_krw=1.5,
+                volume=1000.0,
+            )
+        case, _ = _register_case(
+            app,
+            client,
+            index=index + 1,
+            key="hybrid-negative-return",
+            known_at=_case_timestamp(index),
+            row=row,
+            baseline_price=1000.0,
+        )
+        assert case["id"]
+    plan = _create_plan(client, body["id"], idempotency_key="negative-return-plan", holdout_key="holdout-negative")
+    assert plan.status_code == 200, plan.text
+    snapshot = _create_snapshot(client, plan.json()["id"], idempotency_key="negative-return-snapshot")
+    assert snapshot.status_code == 200, snapshot.text
+    body = snapshot.json()
+    assert body["good"]["probability"] >= 0.5
+    assert body["good"]["lower_bound"] < 0.5
+    assert body["eligible"] is False
+    assert "good lower bound below threshold" in body["failure_reasons"]
+
+
+def test_hybrid_ineligible_when_candidate_is_not_better_than_structural_prior_only(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-not-better")
+    db.commit()
+    db.close()
+    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    assert scenario.status_code == 200, scenario.text
+    body = scenario.json()
+    good_band = next(item["per_share_value_range_krw"] for item in body["scenarios"] if item["label"] == "GOOD")
+    for index in range(30):
+        row = _case_row(
+            exchange_at=_case_timestamp(index),
+            known_at=_case_timestamp(index),
+            open_krw=good_band["low"] + 0.5,
+            high_krw=good_band["low"] + 1.5,
+            low_krw=good_band["low"] - 0.1,
+            close_krw=good_band["low"] + 0.8,
+            volume=1000.0,
+        )
+        case, _ = _register_case(
+            app,
+            client,
+            index=index + 1,
+            key="hybrid-not-better",
+            known_at=_case_timestamp(index),
+            row=row,
+            probabilities={"BAD": 0.1, "BASE": 0.2, "GOOD": 0.7},
+        )
+        assert case["id"]
+    plan = _create_plan(client, body["id"], idempotency_key="not-better-plan", holdout_key="holdout-not-better")
+    assert plan.status_code == 200, plan.text
+    snapshot = _create_snapshot(client, plan.json()["id"], idempotency_key="not-better-snapshot")
+    assert snapshot.status_code == 200, snapshot.text
+    body = snapshot.json()
+    assert body["controls"]["structural_prior_only"]["mean_net_return_bps"] == body["controls"]["hybrid_candidate"]["mean_net_return_bps"]
+    assert body["controls"]["hybrid_candidate"]["mean_net_return_bps"] > 0
+    assert body["eligible"] is False
+    assert "hybrid candidate not better than structural-prior-only" in body["failure_reasons"]
 
 
 def test_hybrid_calibration_rejects_posthoc_windows_and_target_case_reuse(app_client, monkeypatch):

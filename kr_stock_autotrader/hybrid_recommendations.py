@@ -29,7 +29,7 @@ HYBRID_POLICY_VERSION = 1
 HYBRID_POLICY_HASH = "policy-hash-unset"
 HYBRID_MIN_OVERALL_SAMPLES = 30
 HYBRID_MIN_OOS_SAMPLES = 20
-HYBRID_GOOD_LCB_THRESHOLD = Decimal("0.2")
+HYBRID_GOOD_LCB_THRESHOLD = Decimal("0.5")
 HYBRID_TRANSACTION_COST_BPS = 8
 HYBRID_ROUND_TRIP_COST_BPS = 16
 HYBRID_MAX_SPREAD_PCT = Decimal("0.05")
@@ -302,6 +302,10 @@ def _label_for_price(price: Decimal, scenario: dict[str, Any]) -> str:
         if band["low"] <= price <= band["high"]:
             return label
     return "BAD"
+
+
+def _argmax_prior_label(scenario: dict[str, Any]) -> str:
+    return max(scenario["scenarios"], key=lambda item: item["probability"])["label"]
 
 
 def _net_return_bps(entry_price: Decimal, exit_price: Decimal) -> Decimal:
@@ -578,6 +582,75 @@ def _plan_detail(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return out
 
 
+def _control_case_detail(db: sqlite3.Connection, row: dict[str, Any]) -> dict[str, Any]:
+    scenario = detail_by_id(db, row["scenario_set_id"])
+    prior_label = _argmax_prior_label(scenario)
+    baseline_price = _scenario_baseline_price(scenario)
+    costs = _policy_costs(float(baseline_price))
+    good_band = _band_for_label(scenario, "GOOD")
+    cost_adjusted_entry_price = (
+        baseline_price + Decimal(str(costs["entry_cost_krw"]))
+    ).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+    return {
+        "case_id": row["scenario_set_id"],
+        "scenario_set_id": row["scenario_set_id"],
+        "prior_label": prior_label,
+        "realized_label": row["realized_label"],
+        "net_return_bps": float(row["net_return_bps"]),
+        "baseline_price_krw": float(baseline_price),
+        "costs": costs,
+        "good_band": {
+            "low": float(good_band["low"]),
+            "high": float(good_band["high"]),
+        },
+        "cost_adjusted_entry_price_krw": float(cost_adjusted_entry_price),
+    }
+
+
+def _control_summary(
+    *,
+    name: str,
+    cases: list[dict[str, Any]],
+    trade_rule: Any,
+    policy_costs: dict[str, Any],
+) -> dict[str, Any]:
+    traded_cases = [case for case in cases if trade_rule(case)]
+    denominator = len(cases)
+    net_return_sum = sum(case["net_return_bps"] if trade_rule(case) else 0.0 for case in cases)
+    mean_net_return_bps = 0.0 if denominator == 0 else round(net_return_sum / denominator, 8)
+    success_count = sum(1 for case in traded_cases if case["realized_label"] == "GOOD")
+    trade_count = len(traded_cases)
+    success_rate = 0.0 if trade_count == 0 else round(success_count / trade_count, 8)
+    control_cases = [
+        {
+            "case_id": case["case_id"],
+            "scenario_set_id": case["scenario_set_id"],
+            "prior_label": case["prior_label"],
+            "realized_label": case["realized_label"],
+            "trade": bool(trade_rule(case)),
+            "net_return_bps": case["net_return_bps"] if trade_rule(case) else 0.0,
+            "costs": case["costs"],
+            "baseline_price_krw": case["baseline_price_krw"],
+            "good_band": case["good_band"],
+            "cost_adjusted_entry_price_krw": case["cost_adjusted_entry_price_krw"],
+        }
+        for case in cases
+    ]
+    return {
+        "name": name,
+        "decision_rule": name,
+        "denominator": denominator,
+        "trade_count": trade_count,
+        "success_count": success_count,
+        "success_rate": success_rate,
+        "mean_net_return_bps": mean_net_return_bps,
+        "net_return_bps": mean_net_return_bps,
+        "case_ids": [case["case_id"] for case in traded_cases],
+        "cases": control_cases,
+        "costs": policy_costs,
+    }
+
+
 def create_calibration_plan(db: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any]:
     if any(key in data for key in DERIVED_FIELDS):
         raise HTTPException(422, "derived fields are server-owned")
@@ -735,28 +808,54 @@ def create_calibration_snapshot(db: sqlite3.Connection, data: dict[str, Any]) ->
     oos_counts = {label: sum(1 for row in oos_rows if row["realized_label"] == label) for label in ("GOOD", "BASE", "BAD")}
     good_probability = 0.0 if oos_total == 0 else oos_counts["GOOD"] / oos_total
     good_lower_bound = _wilson_lower_bound(oos_counts["GOOD"], oos_total) if oos_total else 0.0
-    reuse_row = db.execute(
-        "SELECT count(*) n FROM hybrid_calibration_snapshots WHERE plan_id=? AND idempotency_key=?",
-        (plan["id"], payload.idempotency_key),
+    holdout_row = db.execute(
+        "SELECT COUNT(*) AS n FROM hybrid_calibration_snapshots WHERE policy_id=? AND cohort_key=? AND holdout_key=?",
+        (plan["policy_id"], plan["cohort_key"], plan["holdout_key"]),
     ).fetchone()
-    holdout_reuse_count = int(reuse_row["n"]) + 1
+    holdout_use_count = int(holdout_row["n"]) + 1
+    holdout_reuse_count = int(holdout_row["n"])
     case_ids = [row["scenario_set_id"] for row in selected_rows]
     oos_case_ids = [row["scenario_set_id"] for row in oos_rows]
     is_case_ids = [row["scenario_set_id"] for row in is_rows]
     concentration_label = max(counts, key=counts.get) if selected_rows else "BASE"
     concentration_pct = 0.0 if overall_total == 0 else round(counts[concentration_label] / overall_total * 100, 8)
-    prior_label = max((item for item in scenario["scenarios"]), key=lambda item: item["probability"])["label"]
-    prior_predictions = [{"case_id": row["scenario_set_id"], "prediction": prior_label, "realized_label": row["realized_label"]} for row in oos_rows]
-    prior_accuracy = 0.0 if not prior_predictions else sum(1 for item in prior_predictions if item["prediction"] == item["realized_label"]) / len(prior_predictions)
+    policy_cost_summary = {
+        "transaction_cost_bps": HYBRID_TRANSACTION_COST_BPS,
+        "round_trip_cost_bps": HYBRID_ROUND_TRIP_COST_BPS,
+        "round_trip_cost_rate": float(Decimal(HYBRID_ROUND_TRIP_COST_BPS) / Decimal(10000)),
+    }
+    control_cases = [_control_case_detail(db, row) for row in oos_rows]
+    no_trade = _control_summary(
+        name="no_trade",
+        cases=control_cases,
+        trade_rule=lambda _case: False,
+        policy_costs=policy_cost_summary,
+    )
+    structural_prior_only = _control_summary(
+        name="structural_prior_only",
+        cases=control_cases,
+        trade_rule=lambda case: case["prior_label"] == "GOOD",
+        policy_costs=policy_cost_summary,
+    )
+    hybrid_candidate = _control_summary(
+        name="hybrid_candidate",
+        cases=control_cases,
+        trade_rule=lambda case: case["prior_label"] in {"BASE", "GOOD"},
+        policy_costs=policy_cost_summary,
+    )
     failure_reasons: list[str] = []
     if overall_total < HYBRID_MIN_OVERALL_SAMPLES:
         failure_reasons.append("insufficient overall sample")
     if oos_total < HYBRID_MIN_OOS_SAMPLES:
         failure_reasons.append("insufficient oos sample")
-    if holdout_reuse_count > 1:
+    if holdout_reuse_count > 0:
         failure_reasons.append("holdout reused")
     if Decimal(str(good_lower_bound)) < HYBRID_GOOD_LCB_THRESHOLD:
         failure_reasons.append("good lower bound below threshold")
+    if hybrid_candidate["mean_net_return_bps"] <= 0:
+        failure_reasons.append("hybrid candidate mean net return not positive")
+    if hybrid_candidate["mean_net_return_bps"] <= structural_prior_only["mean_net_return_bps"]:
+        failure_reasons.append("hybrid candidate not better than structural-prior-only")
     snapshot = {
         "policy": {
             "identity": policy["policy_identity"],
@@ -784,6 +883,13 @@ def create_calibration_snapshot(db: sqlite3.Connection, data: dict[str, Any]) ->
             "is_case_ids": is_case_ids,
             "oos_case_ids": oos_case_ids,
         },
+        "holdout_identity": {
+            "policy_id": policy["id"],
+            "cohort_key": plan["cohort_key"],
+            "holdout_key": plan["holdout_key"],
+            "use_count": holdout_use_count,
+            "reuse_count": holdout_reuse_count,
+        },
         "windows": {
             "is": {"start": is_start.isoformat(), "end": is_end.isoformat(), "count": is_total},
             "oos": {"start": oos_start.isoformat(), "end": oos_end.isoformat(), "count": oos_total},
@@ -800,24 +906,15 @@ def create_calibration_snapshot(db: sqlite3.Connection, data: dict[str, Any]) ->
             "lower_bound": round(good_lower_bound, 8),
         },
         "controls": {
-            "hold": {"case_ids": oos_case_ids, "net_return_bps": 0.0, "denominator": oos_total, "result": "HOLD"},
-            "structural_prior_only": {
-                "prediction_rule": f"argmax_prior:{prior_label}",
-                "predicted_label": prior_label,
-                "accuracy": round(prior_accuracy, 8),
-                "case_ids": oos_case_ids,
-                "net_return_bps": round(sum(float(row["net_return_bps"]) for row in oos_rows if row["realized_label"] == prior_label), 8),
-            },
+            "no_trade": no_trade,
+            "structural_prior_only": structural_prior_only,
+            "hybrid_candidate": hybrid_candidate,
         },
         "concentration": {
             "label": concentration_label,
             "share_pct": concentration_pct,
         },
-        "costs": {
-            "transaction_cost_bps": HYBRID_TRANSACTION_COST_BPS,
-            "round_trip_cost_bps": HYBRID_ROUND_TRIP_COST_BPS,
-            "round_trip_cost_rate": float(Decimal(HYBRID_ROUND_TRIP_COST_BPS) / Decimal(10000)),
-        },
+        "costs": policy_cost_summary,
         "known_at_cutoff": cutoff_at.isoformat(),
         "holdout_reuse_count": holdout_reuse_count,
         "holdout_key": plan["holdout_key"],
@@ -840,27 +937,63 @@ def create_calibration_snapshot(db: sqlite3.Connection, data: dict[str, Any]) ->
     snapshot["eligible"] = not failure_reasons
     snapshot["is"] = snapshot["windows"]["is"]
     snapshot["oos"] = snapshot["windows"]["oos"]
-    row = db.execute(
-        """INSERT INTO hybrid_calibration_snapshots(
-          plan_id,scenario_set_id,policy_id,idempotency_key,cohort_key,holdout_key,cutoff_at,input_sha256,snapshot_json,eligible,failure_reasons,created_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *""",
-        (
-            plan["id"],
-            scenario["id"],
-            policy["id"],
-            payload.idempotency_key,
-            plan["cohort_key"],
-            plan["holdout_key"],
-            cutoff_at.isoformat(),
-            input_sha256,
-            canon(snapshot),
-            int(not failure_reasons),
-            canon(failure_reasons),
-            now(),
-        ),
-    ).fetchone()
-    db.commit()
-    detail = _snapshot_detail(row)
+    try:
+        row = db.execute(
+            """INSERT INTO hybrid_calibration_snapshots(
+              plan_id,scenario_set_id,policy_id,idempotency_key,cohort_key,holdout_key,cutoff_at,input_sha256,snapshot_json,eligible,failure_reasons,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *""",
+            (
+                plan["id"],
+                scenario["id"],
+                policy["id"],
+                payload.idempotency_key,
+                plan["cohort_key"],
+                plan["holdout_key"],
+                cutoff_at.isoformat(),
+                input_sha256,
+                canon(snapshot),
+                int(not failure_reasons),
+                canon(failure_reasons),
+                now(),
+            ),
+        ).fetchone()
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        existing = db.execute(
+            "SELECT * FROM hybrid_calibration_snapshots WHERE plan_id=? AND idempotency_key=?",
+            (plan["id"], payload.idempotency_key),
+        ).fetchone()
+        if existing and existing["input_sha256"] == input_sha256:
+            detail = _snapshot_detail(existing)
+            existing_snapshot = detail["snapshot"]
+            existing_snapshot["eligible"] = bool(detail["eligible"])
+            existing_snapshot["failure_reasons"] = json.loads(detail["failure_reasons"])
+            existing_snapshot["is"] = existing_snapshot["windows"]["is"]
+            existing_snapshot["oos"] = existing_snapshot["windows"]["oos"]
+            existing_snapshot["id"] = detail["id"]
+            return {
+                **existing_snapshot,
+                "id": detail["id"],
+                "plan_id": detail["plan_id"],
+                "scenario_set_id": detail["scenario_set_id"],
+                "policy_id": detail["policy_id"],
+                "idempotency_key": detail["idempotency_key"],
+                "holdout_key": detail["holdout_key"],
+                "cutoff_at": detail["cutoff_at"],
+                "eligible": bool(detail["eligible"]),
+                "failure_reasons": json.loads(detail["failure_reasons"]) if isinstance(detail["failure_reasons"], str) else detail["failure_reasons"],
+                "created_at": detail["created_at"],
+                "snapshot": existing_snapshot,
+                "idempotent": True,
+            }
+        collision = db.execute(
+            "SELECT 1 FROM hybrid_calibration_snapshots WHERE policy_id=? AND cohort_key=? AND holdout_key=?",
+            (plan["policy_id"], plan["cohort_key"], plan["holdout_key"]),
+        ).fetchone()
+        if collision:
+            raise HTTPException(409, "holdout reused")
+        raise
     snapshot["id"] = row["id"]
     snapshot["scenario_set_id"] = row["scenario_set_id"]
     snapshot["policy_id"] = row["policy_id"]

@@ -351,11 +351,13 @@ def connect() -> sqlite3.Connection:
       ON hybrid_calibration_plans(scenario_set_id, policy_id, idempotency_key)""")
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_calibration_snapshot_idem
       ON hybrid_calibration_snapshots(plan_id, idempotency_key)""")
+    db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_calibration_holdout_use
+      ON hybrid_calibration_snapshots(policy_id, cohort_key, holdout_key)""")
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_calibration_cutoff
       ON hybrid_calibration_snapshots(scenario_set_id, policy_id, holdout_key, cutoff_at, input_sha256)""")
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_evaluation_lineage
       ON hybrid_second_stage_evaluations(lineage_hash)""")
-    for table in ("hybrid_policy_specs", "hybrid_outcome_ledger", "hybrid_calibration_snapshots", "hybrid_second_stage_evaluations"):
+    for table in ("hybrid_policy_specs", "hybrid_outcome_ledger", "hybrid_calibration_plans", "hybrid_calibration_snapshots", "hybrid_second_stage_evaluations"):
         db.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_no_update BEFORE UPDATE ON {table} BEGIN SELECT RAISE(ABORT,'immutable {table}'); END;")
         db.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_no_delete BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'immutable {table}'); END;")
     # Conditional records deliberately use a separate append-only table. Do not
