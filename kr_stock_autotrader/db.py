@@ -333,6 +333,10 @@ def connect() -> sqlite3.Connection:
         ("decision_cards", "schema_version", "INTEGER NOT NULL DEFAULT 1"),
         ("order_plans", "approval_generation", "INTEGER NOT NULL DEFAULT 1"),
         ("order_plans", "bought_amount", "REAL NOT NULL DEFAULT 0"),
+        ("hybrid_outcome_ledger", "market_context_run_id", "INTEGER REFERENCES intraday_market_context_runs(id)"),
+        ("hybrid_outcome_ledger", "entry_gate_snapshot_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("hybrid_outcome_ledger", "entry_gate_snapshot_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("hybrid_outcome_ledger", "policy_qualified", "INTEGER NOT NULL DEFAULT 0 CHECK(policy_qualified IN (0,1))"),
     ):
         if column not in {col["name"] for col in db.execute(f"PRAGMA table_info({table})")}:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
@@ -347,6 +351,10 @@ def connect() -> sqlite3.Connection:
       ON hybrid_outcome_ledger(scenario_set_id, policy_id, idempotency_key)""")
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_outcome_case
       ON hybrid_outcome_ledger(scenario_set_id, policy_id)""")
+    db.execute("""CREATE INDEX IF NOT EXISTS idx_hybrid_outcome_policy_cohort_gate
+      ON hybrid_outcome_ledger(policy_id, cohort_key, policy_qualified, scenario_set_id, observation_cutoff_at, id)""")
+    db.execute("""CREATE INDEX IF NOT EXISTS idx_hybrid_outcome_market_context_run
+      ON hybrid_outcome_ledger(market_context_run_id)""")
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_calibration_plan_idem
       ON hybrid_calibration_plans(scenario_set_id, policy_id, idempotency_key)""")
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_calibration_snapshot_idem

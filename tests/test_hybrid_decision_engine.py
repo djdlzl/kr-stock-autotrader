@@ -75,7 +75,21 @@ def _scenario_payload(evidence_id, card_id, *, version=1, probabilities=None, ba
     return payload
 
 
-def _market_context(app, client, card_id, *, symbol="005930", last_price=100.0, best_bid=None, best_ask=None, top_bid_qty=20.0, top_ask_qty=20.0):
+def _market_context(
+    app,
+    client,
+    card_id,
+    *,
+    symbol="005930",
+    last_price=100.0,
+    best_bid=None,
+    best_ask=None,
+    top_bid_qty=20.0,
+    top_ask_qty=20.0,
+    requested_as_of=AS_OF,
+    snapshot_at=None,
+    run_key="hybrid-market-context-0905",
+):
     import kr_stock_autotrader.intraday_market_context as mc
     from kr_stock_autotrader.intraday_market_context import evaluate_intraday_market_context, persist_intraday_market_context_run, resolve_intraday_lineage_context, same_time_history_for_symbol
 
@@ -90,7 +104,7 @@ def _market_context(app, client, card_id, *, symbol="005930", last_price=100.0, 
     benchmark_symbol, previous_close = resolve_intraday_lineage_context(card=card, evidence=evidence, filter_result=filter_result)
     db.close()
 
-    snapshot_at = datetime(2026, 9, 7, 9, 5, 2, tzinfo=ZoneInfo("Asia/Seoul"))
+    snapshot_at = snapshot_at or datetime(2026, 9, 7, 9, 5, 2, tzinfo=ZoneInfo("Asia/Seoul"))
     best_bid = last_price - 0.04 if best_bid is None else best_bid
     best_ask = last_price if best_ask is None else best_ask
     stock_snapshot = _intraday_snapshot(
@@ -98,14 +112,14 @@ def _market_context(app, client, card_id, *, symbol="005930", last_price=100.0, 
         prices=[100, 100, 100, 100, 100, 100],
         volumes=[10, 10, 10, 10, 10, 10],
         retrieved_at=snapshot_at,
-        requested_as_of=AS_OF,
+        requested_as_of=requested_as_of,
     )
     benchmark_snapshot = _intraday_snapshot(
         benchmark_symbol,
         prices=[100, 100, 100, 100, 100, 100],
         volumes=[10, 10, 10, 10, 10, 10],
         retrieved_at=snapshot_at,
-        requested_as_of=AS_OF,
+        requested_as_of=requested_as_of,
     )
     orderbook = {
         "status": "ok",
@@ -132,11 +146,11 @@ def _market_context(app, client, card_id, *, symbol="005930", last_price=100.0, 
     db = dbmod.connect()
     response = persist_intraday_market_context_run(
         db,
-        run_key="hybrid-market-context-0905",
+        run_key=run_key,
         card=dict(card),
         evidence=dict(evidence),
         filter_result=filter_result,
-        requested_as_of=AS_OF,
+        requested_as_of=requested_as_of,
         stock_snapshot=stock_snapshot,
         benchmark_snapshot=benchmark_snapshot,
         orderbook=orderbook,
@@ -193,7 +207,21 @@ def _case_timestamp(offset_days: int) -> str:
     return (BASE_CASE_AT + timedelta(days=offset_days)).isoformat()
 
 
-def _register_case(app, client, *, index, key="hybrid-cohort", version=1, event_identity_prefix="DART:2026-09-03:hybrid", known_at=None, row=None, probabilities=None, baseline_price=None):
+def _register_case(
+    app,
+    client,
+    *,
+    index,
+    key="hybrid-cohort",
+    version=1,
+    event_identity_prefix="DART:2026-09-03:hybrid",
+    known_at=None,
+    row=None,
+    probabilities=None,
+    baseline_price=None,
+    market_context_last_price=None,
+    market_context_run_key=None,
+):
     db = dbmod.connect()
     evidence, filt, saved = _make_lineage(db, key=f"{key}-{index}")
     db.commit()
@@ -205,6 +233,15 @@ def _register_case(app, client, *, index, key="hybrid-cohort", version=1, event_
     )
     assert scenario.status_code == 200, scenario.text
     body = scenario.json()
+    good_band = next(item["per_share_value_range_krw"] for item in body["scenarios"] if item["label"] == "GOOD")
+    market_context = _market_context(
+        app,
+        client,
+        saved["id"],
+        symbol="005930",
+        last_price=market_context_last_price if market_context_last_price is not None else good_band["low"] + 0.5,
+        run_key=market_context_run_key or f"{key}-{index}-market-context",
+    )
     outcome_row = row or _case_row(
         exchange_at=known_at or _case_timestamp(index),
         known_at=known_at or _case_timestamp(index),
@@ -214,6 +251,7 @@ def _register_case(app, client, *, index, key="hybrid-cohort", version=1, event_
         headers=INTERNAL,
         json={
             "idempotency_key": f"case-{index}",
+            "market_context_run_id": market_context["id"],
             "observation_cutoff_at": "2026-10-15T15:30:00+09:00",
             "bars": [outcome_row],
         },
@@ -256,6 +294,7 @@ def test_hybrid_outcomes_exclude_future_rows_and_close_on_same_bar_ambiguity(app
     )
     assert scenario.status_code == 200, scenario.text
     out = scenario.json()
+    market_context = _market_context(app, client, saved["id"], symbol="005930", last_price=100.0)
 
     future_row = {
         "exchange_at": "2026-09-12T15:30:00+09:00",
@@ -267,7 +306,16 @@ def test_hybrid_outcomes_exclude_future_rows_and_close_on_same_bar_ambiguity(app
         "volume": 1000.0,
         "symbol": "005930",
     }
-    response = client.post(f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes", headers=INTERNAL, json={"idempotency_key": "future", "observation_cutoff_at": "2026-09-11T15:30:00+09:00", "bars": [future_row]})
+    response = client.post(
+        f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes",
+        headers=INTERNAL,
+        json={
+            "idempotency_key": "future",
+            "market_context_run_id": market_context["id"],
+            "observation_cutoff_at": "2026-09-11T15:30:00+09:00",
+            "bars": [future_row],
+        },
+    )
     assert response.status_code == 422
 
     ambiguous = {
@@ -280,14 +328,41 @@ def test_hybrid_outcomes_exclude_future_rows_and_close_on_same_bar_ambiguity(app
         "volume": 1000.0,
         "symbol": "005930",
     }
-    response = client.post(f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes", headers=INTERNAL, json={"idempotency_key": "ambiguous", "observation_cutoff_at": "2026-09-11T15:30:00+09:00", "bars": [ambiguous]})
+    response = client.post(
+        f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes",
+        headers=INTERNAL,
+        json={
+            "idempotency_key": "ambiguous",
+            "market_context_run_id": market_context["id"],
+            "observation_cutoff_at": "2026-09-11T15:30:00+09:00",
+            "bars": [ambiguous],
+        },
+    )
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["realized_label"] == "BAD"
     assert body["realized_reason"] == "same_bar_ambiguity_closed_bad"
-    duplicate = client.post(f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes", headers=INTERNAL, json={"idempotency_key": "ambiguous", "observation_cutoff_at": "2026-09-11T15:30:00+09:00", "bars": [dict(ambiguous)]})
+    duplicate = client.post(
+        f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes",
+        headers=INTERNAL,
+        json={
+            "idempotency_key": "ambiguous",
+            "market_context_run_id": market_context["id"],
+            "observation_cutoff_at": "2026-09-11T15:30:00+09:00",
+            "bars": [dict(ambiguous)],
+        },
+    )
     assert duplicate.status_code == 200 and duplicate.json()["idempotent"] is True
-    collision = client.post(f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes", headers=INTERNAL, json={"idempotency_key": "ambiguous", "observation_cutoff_at": "2026-09-11T15:30:00+09:00", "bars": [{**ambiguous, "close_krw": 101.0}]})
+    collision = client.post(
+        f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes",
+        headers=INTERNAL,
+        json={
+            "idempotency_key": "ambiguous",
+            "market_context_run_id": market_context["id"],
+            "observation_cutoff_at": "2026-09-11T15:30:00+09:00",
+            "bars": [{**ambiguous, "close_krw": 101.0}],
+        },
+    )
     assert collision.status_code == 409
 
 
@@ -312,7 +387,17 @@ def test_hybrid_missing_scenario_and_empty_bars_are_controlled_4xx(app_client):
     )
     assert scenario.status_code == 200
     out = scenario.json()
-    empty = client.post(f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes", headers=INTERNAL, json={"idempotency_key": "empty", "observation_cutoff_at": "2026-09-11T15:30:00+09:00", "bars": []})
+    market_context = _market_context(app, client, saved["id"], symbol="005930", last_price=100.0)
+    empty = client.post(
+        f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes",
+        headers=INTERNAL,
+        json={
+            "idempotency_key": "empty",
+            "market_context_run_id": market_context["id"],
+            "observation_cutoff_at": "2026-09-11T15:30:00+09:00",
+            "bars": [],
+        },
+    )
     assert empty.status_code == 422
     db = dbmod.connect()
     try:
@@ -320,6 +405,96 @@ def test_hybrid_missing_scenario_and_empty_bars_are_controlled_4xx(app_client):
     finally:
         db.close()
     assert after == before
+
+
+def test_hybrid_outcome_requires_market_context_run_id(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-missing-context")
+    db.commit()
+    db.close()
+    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    assert scenario.status_code == 200, scenario.text
+    out = scenario.json()
+    response = client.post(
+        f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes",
+        headers=INTERNAL,
+        json={
+            "idempotency_key": "missing-context",
+            "observation_cutoff_at": "2026-09-11T15:30:00+09:00",
+            "bars": [_case_row(exchange_at="2026-09-08T15:30:00+09:00", known_at="2026-09-08T15:30:00+09:00")],
+        },
+    )
+    assert response.status_code == 422
+    db = dbmod.connect()
+    try:
+        assert db.execute("SELECT COUNT(*) FROM hybrid_outcome_ledger").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_hybrid_outcome_rejects_cross_card_market_context_run_id(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-cross-card")
+    other_evidence, other_filt, other_saved = _make_lineage(db, key="hybrid-cross-card-other")
+    db.commit()
+    db.close()
+    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    assert scenario.status_code == 200, scenario.text
+    out = scenario.json()
+    other_context = _market_context(app, client, other_saved["id"], symbol="005930", last_price=100.0)
+    response = client.post(
+        f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes",
+        headers=INTERNAL,
+        json={
+            "idempotency_key": "cross-card",
+            "market_context_run_id": other_context["id"],
+            "observation_cutoff_at": "2026-09-11T15:30:00+09:00",
+            "bars": [_case_row(exchange_at="2026-09-08T15:30:00+09:00", known_at="2026-09-08T15:30:00+09:00")],
+        },
+    )
+    assert response.status_code == 409
+    db = dbmod.connect()
+    try:
+        assert db.execute("SELECT COUNT(*) FROM hybrid_outcome_ledger").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_hybrid_outcome_rejects_market_context_known_after_first_bar(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-future-context")
+    db.commit()
+    db.close()
+    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    assert scenario.status_code == 200, scenario.text
+    out = scenario.json()
+    future_context = _market_context(
+        app,
+        client,
+        saved["id"],
+        symbol="005930",
+        last_price=100.0,
+        snapshot_at=datetime(2026, 9, 9, 9, 5, 2, tzinfo=ZoneInfo("Asia/Seoul")),
+    )
+    response = client.post(
+        f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes",
+        headers=INTERNAL,
+        json={
+            "idempotency_key": "future-context",
+            "market_context_run_id": future_context["id"],
+            "observation_cutoff_at": "2026-09-11T15:30:00+09:00",
+            "bars": [_case_row(exchange_at="2026-09-08T15:30:00+09:00", known_at="2026-09-08T15:30:00+09:00")],
+        },
+    )
+    assert response.status_code == 422
+    db = dbmod.connect()
+    try:
+        assert db.execute("SELECT COUNT(*) FROM hybrid_outcome_ledger").fetchone()[0] == 0
+    finally:
+        db.close()
 
 
 def test_hybrid_calibration_plan_idempotency_and_collision(app_client):
@@ -593,12 +768,14 @@ def test_hybrid_independent_cohort_cases_and_target_exclusion(app_client):
     db.close()
     target = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
     target_body = target.json()
+    market_context = _market_context(app, client, saved["id"], symbol="005930", last_price=100.0)
 
     target_outcome = client.post(
         f"/api/internal/scenario-sets/{target_body['event_identity']}/hybrid-outcomes",
         headers=INTERNAL,
         json={
             "idempotency_key": "target",
+            "market_context_run_id": market_context["id"],
             "observation_cutoff_at": "2026-10-15T15:30:00+09:00",
             "bars": [_case_row(exchange_at="2026-09-09T15:30:00+09:00", known_at="2026-09-09T15:30:00+09:00")],
         },
@@ -628,6 +805,7 @@ def test_hybrid_requires_30_distinct_cases_not_30_rows_from_one_case(app_client)
     db.close()
     scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
     out = scenario.json()
+    market_context = _market_context(app, client, saved["id"], symbol="005930", last_price=100.0)
     accepted = 0
     rejected = 0
     for index in range(30):
@@ -636,6 +814,7 @@ def test_hybrid_requires_30_distinct_cases_not_30_rows_from_one_case(app_client)
             headers=INTERNAL,
             json={
                 "idempotency_key": f"row-{index}",
+                "market_context_run_id": market_context["id"],
                 "observation_cutoff_at": "2026-10-15T15:30:00+09:00",
                 "bars": [_case_row(exchange_at=_case_timestamp(index), known_at=_case_timestamp(index))],
             },
@@ -665,6 +844,7 @@ def test_hybrid_costs_can_downgrade_gross_good_to_net_base(app_client):
     db.close()
     scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
     out = scenario.json()
+    market_context = _market_context(app, client, saved["id"], symbol="005930", last_price=100.0)
     good_band = next(item["per_share_value_range_krw"] for item in out["scenarios"] if item["label"] == "GOOD")
     gross_price = good_band["low"] + 0.05
     response = client.post(
@@ -672,6 +852,7 @@ def test_hybrid_costs_can_downgrade_gross_good_to_net_base(app_client):
         headers=INTERNAL,
         json={
             "idempotency_key": "cost-case",
+            "market_context_run_id": market_context["id"],
             "observation_cutoff_at": "2026-10-15T15:30:00+09:00",
             "bars": [
                 _case_row(
@@ -753,6 +934,7 @@ def test_hybrid_normal_persisted_market_context_exposes_top_book_depth_and_allow
     scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
     out = scenario.json()
     good_band = next(item["per_share_value_range_krw"] for item in out["scenarios"] if item["label"] == "GOOD")
+    first_case = None
     for index in range(30):
         good_price = good_band["low"] + 0.5
         row = _case_row(
@@ -764,9 +946,11 @@ def test_hybrid_normal_persisted_market_context_exposes_top_book_depth_and_allow
             close_krw=good_price,
             volume=1000.0,
         )
-        case, _ = _register_case(app, client, index=index + 1, key="hybrid-topbook-positive", known_at=_case_timestamp(index), row=row)
+        case, outcome = _register_case(app, client, index=index + 1, key="hybrid-topbook-positive", known_at=_case_timestamp(index), row=row)
         assert case["id"]
-    price = (good_band["low"] + good_band["high"]) / 2
+        if first_case is None:
+            first_case = outcome
+    price = good_band["low"] + 0.5
     market_context = _market_context(app, client, saved["id"], symbol="005930", last_price=price, best_bid=price - 0.04, best_ask=price, top_bid_qty=20.0, top_ask_qty=20.0)
     assert market_context["metrics"]["top_bid_qty"] == 20.0
     assert market_context["metrics"]["top_ask_qty"] == 20.0
@@ -784,6 +968,9 @@ def test_hybrid_normal_persisted_market_context_exposes_top_book_depth_and_allow
     assert body["recommendation"] == "BUY_REVIEW"
     assert body["final_state"] == "GOOD"
     assert body["structural_good_compatibility"]["status"] == "GOOD_COMPATIBLE"
+    assert body["entry_gate"]["policy_qualified"] is first_case["policy_qualified"]
+    assert body["entry_gate"]["reason_codes"] == first_case["entry_gate_snapshot"]["reason_codes"]
+    assert body["entry_gate"]["inputs"]["price_krw"] == first_case["entry_gate_snapshot"]["inputs"]["price_krw"]
     assert body["structural_good_compatibility"]["inputs"]["top_bid_qty"] == 20.0
     assert body["structural_good_compatibility"]["inputs"]["top_ask_qty"] == 20.0
 
@@ -829,6 +1016,50 @@ def test_hybrid_cost_adjusted_entry_outside_frozen_good_band_blocks_buy_review(a
     assert body["final_state"] != "GOOD"
     assert body["structural_good_compatibility"]["status"] != "GOOD_COMPATIBLE"
     assert "cost_adjusted_entry_outside_frozen_good_band" in body["structural_good_compatibility"]["reasons"]
+
+
+def test_hybrid_unqualified_context_cases_are_excluded_from_calibration_denominator(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-unqualified")
+    db.commit()
+    db.close()
+    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    assert scenario.status_code == 200, scenario.text
+    out = scenario.json()
+    good_band = next(item["per_share_value_range_krw"] for item in out["scenarios"] if item["label"] == "GOOD")
+    for index in range(30):
+        row = _case_row(
+            exchange_at=_case_timestamp(index),
+            known_at=_case_timestamp(index),
+            open_krw=good_band["low"] + 0.5,
+            high_krw=good_band["low"] + 1.5,
+            low_krw=good_band["low"] - 0.1,
+            close_krw=good_band["low"] + 0.8,
+            volume=1000.0,
+        )
+        case, outcome = _register_case(
+            app,
+            client,
+            index=index + 1,
+            key="hybrid-unqualified",
+            known_at=_case_timestamp(index),
+            row=row,
+            market_context_last_price=1.0,
+        )
+        assert case["id"]
+        assert outcome["policy_qualified"] is False
+    plan = _create_plan(client, out["id"], idempotency_key="unqualified-plan", holdout_key="holdout-unqualified")
+    assert plan.status_code == 200, plan.text
+    snapshot = _create_snapshot(client, plan.json()["id"], idempotency_key="unqualified-snapshot")
+    assert snapshot.status_code == 200, snapshot.text
+    body = snapshot.json()
+    assert body["counts"]["overall"] == 0
+    assert body["selection"]["selected_count"] == 0
+    assert body["selection"]["excluded_count"] == 30
+    assert body["selection"]["excluded_reason_counts"]["price_outside_frozen_good_band"] == 30
+    assert body["eligible"] is False
+    assert "insufficient overall sample" in body["failure_reasons"]
 
 
 def test_hybrid_invalidation_dominates_and_forbidden_tables_remain_zero(app_client):

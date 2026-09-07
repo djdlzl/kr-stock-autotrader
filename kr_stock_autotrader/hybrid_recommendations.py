@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -21,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .decision_cards import canon, now
 from .domain import parse_kst
 from .event_scenarios import detail_by_id
-from .intraday_market_context import latest_market_context_for_card
+from .intraday_market_context import latest_market_context_for_card, market_context_run_detail
 
 
 HYBRID_POLICY_IDENTITY = "giraffe-hybrid-good-base-bad-v1"
@@ -102,6 +103,7 @@ class HybridOutcomeIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     idempotency_key: str = Field(min_length=1, max_length=200)
+    market_context_run_id: int = Field(gt=0)
     observation_cutoff_at: str
     bars: list[HybridOutcomeBarIn]
 
@@ -271,6 +273,107 @@ def _evaluation_detail(row: sqlite3.Row | None) -> dict[str, Any] | None:
     out = dict(row)
     out["evaluation"] = json.loads(out["evaluation_json"])
     return out
+
+
+def _entry_gate_snapshot(
+    *,
+    scenario: dict[str, Any],
+    market_context: dict[str, Any],
+    invalidated: bool,
+) -> dict[str, Any]:
+    metrics = market_context["result"]["metrics"]
+    good_band = _band_for_label(scenario, "GOOD")
+    price_krw = metrics.get("last_price_krw")
+    spread_pct = metrics.get("spread_pct")
+    top_imbalance = metrics.get("top_of_book_imbalance")
+    volume_ratio = metrics.get("same_time_baseline_volume_ratio")
+    top_bid_qty = metrics.get("top_bid_qty")
+    top_ask_qty = metrics.get("top_ask_qty")
+    top_book_ok = (
+        top_bid_qty is not None
+        and top_ask_qty is not None
+        and Decimal(str(top_bid_qty)) >= HYBRID_MIN_TOP_BOOK_QTY
+        and Decimal(str(top_ask_qty)) >= HYBRID_MIN_TOP_BOOK_QTY
+    )
+    market_verified = (
+        market_context["status"] == "VERIFIED"
+        and metrics.get("same_time_baseline_status") == "READY"
+        and metrics.get("previous_close_gap_status") == "VERIFIED"
+        and spread_pct is not None
+        and Decimal(str(spread_pct)) <= HYBRID_MAX_SPREAD_PCT
+        and top_imbalance is not None
+        and abs(Decimal(str(top_imbalance))) <= Decimal("0.5")
+        and volume_ratio is not None
+        and top_book_ok
+    )
+    cost_adjusted_entry_price = None
+    if price_krw is not None:
+        costs = _policy_costs(float(price_krw))
+        cost_adjusted_entry_price = (
+            Decimal(str(price_krw)) + Decimal(str(costs["entry_cost_krw"]))
+        ).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+    else:
+        costs = _policy_costs(0.0)
+    within_band = price_krw is not None and good_band["low"] <= Decimal(str(price_krw)) <= good_band["high"]
+    within_cost_band = cost_adjusted_entry_price is not None and good_band["low"] <= cost_adjusted_entry_price <= good_band["high"]
+    reasons: list[str] = []
+    if invalidated:
+        reasons.append("business_invalidated")
+    if market_context["status"] != "VERIFIED":
+        reasons.append("market_context_not_verified")
+    if metrics.get("same_time_baseline_status") != "READY":
+        reasons.append("same_time_baseline_not_ready")
+    if metrics.get("previous_close_gap_status") != "VERIFIED":
+        reasons.append("previous_close_gap_not_verified")
+    if spread_pct is None or Decimal(str(spread_pct)) > HYBRID_MAX_SPREAD_PCT:
+        reasons.append("spread_pct_exceeds_policy")
+    if top_imbalance is None or abs(Decimal(str(top_imbalance))) > Decimal("0.5"):
+        reasons.append("top_of_book_imbalance_exceeds_policy")
+    if not top_book_ok:
+        reasons.append("min_top_of_book_qty_not_satisfied")
+    if volume_ratio is None:
+        reasons.append("same_time_baseline_volume_ratio_missing")
+    if not within_band:
+        reasons.append("price_outside_frozen_good_band")
+    if price_krw is not None and not within_cost_band:
+        reasons.append("cost_adjusted_entry_outside_frozen_good_band")
+    policy_qualified = not invalidated and market_verified and within_cost_band
+    status = "POLICY_QUALIFIED" if policy_qualified else "POLICY_UNQUALIFIED"
+    return {
+        "status": status,
+        "policy_qualified": policy_qualified,
+        "reason_codes": reasons,
+        "inputs": {
+            "market_context_run_id": market_context["id"],
+            "market_context_status": market_context["status"],
+            "known_at": market_context["known_at"],
+            "retrieved_at": market_context["retrieved_at"],
+            "scenario_band": {"low": float(good_band["low"]), "high": float(good_band["high"])},
+            "price_krw": price_krw,
+            "cost_adjusted_entry_price_krw": None if cost_adjusted_entry_price is None else float(cost_adjusted_entry_price),
+            "round_trip_cost_bps": HYBRID_ROUND_TRIP_COST_BPS,
+            "entry_cost_krw": costs["entry_cost_krw"],
+            "top_bid_qty": top_bid_qty,
+            "top_ask_qty": top_ask_qty,
+            "spread_pct": spread_pct,
+            "top_of_book_imbalance": top_imbalance,
+            "same_time_baseline_status": metrics.get("same_time_baseline_status"),
+            "same_time_baseline_volume_ratio": volume_ratio,
+            "previous_close_gap_status": metrics.get("previous_close_gap_status"),
+            "business_invalidated": invalidated,
+        },
+    }
+
+
+def _entry_gate_detail(entry_gate_snapshot: dict[str, Any]) -> dict[str, Any]:
+    snapshot_hash = _sha256(canon(entry_gate_snapshot))
+    return {
+        "status": entry_gate_snapshot["status"],
+        "policy_qualified": bool(entry_gate_snapshot["policy_qualified"]),
+        "snapshot": entry_gate_snapshot,
+        "snapshot_hash": snapshot_hash,
+        "reason_codes": list(entry_gate_snapshot["reason_codes"]),
+    }
 
 
 def _cohort_key(scenario: dict[str, Any]) -> str:
@@ -486,7 +589,23 @@ def record_outcome(db: sqlite3.Connection, scenario_identity: str, data: dict[st
         raise HTTPException(422, "observation cutoff must follow scenario freeze")
     bars = payload.bars
     validated_bars = _validate_outcome_rows(bars, frozen_at=frozen_at, cutoff_at=cutoff_at, symbol=scenario["symbol"])
-    payload = canon({"observation_cutoff_at": cutoff_at.isoformat(), "bars": validated_bars})
+    market_context = market_context_run_detail(db, run_id=payload.market_context_run_id)
+    if market_context["card_id"] != scenario["card_id"]:
+        raise HTTPException(409, "market context card mismatch")
+    first_exchange_at = min(parse_kst(row["exchange_at"]) for row in validated_bars)
+    if parse_kst(market_context["known_at"]) >= first_exchange_at:
+        raise HTTPException(422, "market context must be known before first outcome bar")
+    card = db.execute("SELECT * FROM decision_cards WHERE id=?", (scenario["card_id"],)).fetchone()
+    evidence = db.execute("SELECT * FROM material_evidence WHERE id=?", (scenario["evidence_id"],)).fetchone()
+    invalidated = bool(card["invalidated_at"] or evidence["invalidated_at"] or evidence["status"] == "invalidated")
+    entry_gate_snapshot = _entry_gate_snapshot(scenario=scenario, market_context=market_context, invalidated=invalidated)
+    payload = canon(
+        {
+            "market_context_run_id": payload.market_context_run_id,
+            "observation_cutoff_at": cutoff_at.isoformat(),
+            "bars": validated_bars,
+        }
+    )
     input_sha256 = _sha256(payload)
     existing = db.execute(
         "SELECT * FROM hybrid_outcome_ledger WHERE scenario_set_id=? AND idempotency_key=?",
@@ -510,8 +629,9 @@ def record_outcome(db: sqlite3.Connection, scenario_identity: str, data: dict[st
         """INSERT INTO hybrid_outcome_ledger(
           scenario_set_id,policy_id,idempotency_key,cohort_key,case_id,event_type,profile_id,profile_version,scenario_kind,
           scenario_set_version,observation_cutoff_at,observed_at,realized_label,realized_reason,gross_label,gross_return_bps,
-          net_return_bps,input_sha256,pricing_json,outcome_json,bars_json,created_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *""",
+          net_return_bps,input_sha256,pricing_json,outcome_json,bars_json,market_context_run_id,entry_gate_snapshot_json,
+          entry_gate_snapshot_hash,policy_qualified,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *""",
         (
             scenario["id"],
             policy["id"],
@@ -534,6 +654,10 @@ def record_outcome(db: sqlite3.Connection, scenario_identity: str, data: dict[st
             canon(pricing),
             payload,
             canon(validated_bars),
+            market_context["id"],
+            canon(entry_gate_snapshot),
+            _sha256(canon(entry_gate_snapshot)),
+            int(entry_gate_snapshot["policy_qualified"]),
             now(),
         ),
     ).fetchone()
@@ -549,6 +673,9 @@ def _outcome_detail(row: sqlite3.Row | None) -> dict[str, Any]:
     out = dict(row)
     out["outcome"] = json.loads(out["outcome_json"])
     out["bars"] = json.loads(out["bars_json"])
+    out["entry_gate_snapshot"] = json.loads(out["entry_gate_snapshot_json"]) if out.get("entry_gate_snapshot_json") else {}
+    out["entry_gate_snapshot_hash"] = out.get("entry_gate_snapshot_hash")
+    out["policy_qualified"] = bool(out.get("policy_qualified"))
     out["pricing"] = json.loads(out["pricing_json"]) if out.get("pricing_json") else {}
     out["policy"] = _policy_detail(
         {
@@ -588,12 +715,14 @@ def _control_case_detail(db: sqlite3.Connection, row: dict[str, Any]) -> dict[st
     baseline_price = _scenario_baseline_price(scenario)
     costs = _policy_costs(float(baseline_price))
     good_band = _band_for_label(scenario, "GOOD")
+    entry_gate_snapshot = json.loads(row["entry_gate_snapshot_json"]) if row.get("entry_gate_snapshot_json") else {}
     cost_adjusted_entry_price = (
         baseline_price + Decimal(str(costs["entry_cost_krw"]))
     ).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
     return {
         "case_id": row["scenario_set_id"],
         "scenario_set_id": row["scenario_set_id"],
+        "market_context_run_id": row.get("market_context_run_id"),
         "prior_label": prior_label,
         "realized_label": row["realized_label"],
         "net_return_bps": float(row["net_return_bps"]),
@@ -604,6 +733,11 @@ def _control_case_detail(db: sqlite3.Connection, row: dict[str, Any]) -> dict[st
             "high": float(good_band["high"]),
         },
         "cost_adjusted_entry_price_krw": float(cost_adjusted_entry_price),
+        "policy_qualified": bool(row.get("policy_qualified")),
+        "entry_gate_snapshot_hash": row.get("entry_gate_snapshot_hash"),
+        "entry_gate_snapshot": entry_gate_snapshot,
+        "entry_gate_status": entry_gate_snapshot.get("status"),
+        "entry_gate_reason_codes": entry_gate_snapshot.get("reason_codes", []),
     }
 
 
@@ -620,19 +754,24 @@ def _control_summary(
     mean_net_return_bps = 0.0 if denominator == 0 else round(net_return_sum / denominator, 8)
     success_count = sum(1 for case in traded_cases if case["realized_label"] == "GOOD")
     trade_count = len(traded_cases)
-    success_rate = 0.0 if trade_count == 0 else round(success_count / trade_count, 8)
+    success_rate = 0.0 if denominator == 0 else round(success_count / denominator, 8)
     control_cases = [
         {
             "case_id": case["case_id"],
             "scenario_set_id": case["scenario_set_id"],
             "prior_label": case["prior_label"],
             "realized_label": case["realized_label"],
+            "policy_qualified": case.get("policy_qualified"),
             "trade": bool(trade_rule(case)),
             "net_return_bps": case["net_return_bps"] if trade_rule(case) else 0.0,
             "costs": case["costs"],
             "baseline_price_krw": case["baseline_price_krw"],
             "good_band": case["good_band"],
             "cost_adjusted_entry_price_krw": case["cost_adjusted_entry_price_krw"],
+            "market_context_run_id": case.get("market_context_run_id"),
+            "entry_gate_snapshot_hash": case.get("entry_gate_snapshot_hash"),
+            "entry_gate_status": case.get("entry_gate_status"),
+            "entry_gate_reason_codes": case.get("entry_gate_reason_codes", []),
         }
         for case in cases
     ]
@@ -646,6 +785,7 @@ def _control_summary(
         "mean_net_return_bps": mean_net_return_bps,
         "net_return_bps": mean_net_return_bps,
         "case_ids": [case["case_id"] for case in traded_cases],
+        "selected_case_ids": [case["case_id"] for case in cases],
         "cases": control_cases,
         "costs": policy_costs,
     }
@@ -795,9 +935,10 @@ def create_calibration_snapshot(db: sqlite3.Connection, data: dict[str, Any]) ->
             (plan["policy_id"], plan["cohort_key"], plan["scenario_set_id"], plan["cutoff_at"]),
         )
     ]
-    if any(parse_kst(row["observed_at"]) <= frozen_at for row in latest_rows):
+    selected_rows = [row for row in latest_rows if is_start <= parse_kst(row["observed_at"]) < oos_end and int(row.get("policy_qualified") or 0) == 1]
+    excluded_rows = [row for row in latest_rows if is_start <= parse_kst(row["observed_at"]) < oos_end and int(row.get("policy_qualified") or 0) != 1]
+    if any(parse_kst(row["observed_at"]) <= frozen_at for row in selected_rows):
         raise HTTPException(422, "calibration plan was frozen after eligible outcome evidence")
-    selected_rows = [row for row in latest_rows if is_start <= parse_kst(row["observed_at"]) < oos_end]
     is_rows = [row for row in selected_rows if is_start <= parse_kst(row["observed_at"]) < is_end]
     oos_rows = [row for row in selected_rows if oos_start <= parse_kst(row["observed_at"]) < oos_end]
     overall_total = len(selected_rows)
@@ -840,9 +981,16 @@ def create_calibration_snapshot(db: sqlite3.Connection, data: dict[str, Any]) ->
     hybrid_candidate = _control_summary(
         name="hybrid_candidate",
         cases=control_cases,
-        trade_rule=lambda case: case["prior_label"] in {"BASE", "GOOD"},
+        trade_rule=lambda case: bool(case["policy_qualified"]),
         policy_costs=policy_cost_summary,
     )
+    excluded_reason_counts: Counter[str] = Counter()
+    excluded_status_counts: Counter[str] = Counter()
+    for row in excluded_rows:
+        snapshot = json.loads(row["entry_gate_snapshot_json"]) if row.get("entry_gate_snapshot_json") else {}
+        excluded_status_counts[str(snapshot.get("status") or "POLICY_UNQUALIFIED")] += 1
+        for reason in snapshot.get("reason_codes", []) or []:
+            excluded_reason_counts[str(reason)] += 1
     failure_reasons: list[str] = []
     if overall_total < HYBRID_MIN_OVERALL_SAMPLES:
         failure_reasons.append("insufficient overall sample")
@@ -880,8 +1028,12 @@ def create_calibration_snapshot(db: sqlite3.Connection, data: dict[str, Any]) ->
             "key": plan["cohort_key"],
             "target_case_id": plan["scenario_set_id"],
             "case_ids": case_ids,
-            "is_case_ids": is_case_ids,
-            "oos_case_ids": oos_case_ids,
+            "selected_case_ids": case_ids,
+            "selected_is_case_ids": is_case_ids,
+            "selected_oos_case_ids": oos_case_ids,
+            "excluded_case_ids": [row["scenario_set_id"] for row in excluded_rows],
+            "excluded_reason_counts": dict(sorted(excluded_reason_counts.items())),
+            "excluded_status_counts": dict(sorted(excluded_status_counts.items())),
         },
         "holdout_identity": {
             "policy_id": policy["id"],
@@ -899,6 +1051,15 @@ def create_calibration_snapshot(db: sqlite3.Connection, data: dict[str, Any]) ->
             "overall": overall_total,
             "is": is_counts,
             "oos": oos_counts,
+        },
+        "selection": {
+            "selected_case_ids": case_ids,
+            "selected_oos_case_ids": oos_case_ids,
+            "excluded_case_ids": [row["scenario_set_id"] for row in excluded_rows],
+            "excluded_reason_counts": dict(sorted(excluded_reason_counts.items())),
+            "excluded_status_counts": dict(sorted(excluded_status_counts.items())),
+            "selected_count": overall_total,
+            "excluded_count": len(excluded_rows),
         },
         "good": {
             "count": oos_counts["GOOD"],
@@ -1092,68 +1253,23 @@ def create_evaluation(db: sqlite3.Connection, card_id: int, data: dict[str, Any]
     market_context = latest_market_context_for_card(db, card_id)
     if not market_context:
         raise HTTPException(409, "verified 09:05 market context required")
-    latest_market = market_context["result"]["metrics"]
     policy = ensure_policy(db)
     good_band = _band_for_label(scenario_detail, "GOOD")
-    price_krw = latest_market.get("last_price_krw")
-    spread_pct = latest_market.get("spread_pct")
-    top_imbalance = latest_market.get("top_of_book_imbalance")
-    volume_ratio = latest_market.get("same_time_baseline_volume_ratio")
-    top_bid_qty = latest_market.get("top_bid_qty")
-    top_ask_qty = latest_market.get("top_ask_qty")
-    top_book_ok = (
-        top_bid_qty is not None
-        and top_ask_qty is not None
-        and Decimal(str(top_bid_qty)) >= HYBRID_MIN_TOP_BOOK_QTY
-        and Decimal(str(top_ask_qty)) >= HYBRID_MIN_TOP_BOOK_QTY
-    )
-    market_verified = (
-        market_context["status"] == "VERIFIED"
-        and latest_market.get("same_time_baseline_status") == "READY"
-        and latest_market.get("previous_close_gap_status") == "VERIFIED"
-        and spread_pct is not None
-        and Decimal(str(spread_pct)) <= HYBRID_MAX_SPREAD_PCT
-        and top_imbalance is not None
-        and abs(Decimal(str(top_imbalance))) <= Decimal("0.5")
-        and volume_ratio is not None
-        and top_book_ok
-    )
     invalidated = bool(card["invalidated_at"] or evidence["invalidated_at"] or evidence["status"] == "invalidated")
     failure_reasons = list(calibration["snapshot"]["failure_reasons"])
-    within_guardrail = price_krw is not None and good_band["low"] <= Decimal(str(price_krw)) <= good_band["high"]
+    entry_gate_snapshot = _entry_gate_snapshot(scenario=scenario_detail, market_context=market_context, invalidated=invalidated)
+    latest_market = market_context["result"]["metrics"]
+    price_krw = latest_market.get("last_price_krw")
     costs = _policy_costs(float(price_krw or 0.0))
     cost_adjusted_entry_price = None
-    within_cost_guardrail = False
     if price_krw is not None:
         cost_adjusted_entry_price = (Decimal(str(price_krw)) + Decimal(str(costs["entry_cost_krw"]))).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
-        within_cost_guardrail = good_band["low"] <= cost_adjusted_entry_price <= good_band["high"]
     structural_good_compatibility = {
-        "status": "UNAVAILABLE",
-        "inputs": {
-            "scenario_band": {"low": float(good_band["low"]), "high": float(good_band["high"])},
-            "price_krw": price_krw,
-            "round_trip_cost_bps": HYBRID_ROUND_TRIP_COST_BPS,
-            "entry_cost_krw": costs["entry_cost_krw"],
-            "cost_adjusted_entry_price_krw": None if cost_adjusted_entry_price is None else float(cost_adjusted_entry_price),
-            "top_bid_qty": top_bid_qty,
-            "top_ask_qty": top_ask_qty,
-            "same_time_baseline_volume_ratio": volume_ratio,
-        },
-        "reasons": [],
+        "status": "GOOD_COMPATIBLE" if entry_gate_snapshot["policy_qualified"] else "UNAVAILABLE",
+        "inputs": entry_gate_snapshot["inputs"],
+        "reasons": list(entry_gate_snapshot["reason_codes"]),
+        "entry_gate_snapshot_hash": _sha256(canon(entry_gate_snapshot)),
     }
-    if invalidated:
-        structural_good_compatibility["reasons"].append("business_invalidated")
-    elif within_cost_guardrail and top_book_ok and volume_ratio is not None:
-        structural_good_compatibility["status"] = "GOOD_COMPATIBLE"
-    else:
-        if not within_guardrail:
-            structural_good_compatibility["reasons"].append("price_outside_frozen_good_band")
-        if price_krw is not None and not within_cost_guardrail:
-            structural_good_compatibility["reasons"].append("cost_adjusted_entry_outside_frozen_good_band")
-        if not top_book_ok:
-            structural_good_compatibility["reasons"].append("min_top_of_book_qty_not_satisfied")
-        if volume_ratio is None:
-            structural_good_compatibility["reasons"].append("same_time_baseline_volume_ratio_missing")
     final_state = "HOLD"
     recommendation = "HOLD_INSUFFICIENT_EVIDENCE"
     if invalidated:
@@ -1162,7 +1278,7 @@ def create_evaluation(db: sqlite3.Connection, card_id: int, data: dict[str, Any]
     elif not calibration["eligible"]:
         final_state = "HOLD"
         recommendation = "HOLD_INSUFFICIENT_EVIDENCE"
-    elif market_verified and structural_good_compatibility["status"] == "GOOD_COMPATIBLE":
+    elif entry_gate_snapshot["policy_qualified"]:
         if Decimal(str(calibration["snapshot"]["good"]["lower_bound"])) >= HYBRID_GOOD_LCB_THRESHOLD:
             final_state = "GOOD"
             recommendation = "BUY_REVIEW"
@@ -1227,6 +1343,7 @@ def create_evaluation(db: sqlite3.Connection, card_id: int, data: dict[str, Any]
         "recommendation_only": True,
         "reason_codes": failure_reasons if failure_reasons else ([recommendation] if recommendation != "BUY_REVIEW" else []),
         "structural_good_compatibility": structural_good_compatibility,
+        "entry_gate": entry_gate_snapshot,
         "lineage_ids": {
             "card_id": card_id,
             "scenario_set_id": scenario["id"],
@@ -1240,8 +1357,8 @@ def create_evaluation(db: sqlite3.Connection, card_id: int, data: dict[str, Any]
             "oos_count": calibration["snapshot"]["windows"]["oos"]["count"],
             "overall_count": calibration["snapshot"]["counts"]["overall"],
             "holdout_reuse_count": calibration["snapshot"]["holdout_reuse_count"],
-            "top_bid_qty": top_bid_qty,
-            "top_ask_qty": top_ask_qty,
+            "top_bid_qty": entry_gate_snapshot["inputs"]["top_bid_qty"],
+            "top_ask_qty": entry_gate_snapshot["inputs"]["top_ask_qty"],
         },
     }
     row = db.execute(
