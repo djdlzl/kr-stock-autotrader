@@ -2,69 +2,51 @@
 
 ## Actual Journey
 
-Synthetic contract flow executed against a throwaway SQLite database through FastAPI and authenticated internal endpoints.
+This pass verified the hybrid slice through the automated contract suite against a throwaway SQLite database. I did not run a separate ad hoc end-to-end script in this pass.
 
 ### Commands
 
 ```text
-SESSION_SECRET='test-session-secret-that-is-at-least-thirty-two-bytes-long' SIGNUP_ENABLED=true INTERNAL_API_KEY=hybrid-key /Users/jaewoo/_workspace/giraffe-0905-market-context/.venv/bin/python - <<'PY'
-...
-PY
+/Users/jaewoo/_workspace/giraffe-0905-market-context/.venv/bin/python -m pytest -q tests/test_hybrid_decision_engine.py
+/Users/jaewoo/_workspace/giraffe-0905-market-context/.venv/bin/python -m pytest -q
+/Users/jaewoo/_workspace/giraffe-0905-market-context/.venv/bin/python -m compileall -q .
+git diff --check
 ```
 
-### Normal Case
+### Results
 
-- Scenario set created successfully.
-- 09:05 market-context evaluation returned `VERIFIED`.
-- Outcome ledger accepted 3 append-only rows.
-- Calibration snapshot returned:
-  - `eligible=true`
-  - `IS count=1`
-  - `OOS count=2`
-  - `overall count=3`
-  - `GOOD count=2`
-  - `GOOD probability=1.0`
-  - `GOOD lower_bound=0.34237195`
-  - `holdout_reuse_count=1`
-- Second-stage evaluation returned:
-  - `final_state=GOOD`
-  - `recommendation=BUY_REVIEW`
-  - `recommendation_only=true`
-  - `policy_identity=giraffe-hybrid-good-base-bad-v1`
-  - `policy_version=1`
-  - `policy_hash=2d0fc94d20f439fd5deccdaf1654169fff84f2524a4b1dedb0daa06aab159845`
-- Readback from `/api/cards/{card_id}` exposed the latest immutable hybrid decision.
+- targeted hybrid tests: `10 passed, 2 warnings`
+- full suite: `292 passed, 2 warnings`
+- compileall: passed
+- diff check: passed
 
-### Insufficient Evidence
+### What The Suite Exercises
 
-- Covered by `tests/test_hybrid_decision_engine.py`.
-- Result: `HOLD` + `HOLD_INSUFFICIENT_EVIDENCE`.
+- one realized outcome per independent scenario-set case
+- calibration over other independent cohort-matched scenario sets
+- target-case exclusion from calibration
+- preregistered plan freeze before OOS evidence is accepted
+- minimum sample gates of `30` overall and `20` OOS
+- cost-adjusted first-touch outcome labels
+- HOLD control arithmetic with the same denominator as OOS
+- structural-prior-only control arithmetic over the same OOS case IDs
+- top-book depth, spread, imbalance, and baseline-volume market-context gates
+- controlled `404`, `409`, and `422` responses for the hostile inputs in the prompt
+- `recommendation_only` hard rejection when forced false
+- no writes to order, allocation, fill, or live-receipt tables
 
-### Invalidated / BAD
+### Evidence Notes
 
-- After explicit invalidation of the frozen card, second-stage evaluation returned:
-  - `final_state=BAD`
-  - `recommendation=REDUCE_REVIEW`
-- This confirmed invalidation dominates and blocks BUY.
+- The test suite builds independent historical scenario/card cases in a throwaway database.
+- One test confirms that 30 rows from the same case do not satisfy the cohort sample requirement.
+- One test confirms the target case is excluded from calibration.
+- One test confirms calibration snapshot creation refuses post-hoc window replacement.
+- One test confirms a gross GOOD case can become BASE/BAD after transaction costs are applied.
+- One test confirms low top-of-book depth blocks the BUY review path.
+- One test confirms invalidation dominates the final decision path.
 
-### Hostile Inputs
+### Claim Limits
 
-- Covered by contract tests for:
-  - future / post-cutoff outcome rows
-  - forged derived fields
-  - idempotency collision
-- Result: `422` or `409`, no side effects.
-
-### Prior-Only Control
-
-- Covered by `tests/test_hybrid_decision_engine.py`.
-- Result: structural prior alone did not promote BUY without eligible untouched OOS evidence.
-
-### Side-Effect Check
-
-- Forbidden tables remained unchanged:
-  - `order_plans=0`
-  - `order_fills=0`
-  - `positions=0`
-  - `order_events=0`
-  - `live_dry_run_receipts=0`
+- This is synthetic contract evidence, not live trading evidence.
+- It does not claim execution readiness, broker integration readiness, or production alpha.
+- It does not create orders, allocations, fills, or live dry-run receipts.

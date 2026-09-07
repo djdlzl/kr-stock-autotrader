@@ -3,7 +3,7 @@
 import os
 import tempfile
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -20,6 +20,7 @@ INTERNAL = {"X-Internal-API-Key": "hybrid-key"}
 POLICY_ID = "giraffe-hybrid-good-base-bad-v1"
 KNOWN = "2026-09-03T08:00:00+09:00"
 AS_OF = "2026-09-07T09:05:00+09:00"
+BASE_CASE_AT = datetime(2026, 9, 8, 15, 30, tzinfo=ZoneInfo("Asia/Seoul"))
 
 
 @pytest.fixture
@@ -67,7 +68,7 @@ def _scenario_payload(evidence_id, card_id, *, version=1):
     return payload
 
 
-def _market_context(app, client, card_id, *, symbol="005930"):
+def _market_context(app, client, card_id, *, symbol="005930", top_bid_qty=20.0, top_ask_qty=20.0):
     import kr_stock_autotrader.intraday_market_context as mc
     from kr_stock_autotrader.intraday_market_context import evaluate_intraday_market_context, persist_intraday_market_context_run, resolve_intraday_lineage_context, same_time_history_for_symbol
 
@@ -103,8 +104,8 @@ def _market_context(app, client, card_id, *, symbol="005930"):
         "last_price": 100.0,
         "best_bid": 99.96,
         "best_ask": 100.0,
-        "top_bid_qty": 20.0,
-        "top_ask_qty": 20.0,
+        "top_bid_qty": top_bid_qty,
+        "top_ask_qty": top_ask_qty,
         "quote_known_at": snapshot_at.isoformat(),
         "retrieved_at": snapshot_at.isoformat(),
         "timestamp_source": "network_retrieved_at",
@@ -166,6 +167,72 @@ def _evaluate_payload(calibration_id):
     return {"policy_identity": POLICY_ID, "policy_version": 1, "calibration_snapshot_id": calibration_id, "recommendation_only": True}
 
 
+def _case_row(*, exchange_at, known_at, open_krw=100.0, high_krw=112.0, low_krw=99.0, close_krw=110.0, volume=1000.0, symbol="005930"):
+    return {
+        "exchange_at": exchange_at,
+        "known_at": known_at,
+        "open_krw": open_krw,
+        "high_krw": high_krw,
+        "low_krw": low_krw,
+        "close_krw": close_krw,
+        "volume": volume,
+        "symbol": symbol,
+    }
+
+
+def _case_timestamp(offset_days: int) -> str:
+    return (BASE_CASE_AT + timedelta(days=offset_days)).isoformat()
+
+
+def _register_case(app, client, *, index, key="hybrid-cohort", version=1, event_identity_prefix="DART:2026-09-03:hybrid", known_at=None, row=None):
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key=f"{key}-{index}")
+    db.commit()
+    db.close()
+    scenario = client.post(
+        "/api/internal/scenario-sets",
+        headers=INTERNAL,
+        json=_scenario_payload(evidence["id"], saved["id"], version=version),
+    )
+    assert scenario.status_code == 200, scenario.text
+    body = scenario.json()
+    outcome_row = row or _case_row(
+        exchange_at=known_at or _case_timestamp(index),
+        known_at=known_at or _case_timestamp(index),
+    )
+    outcome = client.post(
+        f"/api/internal/scenario-sets/{body['event_identity']}/hybrid-outcomes",
+        headers=INTERNAL,
+        json={
+            "idempotency_key": f"case-{index}",
+            "observation_cutoff_at": "2026-10-15T15:30:00+09:00",
+            "bars": [outcome_row],
+        },
+    )
+    assert outcome.status_code == 200, outcome.text
+    return body, outcome.json()
+
+
+def _create_plan(client, scenario_set_id, *, idempotency_key="plan-a", frozen_at="2026-09-07T09:00:00+09:00", is_start="2026-09-08T00:00:00+09:00", is_end="2026-09-18T00:00:00+09:00", oos_start="2026-09-18T00:00:00+09:00", oos_end="2026-10-08T00:00:00+09:00", cutoff_at="2026-10-15T15:30:00+09:00"):
+    payload = {
+        "idempotency_key": idempotency_key,
+        "scenario_set_id": scenario_set_id,
+        "policy_identity": POLICY_ID,
+        "policy_version": 1,
+        "holdout_key": "holdout-a",
+        "is_window": {"start": is_start, "end": is_end},
+        "oos_window": {"start": oos_start, "end": oos_end},
+        "cutoff_at": cutoff_at,
+    }
+    response = client.post("/api/internal/hybrid/calibration-plans", headers=INTERNAL, json=payload)
+    return response
+
+
+def _create_snapshot(client, plan_id, *, idempotency_key="snapshot-a"):
+    response = client.post("/api/internal/hybrid/calibrations", headers=INTERNAL, json={"plan_id": plan_id, "idempotency_key": idempotency_key})
+    return response
+
+
 def test_hybrid_outcomes_exclude_future_rows_and_close_on_same_bar_ambiguity(app_client):
     app, client = app_client
     db = dbmod.connect()
@@ -211,194 +278,269 @@ def test_hybrid_outcomes_exclude_future_rows_and_close_on_same_bar_ambiguity(app
     assert collision.status_code == 409
 
 
-def test_hybrid_calibration_chronology_rejects_forgery_and_holdout_reuse(app_client):
+def test_hybrid_missing_scenario_and_empty_bars_are_controlled_4xx(app_client):
     app, client = app_client
+    missing = client.post("/api/internal/scenario-sets/DOES-NOT-EXIST/hybrid-outcomes", headers=INTERNAL, json={"idempotency_key": "missing", "observation_cutoff_at": "2026-09-11T15:30:00+09:00", "bars": [_case_row(exchange_at="2026-09-08T15:30:00+09:00", known_at="2026-09-08T15:30:00+09:00")]})
+    assert missing.status_code == 404
     db = dbmod.connect()
-    evidence, filt, saved = _make_lineage(db, key="hybrid-calibration")
+    try:
+        before = {table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("hybrid_outcome_ledger", "hybrid_calibration_plans", "hybrid_calibration_snapshots", "hybrid_second_stage_evaluations", "order_plans", "order_fills", "positions", "order_events", "live_dry_run_receipts")}
+    finally:
+        db.close()
+    assert before == {"hybrid_outcome_ledger": 0, "hybrid_calibration_plans": 0, "hybrid_calibration_snapshots": 0, "hybrid_second_stage_evaluations": 0, "order_plans": 0, "order_fills": 0, "positions": 0, "order_events": 0, "live_dry_run_receipts": 0}
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-empty-bars")
     db.commit()
     db.close()
+    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    assert scenario.status_code == 200
+    out = scenario.json()
+    empty = client.post(f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes", headers=INTERNAL, json={"idempotency_key": "empty", "observation_cutoff_at": "2026-09-11T15:30:00+09:00", "bars": []})
+    assert empty.status_code == 422
+    db = dbmod.connect()
+    try:
+        after = {table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("hybrid_outcome_ledger", "hybrid_calibration_plans", "hybrid_calibration_snapshots", "hybrid_second_stage_evaluations", "order_plans", "order_fills", "positions", "order_events", "live_dry_run_receipts")}
+    finally:
+        db.close()
+    assert after == before
 
+
+def test_hybrid_calibration_plan_idempotency_and_collision(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-plan")
+    db.commit()
+    db.close()
+    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    assert scenario.status_code == 200, scenario.text
+    out = scenario.json()
+    first = _create_plan(client, out["id"], idempotency_key="plan-key")
+    assert first.status_code == 200, first.text
+    duplicate = _create_plan(client, out["id"], idempotency_key="plan-key")
+    assert duplicate.status_code == 200
+    assert duplicate.json()["id"] == first.json()["id"]
+    collision = _create_plan(client, out["id"], idempotency_key="plan-key", is_start="2026-09-09T00:00:00+09:00")
+    assert collision.status_code == 409
+
+
+def test_hybrid_calibration_rejects_posthoc_windows_and_target_case_reuse(app_client, monkeypatch):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-preregister")
+    db.commit()
+    db.close()
     scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
     out = scenario.json()
-    verified = _market_context(app, client, saved["id"])
-    assert verified["market_context_status"] == "VERIFIED"
 
-    _seed_outcomes(
-        client,
-        out["event_identity"],
-        [
-            [{
-                "exchange_at": "2026-09-08T15:30:00+09:00",
-                "known_at": "2026-09-08T15:30:00+09:00",
-                "open_krw": 100.0,
-                "high_krw": 112.0,
-                "low_krw": 99.0,
-                "close_krw": 110.0,
-                "volume": 1000.0,
-                "symbol": "005930",
-            }],
-            [{
-                "exchange_at": "2026-09-09T15:30:00+09:00",
-                "known_at": "2026-09-09T15:30:00+09:00",
-                "open_krw": 100.0,
-                "high_krw": 108.0,
-                "low_krw": 99.0,
-                "close_krw": 101.0,
-                "volume": 1000.0,
-                "symbol": "005930",
-            }],
-            [{
-                "exchange_at": "2026-09-10T15:30:00+09:00",
-                "known_at": "2026-09-10T15:30:00+09:00",
-                "open_krw": 100.0,
-                "high_krw": 110.0,
-                "low_krw": 99.0,
-                "close_krw": 109.0,
-                "volume": 1000.0,
-                "symbol": "005930",
-            }],
-        ],
-    )
+    prefreeze_at = "2026-09-08T00:00:01+09:00"
+    prefreeze_case, _ = _register_case(app, client, index=1, key="hybrid-preregister", known_at=prefreeze_at)
+    assert prefreeze_case["id"]
+    import kr_stock_autotrader.hybrid_recommendations as hy
 
-    forbidden = client.post(
+    monkeypatch.setattr(hy, "now", lambda: "2026-09-09T00:00:00+09:00")
+
+    prereg = _create_plan(client, out["id"], idempotency_key="prereg-a")
+    assert prereg.status_code == 200, prereg.text
+    plan = prereg.json()
+
+    snapshot = _create_snapshot(client, plan["id"])
+    assert snapshot.status_code == 422
+
+    replacement = client.post(
         "/api/internal/hybrid/calibrations",
         headers=INTERNAL,
-        json={**_calibration_payload(out["id"]), "policy_hash": "forged", "good_probability": 0.99},
+        json={"plan_id": plan["id"], "idempotency_key": "snapshot-a", "oos_window": {"start": "2026-09-01T00:00:00+09:00", "end": "2026-09-02T00:00:00+09:00"}},
     )
-    assert forbidden.status_code == 422
-
-    created = client.post("/api/internal/hybrid/calibrations", headers=INTERNAL, json=_calibration_payload(out["id"]))
-    assert created.status_code == 200, created.text
-    snapshot = created.json()
-    assert snapshot["eligible"] is True
-    assert snapshot["oos"]["count"] == 2
-    assert snapshot["is"]["count"] == 1
-    assert snapshot["holdout_reuse_count"] == 1
-
-    reused = client.post("/api/internal/hybrid/calibrations", headers=INTERNAL, json=_calibration_payload(out["id"], holdout_key="holdout-a"))
-    assert reused.status_code == 200
-    reused_body = reused.json()
-    assert reused_body["holdout_reuse_count"] == 2
-    assert reused_body["eligible"] is False
-    assert "holdout reused" in reused_body["failure_reasons"]
+    assert replacement.status_code == 422
 
 
-def test_hybrid_evaluation_happy_path_invalidated_dominates_and_readback_has_no_side_effects(app_client):
+def test_hybrid_independent_cohort_cases_and_target_exclusion(app_client):
     app, client = app_client
     db = dbmod.connect()
-    evidence, filt, saved = _make_lineage(db, key="hybrid-eval")
+    evidence, filt, saved = _make_lineage(db, key="hybrid-independent")
     db.commit()
     db.close()
+    target = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    target_body = target.json()
 
+    target_outcome = client.post(
+        f"/api/internal/scenario-sets/{target_body['event_identity']}/hybrid-outcomes",
+        headers=INTERNAL,
+        json={
+            "idempotency_key": "target",
+            "observation_cutoff_at": "2026-10-15T15:30:00+09:00",
+            "bars": [_case_row(exchange_at="2026-09-09T15:30:00+09:00", known_at="2026-09-09T15:30:00+09:00")],
+        },
+    )
+    assert target_outcome.status_code == 200, target_outcome.text
+
+    case_ids = []
+    for index in range(1, 4):
+        case, _ = _register_case(app, client, index=index, key="hybrid-independent", known_at=f"2026-09-{8 + index:02d}T15:30:00+09:00")
+        case_ids.append(case["id"])
+
+    plan = _create_plan(client, target_body["id"], idempotency_key="cohort-plan")
+    assert plan.status_code == 200, plan.text
+    snapshot = _create_snapshot(client, plan.json()["id"])
+    assert snapshot.status_code == 200, snapshot.text
+    body = snapshot.json()
+    assert body["counts"]["overall"] == 3
+    assert target_body["id"] not in body["lineage"]["case_ids"]
+    assert sorted(body["lineage"]["case_ids"]) == sorted(case_ids)
+
+
+def test_hybrid_requires_30_distinct_cases_not_30_rows_from_one_case(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-distinct")
+    db.commit()
+    db.close()
     scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
     out = scenario.json()
-    verified = _market_context(app, client, saved["id"])
-    assert verified["market_context_status"] == "VERIFIED"
+    accepted = 0
+    rejected = 0
+    for index in range(30):
+        response = client.post(
+            f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes",
+            headers=INTERNAL,
+            json={
+                "idempotency_key": f"row-{index}",
+                "observation_cutoff_at": "2026-10-15T15:30:00+09:00",
+                "bars": [_case_row(exchange_at=_case_timestamp(index), known_at=_case_timestamp(index))],
+            },
+        )
+        if index == 0:
+            assert response.status_code == 200, response.text
+            accepted += 1
+        else:
+            assert response.status_code == 409
+            rejected += 1
+    plan = _create_plan(client, out["id"], idempotency_key="distinct-plan")
+    assert plan.status_code == 200, plan.text
+    snapshot = _create_snapshot(client, plan.json()["id"])
+    assert snapshot.status_code == 200, snapshot.text
+    body = snapshot.json()
+    assert body["counts"]["overall"] == 0
+    assert body["eligible"] is False
+    assert accepted == 1 and rejected == 29
+    assert "insufficient overall sample" in body["failure_reasons"]
 
-    _seed_outcomes(
-        client,
-        out["event_identity"],
-        [
-            [{
-                "exchange_at": "2026-09-08T15:30:00+09:00",
-                "known_at": "2026-09-08T15:30:00+09:00",
-                "open_krw": 100.0,
-                "high_krw": 112.0,
-                "low_krw": 99.0,
-                "close_krw": 110.0,
-                "volume": 1000.0,
-                "symbol": "005930",
-            }],
-            [{
-                "exchange_at": "2026-09-09T15:30:00+09:00",
-                "known_at": "2026-09-09T15:30:00+09:00",
-                "open_krw": 100.0,
-                "high_krw": 112.0,
-                "low_krw": 99.0,
-                "close_krw": 110.0,
-                "volume": 1000.0,
-                "symbol": "005930",
-            }],
-            [{
-                "exchange_at": "2026-09-10T15:30:00+09:00",
-                "known_at": "2026-09-10T15:30:00+09:00",
-                "open_krw": 100.0,
-                "high_krw": 105.0,
-                "low_krw": 99.0,
-                "close_krw": 101.0,
-                "volume": 1000.0,
-                "symbol": "005930",
-            }],
-        ],
+
+def test_hybrid_costs_can_downgrade_gross_good_to_net_base(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-cost")
+    db.commit()
+    db.close()
+    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    out = scenario.json()
+    good_band = next(item["per_share_value_range_krw"] for item in out["scenarios"] if item["label"] == "GOOD")
+    gross_price = good_band["low"] + 0.05
+    response = client.post(
+        f"/api/internal/scenario-sets/{out['event_identity']}/hybrid-outcomes",
+        headers=INTERNAL,
+        json={
+            "idempotency_key": "cost-case",
+            "observation_cutoff_at": "2026-10-15T15:30:00+09:00",
+            "bars": [
+                _case_row(
+                    exchange_at="2026-09-08T15:30:00+09:00",
+                    known_at="2026-09-08T15:30:00+09:00",
+                    open_krw=gross_price,
+                    high_krw=gross_price,
+                    low_krw=good_band["low"] - 0.5,
+                    close_krw=gross_price,
+                )
+            ],
+        },
     )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["gross_label"] == "GOOD"
+    assert body["realized_label"] in {"BASE", "BAD"}
+    assert body["net_return_bps"] < body["gross_return_bps"]
 
-    calibration = client.post("/api/internal/hybrid/calibrations", headers=INTERNAL, json=_calibration_payload(out["id"]))
-    assert calibration.status_code == 200, calibration.text
-    snapshot = calibration.json()
-    assert snapshot["good"]["probability"] >= snapshot["good"]["lower_bound"]
 
-    evaluation = client.post(f"/api/internal/cards/{saved['id']}/hybrid-evaluation", headers=INTERNAL, json=_evaluate_payload(snapshot["id"]))
+def test_hybrid_policy_hash_drift_and_recommendation_only_false_are_rejected(app_client, monkeypatch):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-drift")
+    db.commit()
+    db.close()
+    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    out = scenario.json()
+    plan = _create_plan(client, out["id"], idempotency_key="drift-plan")
+    assert plan.status_code == 200, plan.text
+    snapshot = _create_snapshot(client, plan.json()["id"])
+    assert snapshot.status_code == 200, snapshot.text
+    forged = client.post(
+        f"/api/internal/cards/{saved['id']}/hybrid-evaluation",
+        headers=INTERNAL,
+        json={"policy_identity": POLICY_ID, "policy_version": 1, "calibration_snapshot_id": snapshot.json()["id"], "recommendation_only": False},
+    )
+    assert forged.status_code == 422
+    import kr_stock_autotrader.hybrid_recommendations as hy
+
+    original = hy._policy_spec()
+    mutated = {**original, "market_context_requirements": {**original["market_context_requirements"], "max_spread_pct": 0.04}}
+    monkeypatch.setattr(hy, "_policy_spec", lambda: mutated)
+    drift = _create_plan(client, out["id"], idempotency_key="drift-plan-2")
+    assert drift.status_code == 409
+
+
+def test_hybrid_min_top_of_book_qty_blocks_buy_review(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-topbook")
+    db.commit()
+    db.close()
+    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    out = scenario.json()
+    for index in range(30):
+        case, _ = _register_case(app, client, index=index + 1, key="hybrid-topbook", known_at=_case_timestamp(index))
+        assert case["id"]
+    _market_context(app, client, saved["id"], symbol="005930", top_bid_qty=0.1, top_ask_qty=0.1)
+    plan = _create_plan(client, out["id"], idempotency_key="topbook-plan")
+    assert plan.status_code == 200, plan.text
+    snapshot = _create_snapshot(client, plan.json()["id"])
+    assert snapshot.status_code == 200, snapshot.text
+    evaluation = client.post(
+        f"/api/internal/cards/{saved['id']}/hybrid-evaluation",
+        headers=INTERNAL,
+        json={"policy_identity": POLICY_ID, "policy_version": 1, "calibration_snapshot_id": snapshot.json()["id"], "recommendation_only": True},
+    )
     assert evaluation.status_code == 200, evaluation.text
-    body = evaluation.json()
-    assert body["final_state"] == "GOOD"
-    assert body["recommendation"] == "BUY_REVIEW"
-    assert body["recommendation_only"] is True
-    assert body["policy"]["identity"] == POLICY_ID
-    assert body["market_context"]["market_context_status"] == "VERIFIED"
-    assert body["calibration_snapshot"]["eligible"] is True
+    assert evaluation.json()["recommendation"] != "BUY_REVIEW"
 
+
+def test_hybrid_invalidation_dominates_and_forbidden_tables_remain_zero(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-invalidation")
+    db.commit()
+    db.close()
+    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    out = scenario.json()
+    for index in range(30):
+        _register_case(app, client, index=index + 1, key="hybrid-invalidation", known_at=_case_timestamp(index))
+    _market_context(app, client, saved["id"], symbol="005930")
+    plan = _create_plan(client, out["id"], idempotency_key="invalid-plan")
+    assert plan.status_code == 200, plan.text
+    snapshot = _create_snapshot(client, plan.json()["id"])
+    assert snapshot.status_code == 200, snapshot.text
+    db = dbmod.connect()
+    db.execute("UPDATE decision_cards SET invalidated_at=? WHERE id=?", ("2026-09-07T09:06:00+09:00", saved["id"]))
+    db.commit()
+    db.close()
+    evaluation = client.post(
+        f"/api/internal/cards/{saved['id']}/hybrid-evaluation",
+        headers=INTERNAL,
+        json={"policy_identity": POLICY_ID, "policy_version": 1, "calibration_snapshot_id": snapshot.json()["id"], "recommendation_only": True},
+    )
+    assert evaluation.status_code == 200
+    assert evaluation.json()["final_state"] == "BAD"
     db = dbmod.connect()
     try:
         assert {table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("order_plans", "order_fills", "positions", "order_events", "live_dry_run_receipts")} == {"order_plans": 0, "order_fills": 0, "positions": 0, "order_events": 0, "live_dry_run_receipts": 0}
     finally:
         db.close()
-
-    db = dbmod.connect()
-    db.execute("UPDATE decision_cards SET invalidated_at=? WHERE id=?", ("2026-09-07T09:06:00+09:00", saved["id"]))
-    db.commit()
-    db.close()
-    invalidated = client.post(f"/api/internal/cards/{saved['id']}/hybrid-evaluation", headers=INTERNAL, json=_evaluate_payload(snapshot["id"]))
-    assert invalidated.status_code == 200
-    assert invalidated.json()["final_state"] == "BAD"
-    assert invalidated.json()["recommendation"] == "REDUCE_REVIEW"
-
-    readback = client.get(f"/api/cards/{saved['id']}")
-    assert readback.status_code == 200
-    assert readback.json()["hybrid_decision"]["final_state"] == "BAD"
-    assert readback.json()["hybrid_decision"]["recommendation_only"] is True
-
-
-def test_hybrid_insufficient_samples_holds_without_buy_fallback(app_client):
-    app, client = app_client
-    db = dbmod.connect()
-    evidence, filt, saved = _make_lineage(db, key="hybrid-short")
-    db.commit()
-    db.close()
-
-    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
-    out = scenario.json()
-    _market_context(app, client, saved["id"])
-    _seed_outcomes(
-        client,
-        out["event_identity"],
-        [[{
-            "exchange_at": "2026-09-08T15:30:00+09:00",
-            "known_at": "2026-09-08T15:30:00+09:00",
-            "open_krw": 100.0,
-            "high_krw": 112.0,
-            "low_krw": 99.0,
-            "close_krw": 110.0,
-            "volume": 1000.0,
-            "symbol": "005930",
-        }]],
-    )
-    calibration = client.post("/api/internal/hybrid/calibrations", headers=INTERNAL, json=_calibration_payload(out["id"], oos_start="2026-09-10T00:00:00+09:00", oos_end="2026-09-11T00:00:00+09:00"))
-    assert calibration.status_code == 200, calibration.text
-    snapshot = calibration.json()
-    assert snapshot["eligible"] is False
-    assert snapshot["failure_reasons"]
-    evaluation = client.post(f"/api/internal/cards/{saved['id']}/hybrid-evaluation", headers=INTERNAL, json=_evaluate_payload(snapshot["id"]))
-    assert evaluation.status_code == 200
-    body = evaluation.json()
-    assert body["final_state"] == "HOLD"
-    assert body["recommendation"] == "HOLD_INSUFFICIENT_EVIDENCE"

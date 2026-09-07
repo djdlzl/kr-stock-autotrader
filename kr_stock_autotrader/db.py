@@ -240,16 +240,44 @@ def connect() -> sqlite3.Connection:
       created_at TEXT NOT NULL,
       UNIQUE(policy_identity, policy_version)
     );
+    CREATE TABLE IF NOT EXISTS hybrid_calibration_plans (
+      id INTEGER PRIMARY KEY,
+      scenario_set_id INTEGER NOT NULL REFERENCES event_scenario_sets(id),
+      policy_id INTEGER NOT NULL REFERENCES hybrid_policy_specs(id),
+      idempotency_key TEXT NOT NULL,
+      input_sha256 TEXT NOT NULL CHECK(length(input_sha256)=64),
+      cohort_key TEXT NOT NULL,
+      frozen_at TEXT NOT NULL,
+      holdout_key TEXT NOT NULL,
+      is_window_start TEXT NOT NULL,
+      is_window_end TEXT NOT NULL,
+      oos_window_start TEXT NOT NULL,
+      oos_window_end TEXT NOT NULL,
+      cutoff_at TEXT NOT NULL,
+      plan_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS hybrid_outcome_ledger (
       id INTEGER PRIMARY KEY,
       scenario_set_id INTEGER NOT NULL REFERENCES event_scenario_sets(id),
       policy_id INTEGER NOT NULL REFERENCES hybrid_policy_specs(id),
       idempotency_key TEXT NOT NULL,
+      cohort_key TEXT NOT NULL DEFAULT '',
+      case_id INTEGER NOT NULL DEFAULT 0,
+      event_type TEXT NOT NULL DEFAULT '',
+      profile_id TEXT NOT NULL DEFAULT '',
+      profile_version INTEGER NOT NULL DEFAULT 1,
+      scenario_kind TEXT NOT NULL DEFAULT 'QUANTITATIVE',
+      scenario_set_version INTEGER NOT NULL DEFAULT 1,
       observation_cutoff_at TEXT NOT NULL,
       observed_at TEXT NOT NULL,
       realized_label TEXT NOT NULL CHECK(realized_label IN ('GOOD','BASE','BAD')),
       realized_reason TEXT NOT NULL,
+      gross_label TEXT NOT NULL DEFAULT 'BASE',
+      gross_return_bps REAL NOT NULL DEFAULT 0,
+      net_return_bps REAL NOT NULL DEFAULT 0,
       input_sha256 TEXT NOT NULL CHECK(length(input_sha256)=64),
+      pricing_json TEXT NOT NULL DEFAULT '{}',
       outcome_json TEXT NOT NULL,
       bars_json TEXT NOT NULL,
       created_at TEXT NOT NULL,
@@ -257,8 +285,11 @@ def connect() -> sqlite3.Connection:
     );
     CREATE TABLE IF NOT EXISTS hybrid_calibration_snapshots (
       id INTEGER PRIMARY KEY,
+      plan_id INTEGER NOT NULL REFERENCES hybrid_calibration_plans(id),
       scenario_set_id INTEGER NOT NULL REFERENCES event_scenario_sets(id),
       policy_id INTEGER NOT NULL REFERENCES hybrid_policy_specs(id),
+      idempotency_key TEXT NOT NULL,
+      cohort_key TEXT NOT NULL DEFAULT '',
       holdout_key TEXT NOT NULL,
       cutoff_at TEXT NOT NULL,
       input_sha256 TEXT NOT NULL CHECK(length(input_sha256)=64),
@@ -283,7 +314,7 @@ def connect() -> sqlite3.Connection:
       denominator INTEGER NOT NULL,
       final_state TEXT NOT NULL CHECK(final_state IN ('GOOD','BASE','BAD','HOLD')),
       recommendation TEXT NOT NULL CHECK(recommendation IN ('BUY_REVIEW','WATCH','REDUCE_REVIEW','NO_ACTION','HOLD_INSUFFICIENT_EVIDENCE')),
-      recommendation_only INTEGER NOT NULL CHECK(recommendation_only IN (0,1)),
+      recommendation_only INTEGER NOT NULL CHECK(recommendation_only=1),
       reason_codes_json TEXT NOT NULL,
       lineage_hash TEXT NOT NULL UNIQUE,
       known_at TEXT NOT NULL,
@@ -314,6 +345,12 @@ def connect() -> sqlite3.Connection:
       ON deterministic_filter_results(parent_filter_id) WHERE parent_filter_id IS NOT NULL""")
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_outcome_idempotency
       ON hybrid_outcome_ledger(scenario_set_id, policy_id, idempotency_key)""")
+    db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_outcome_case
+      ON hybrid_outcome_ledger(scenario_set_id, policy_id)""")
+    db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_calibration_plan_idem
+      ON hybrid_calibration_plans(scenario_set_id, policy_id, idempotency_key)""")
+    db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_calibration_snapshot_idem
+      ON hybrid_calibration_snapshots(plan_id, idempotency_key)""")
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_calibration_cutoff
       ON hybrid_calibration_snapshots(scenario_set_id, policy_id, holdout_key, cutoff_at, input_sha256)""")
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_hybrid_evaluation_lineage

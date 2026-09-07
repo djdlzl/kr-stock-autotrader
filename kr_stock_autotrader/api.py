@@ -767,6 +767,17 @@ async def internal_hybrid_outcome_append(identity: str, request: Request, _: Non
     finally:
         db.close()
 
+
+@app.post('/api/internal/hybrid/calibration-plans')
+async def internal_hybrid_calibration_plan_create(request: Request, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try:
+        from .hybrid_recommendations import create_calibration_plan
+
+        return create_calibration_plan(db, await request.json())
+    finally:
+        db.close()
+
 @app.post('/api/internal/evidence')
 async def internal_evidence_create(request: Request, _: None = Depends(require_internal_api_key)):
     data = await request.json(); db = connect()
