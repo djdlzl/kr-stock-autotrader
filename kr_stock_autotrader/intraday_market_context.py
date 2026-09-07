@@ -562,6 +562,23 @@ def market_context_run_detail(db: sqlite3.Connection, *, run_key: str | None = N
     ]
     for observation in result["observations"]:
         observation["observation"] = json.loads(observation.pop("observation_json"))
+    result_payload = result.get("result")
+    metrics = result_payload.get("metrics") if isinstance(result_payload, dict) else None
+    if isinstance(metrics, dict):
+        orderbook = next(
+            (
+                observation.get("observation")
+                for observation in result["observations"]
+                if observation.get("series") == "orderbook" and observation.get("kind") == "ORDERBOOK" and isinstance(observation.get("observation"), dict)
+            ),
+            None,
+        )
+        if isinstance(orderbook, dict):
+            metrics["top_bid_qty"] = orderbook.get("top_bid_qty")
+            metrics["top_ask_qty"] = orderbook.get("top_ask_qty")
+            metrics["best_bid_krw"] = orderbook.get("best_bid_krw")
+            metrics["best_ask_krw"] = orderbook.get("best_ask_krw")
+            metrics["last_price_krw"] = orderbook.get("last_price_krw")
     return result
 
 

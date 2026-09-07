@@ -992,7 +992,7 @@ def create_evaluation(db: sqlite3.Connection, card_id: int, data: dict[str, Any]
     cost_adjusted_entry_price = None
     within_cost_guardrail = False
     if price_krw is not None:
-        cost_adjusted_entry_price = (Decimal(str(price_krw)) - Decimal(str(costs["entry_cost_krw"]))).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+        cost_adjusted_entry_price = (Decimal(str(price_krw)) + Decimal(str(costs["entry_cost_krw"]))).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
         within_cost_guardrail = good_band["low"] <= cost_adjusted_entry_price <= good_band["high"]
     structural_good_compatibility = {
         "status": "UNAVAILABLE",
@@ -1029,7 +1029,7 @@ def create_evaluation(db: sqlite3.Connection, card_id: int, data: dict[str, Any]
     elif not calibration["eligible"]:
         final_state = "HOLD"
         recommendation = "HOLD_INSUFFICIENT_EVIDENCE"
-    elif market_verified and within_guardrail:
+    elif market_verified and structural_good_compatibility["status"] == "GOOD_COMPATIBLE":
         if Decimal(str(calibration["snapshot"]["good"]["lower_bound"])) >= HYBRID_GOOD_LCB_THRESHOLD:
             final_state = "GOOD"
             recommendation = "BUY_REVIEW"

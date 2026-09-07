@@ -68,7 +68,7 @@ def _scenario_payload(evidence_id, card_id, *, version=1):
     return payload
 
 
-def _market_context(app, client, card_id, *, symbol="005930", top_bid_qty=20.0, top_ask_qty=20.0):
+def _market_context(app, client, card_id, *, symbol="005930", last_price=100.0, best_bid=None, best_ask=None, top_bid_qty=20.0, top_ask_qty=20.0):
     import kr_stock_autotrader.intraday_market_context as mc
     from kr_stock_autotrader.intraday_market_context import evaluate_intraday_market_context, persist_intraday_market_context_run, resolve_intraday_lineage_context, same_time_history_for_symbol
 
@@ -84,6 +84,8 @@ def _market_context(app, client, card_id, *, symbol="005930", top_bid_qty=20.0, 
     db.close()
 
     snapshot_at = datetime(2026, 9, 7, 9, 5, 2, tzinfo=ZoneInfo("Asia/Seoul"))
+    best_bid = last_price - 0.04 if best_bid is None else best_bid
+    best_ask = last_price if best_ask is None else best_ask
     stock_snapshot = _intraday_snapshot(
         symbol,
         prices=[100, 100, 100, 100, 100, 100],
@@ -101,9 +103,9 @@ def _market_context(app, client, card_id, *, symbol="005930", top_bid_qty=20.0, 
     orderbook = {
         "status": "ok",
         "symbol": symbol,
-        "last_price": 100.0,
-        "best_bid": 99.96,
-        "best_ask": 100.0,
+        "last_price": last_price,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
         "top_bid_qty": top_bid_qty,
         "top_ask_qty": top_ask_qty,
         "quote_known_at": snapshot_at.isoformat(),
@@ -511,6 +513,93 @@ def test_hybrid_min_top_of_book_qty_blocks_buy_review(app_client):
     )
     assert evaluation.status_code == 200, evaluation.text
     assert evaluation.json()["recommendation"] != "BUY_REVIEW"
+
+
+def test_hybrid_normal_persisted_market_context_exposes_top_book_depth_and_allows_buy_review(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-topbook-positive")
+    db.commit()
+    db.close()
+    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    out = scenario.json()
+    good_band = next(item["per_share_value_range_krw"] for item in out["scenarios"] if item["label"] == "GOOD")
+    for index in range(30):
+        good_price = good_band["low"] + 0.5
+        row = _case_row(
+            exchange_at=_case_timestamp(index),
+            known_at=_case_timestamp(index),
+            open_krw=good_price,
+            high_krw=good_price + 0.1,
+            low_krw=good_price - 0.1,
+            close_krw=good_price,
+            volume=1000.0,
+        )
+        case, _ = _register_case(app, client, index=index + 1, key="hybrid-topbook-positive", known_at=_case_timestamp(index), row=row)
+        assert case["id"]
+    price = (good_band["low"] + good_band["high"]) / 2
+    market_context = _market_context(app, client, saved["id"], symbol="005930", last_price=price, best_bid=price - 0.04, best_ask=price, top_bid_qty=20.0, top_ask_qty=20.0)
+    assert market_context["metrics"]["top_bid_qty"] == 20.0
+    assert market_context["metrics"]["top_ask_qty"] == 20.0
+    plan = _create_plan(client, out["id"], idempotency_key="topbook-positive-plan")
+    assert plan.status_code == 200, plan.text
+    snapshot = _create_snapshot(client, plan.json()["id"])
+    assert snapshot.status_code == 200, snapshot.text
+    evaluation = client.post(
+        f"/api/internal/cards/{saved['id']}/hybrid-evaluation",
+        headers=INTERNAL,
+        json={"policy_identity": POLICY_ID, "policy_version": 1, "calibration_snapshot_id": snapshot.json()["id"], "recommendation_only": True},
+    )
+    assert evaluation.status_code == 200, evaluation.text
+    body = evaluation.json()
+    assert body["recommendation"] == "BUY_REVIEW"
+    assert body["final_state"] == "GOOD"
+    assert body["structural_good_compatibility"]["status"] == "GOOD_COMPATIBLE"
+    assert body["structural_good_compatibility"]["inputs"]["top_bid_qty"] == 20.0
+    assert body["structural_good_compatibility"]["inputs"]["top_ask_qty"] == 20.0
+
+
+def test_hybrid_cost_adjusted_entry_outside_frozen_good_band_blocks_buy_review(app_client):
+    app, client = app_client
+    db = dbmod.connect()
+    evidence, filt, saved = _make_lineage(db, key="hybrid-cost-guardrail")
+    db.commit()
+    db.close()
+    scenario = client.post("/api/internal/scenario-sets", headers=INTERNAL, json=_scenario_payload(evidence["id"], saved["id"]))
+    out = scenario.json()
+    good_band = next(item["per_share_value_range_krw"] for item in out["scenarios"] if item["label"] == "GOOD")
+    for index in range(30):
+        good_price = good_band["low"] + 0.5
+        row = _case_row(
+            exchange_at=_case_timestamp(index),
+            known_at=_case_timestamp(index),
+            open_krw=good_price,
+            high_krw=good_price + 0.1,
+            low_krw=good_price - 0.1,
+            close_krw=good_price,
+            volume=1000.0,
+        )
+        case, _ = _register_case(app, client, index=index + 1, key="hybrid-cost-guardrail", known_at=_case_timestamp(index), row=row)
+        assert case["id"]
+    price = good_band["high"] - 0.001
+    market_context = _market_context(app, client, saved["id"], symbol="005930", last_price=price, best_bid=price - 0.04, best_ask=price, top_bid_qty=20.0, top_ask_qty=20.0)
+    assert market_context["metrics"]["top_bid_qty"] == 20.0
+    assert market_context["metrics"]["top_ask_qty"] == 20.0
+    plan = _create_plan(client, out["id"], idempotency_key="cost-guardrail-plan")
+    assert plan.status_code == 200, plan.text
+    snapshot = _create_snapshot(client, plan.json()["id"])
+    assert snapshot.status_code == 200, snapshot.text
+    evaluation = client.post(
+        f"/api/internal/cards/{saved['id']}/hybrid-evaluation",
+        headers=INTERNAL,
+        json={"policy_identity": POLICY_ID, "policy_version": 1, "calibration_snapshot_id": snapshot.json()["id"], "recommendation_only": True},
+    )
+    assert evaluation.status_code == 200, evaluation.text
+    body = evaluation.json()
+    assert body["recommendation"] != "BUY_REVIEW"
+    assert body["final_state"] != "GOOD"
+    assert body["structural_good_compatibility"]["status"] != "GOOD_COMPATIBLE"
+    assert "cost_adjusted_entry_outside_frozen_good_band" in body["structural_good_compatibility"]["reasons"]
 
 
 def test_hybrid_invalidation_dominates_and_forbidden_tables_remain_zero(app_client):
