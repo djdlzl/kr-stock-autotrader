@@ -364,10 +364,11 @@ def test_release0_persisted_blockers_keep_string_items_whole_and_fail_closed(mon
     script = re.search(r"<script>(.*?)</script>", client.get("/app").text, re.S).group(1)
     korean = re.search(r"function korean.*?(?=function blockerItems)", script, re.S).group(0)
     normalizer = re.search(r"function blockerItems.*?(?=function kst)", script, re.S).group(0)
+    market_context = re.search(r"function marketContext.*?(?=function renderDetail)", script, re.S).group(0)
     renderer = re.search(r"function renderDetail.*?(?=function visibleFocusable)", script, re.S).group(0)
     node = (
         "const esc=v=>String(v??'');const scenarios=()=>'';const sourceFacts=()=>'';"
-        + korean + normalizer + renderer
+        + korean + normalizer + market_context + renderer
         + "\nconsole.log(JSON.stringify([renderDetail(" + json.dumps(detail.json()) + "),"
         + "renderDetail({card:{unknowns:['첫 항목','둘째 항목',null,7,{}]},filter:{reasons:['셋째 항목',false,{}]}})]));"
     )

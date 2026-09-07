@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Protocol
 import httpx
 from .domain import KST, now_kst, previous_krx_business_date
+from .intraday_market_context import INTRADAY_MINUTE_PATH as _INTRADAY_MINUTE_PATH, INTRADAY_MINUTE_TR_ID as _INTRADAY_MINUTE_TR_ID, IntradayMinuteSnapshot, project_intraday_minute_snapshot
 
 PRODUCTION_BASE_URL = "https://openapi.koreainvestment.com:9443"
 OAUTH_PATH = "/oauth2/tokenP"
@@ -22,6 +23,8 @@ ORDERBOOK_TR_ID = "FHKST01010200"
 DAILY_CHART_PATH = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
 DAILY_CHART_TR_ID = "FHKST03010100"
 DAILY_CHART_OFFICIAL_REFERENCE = "https://apiportal.koreainvestment.com/api/apis/public/detail?accessUrl=/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+INTRADAY_MINUTE_PATH = _INTRADAY_MINUTE_PATH
+INTRADAY_MINUTE_TR_ID = _INTRADAY_MINUTE_TR_ID
 TOKEN_REFRESH_SKEW = timedelta(seconds=30)
 MAX_TOKEN_LIFETIME = timedelta(hours=24)
 
@@ -100,7 +103,7 @@ class KISReadOnlyClient:
                 "network_order_calls": 0, "environment": "production"}
 
     def _request(self, method: str, path: str, **kwargs):
-        if (method, path) not in {("POST", OAUTH_PATH), ("GET", QUOTE_PATH), ("GET", ORDERBOOK_PATH), ("GET", DAILY_CHART_PATH)}:
+        if (method, path) not in {("POST", OAUTH_PATH), ("GET", QUOTE_PATH), ("GET", ORDERBOOK_PATH), ("GET", DAILY_CHART_PATH), ("GET", INTRADAY_MINUTE_PATH)}:
             raise ValueError("non-allowlisted KIS request")
         return self._transport.request(method, self._base_url + path, **kwargs)
 
@@ -235,3 +238,48 @@ class KISReadOnlyClient:
             return DailySnapshot(summary_market_cap_100m=cap, bars=tuple(output2), retrieved_at=now_kst())
         except (TypeError, ValueError, KeyError):
             raise ValueError("KIS daily snapshot unavailable")
+
+    def _intraday_once(self, symbol: str, requested_as_of: datetime, token: str) -> tuple[object, datetime, bool]:
+        response = self._request(
+            "GET",
+            INTRADAY_MINUTE_PATH,
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": symbol,
+                "FID_INPUT_HOUR_1": requested_as_of.strftime("%H%M%S"),
+                "FID_PW_DATA_INCU_YN": "Y",
+                "FID_ETC_CLS_CODE": "",
+            },
+            headers={"authorization": f"Bearer {token}", "appkey": self._app_key, "appsecret": self._app_secret, "tr_id": INTRADAY_MINUTE_TR_ID},
+        )
+        retrieved = now_kst()
+        try:
+            payload = response.json()
+        except (ValueError, TypeError):
+            raise ValueError("intraday snapshot unavailable")
+        if self._auth_expired(response, payload):
+            return {}, retrieved, True
+        if not _response_ok(response) or payload.get("rt_cd") != "0":
+            raise ValueError("intraday snapshot unavailable")
+        return payload, retrieved, False
+
+    def intraday_minute_bars(self, symbol: str, requested_as_of: datetime) -> IntradayMinuteSnapshot:
+        if not isinstance(symbol, str) or not re.fullmatch(r"\d{6}", symbol) or requested_as_of.tzinfo is None:
+            raise ValueError("intraday snapshot unavailable")
+        attempt_started = now_kst()
+        if requested_as_of.astimezone(KST) > attempt_started:
+            raise ValueError("intraday snapshot unavailable")
+        try:
+            for attempt in range(2):
+                payload, retrieved, auth_expired = self._intraday_once(symbol, requested_as_of.astimezone(KST), self._token_value())
+                if auth_expired:
+                    self._clear_token()
+                    if attempt == 1:
+                        raise ValueError("intraday snapshot unavailable")
+                    continue
+                if requested_as_of.astimezone(KST) > retrieved:
+                    raise ValueError("intraday snapshot unavailable")
+                return project_intraday_minute_snapshot(payload, symbol=symbol, requested_as_of=requested_as_of.astimezone(KST), retrieved_at=retrieved, provider="KIS", tr_id=INTRADAY_MINUTE_TR_ID)
+        except (RuntimeError, ValueError, TypeError, KeyError, httpx.HTTPError):
+            pass
+        raise ValueError("intraday snapshot unavailable")

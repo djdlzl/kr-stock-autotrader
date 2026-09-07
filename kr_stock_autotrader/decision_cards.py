@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 from fastapi import Header, HTTPException
 from .decision_card_schema import SCHEMA_VERSION, validate_card
 from .db import FILTER_EVALUATOR_VERSION
+from .intraday_market_context import latest_market_context_for_card
 from .domain import Quote, fresh_quote, market_open, now_kst, parse_kst
 
 PROMPT_PATH = Path(__file__).parents[1] / "prompts" / "decision-card-v1.md"
@@ -539,6 +540,28 @@ def user_card_view(db, ident, user_id):
         current = observations[0] if observations else {"match":"UNOBSERVED","action":"NO_ACTION","active_scenario_label":None}
         result["event_scenarios"].append({"kind":scenario["scenario_kind"],"schema_version":conditional_schema_version if is_conditional else scenario["scenario_schema_version"],"version":scenario["version"],"frozen_at":scenario["frozen_at"],"expected_value_krw":scenario["expected_value_krw"],"scenarios":json.loads(scenario["scenarios_json"]),"current":current,"trust":_scenario_trust(current, invalidated=bool(result.get("invalidated_at"))),"tracking_state":"UNOBSERVABLE" if is_conditional else ("ACTIVE" if not result.get("invalidated_at") else "INACTIVE")})
     result["user_state"]={"decision":dict(decision) if decision else None,"order_plan":plan_view,"draft":({**dict(draft),"snapshot":json.loads(draft["snapshot_json"])} if draft else None),"default_paper_amount":_default_paper_amount(db, user_id)}
+    market_context = latest_market_context_for_card(db, ident)
+    if market_context:
+        result["market_context"] = {
+            "run_key": market_context["run_key"],
+            "source_topic": market_context["source_topic"],
+            "card_id": market_context["card_id"],
+            "evidence_id": market_context["evidence_id"],
+            "filter_id": market_context["filter_id"],
+            "symbol": market_context["symbol"],
+            "benchmark_symbol": market_context["benchmark_symbol"],
+            "requested_as_of": market_context["requested_as_of"],
+            "known_at": market_context["known_at"],
+            "retrieved_at": market_context["retrieved_at"],
+            "market_context_status": market_context["status"],
+            "reason": market_context["reason"],
+            "metrics": market_context["result"]["metrics"],
+            "units": market_context["result"]["units"],
+            "formulas": market_context["result"]["formulas"],
+            "idempotent": False,
+        }
+    else:
+        result["market_context"] = None
     return result
 
 def list_cards(db, missing=False, date=None, current_only=False, operation_date=False):

@@ -169,13 +169,57 @@ def connect() -> sqlite3.Connection:
     );
     CREATE TABLE IF NOT EXISTS event_scenario_observations (
       id INTEGER PRIMARY KEY, scenario_set_id INTEGER NOT NULL REFERENCES event_scenario_sets(id), known_at TEXT NOT NULL,
-      price_krw REAL NOT NULL, benchmark_excess_pct REAL NOT NULL, sector_excess_pct REAL NOT NULL, volume_ratio REAL NOT NULL,
+      price_krw REAL NOT NULL, benchmark_excess_pct REAL, sector_excess_pct REAL, volume_ratio REAL,
       match TEXT NOT NULL CHECK(match IN ('BAD_MATCH','BASE_MATCH','GOOD_MATCH','OUT_OF_RANGE')),
       action TEXT NOT NULL CHECK(action IN ('NO_ACTION','WATCH','ENTRY_REVIEW','ADD_REVIEW','REDUCE_REVIEW','EXIT_REVIEW')),
       provider TEXT NOT NULL DEFAULT 'synthetic', source TEXT NOT NULL DEFAULT 'synthetic', source_receipt TEXT, symbol TEXT,
       retrieved_at TEXT, quote_known_at TEXT, units TEXT NOT NULL DEFAULT 'KRW/pct/ratio',
       idempotency_key TEXT, best_bid REAL, best_ask REAL, spread_pct REAL, imbalance REAL,
       active_scenario_label TEXT, market_context_status TEXT NOT NULL DEFAULT 'UNAVAILABLE', material_hash TEXT NOT NULL DEFAULT '', UNIQUE(scenario_set_id, known_at, source)
+    );
+    CREATE TABLE IF NOT EXISTS intraday_market_context_runs (
+      id INTEGER PRIMARY KEY,
+      run_key TEXT NOT NULL UNIQUE,
+      source_topic TEXT NOT NULL,
+      card_id INTEGER NOT NULL REFERENCES decision_cards(id),
+      card_version INTEGER NOT NULL,
+      evidence_id INTEGER NOT NULL REFERENCES material_evidence(id),
+      evidence_version INTEGER NOT NULL,
+      filter_id INTEGER NOT NULL REFERENCES deterministic_filter_results(id),
+      filter_lineage_version INTEGER NOT NULL,
+      symbol TEXT NOT NULL,
+      benchmark_symbol TEXT NOT NULL,
+      requested_as_of TEXT NOT NULL,
+      session_date TEXT NOT NULL,
+      known_at TEXT NOT NULL,
+      retrieved_at TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      tr_id TEXT NOT NULL,
+      benchmark_tr_id TEXT NOT NULL,
+      schema_version INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      input_sha256 TEXT NOT NULL,
+      result_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS intraday_market_context_observations (
+      id INTEGER PRIMARY KEY,
+      run_id INTEGER NOT NULL REFERENCES intraday_market_context_runs(id),
+      series TEXT NOT NULL CHECK(series IN ('stock','benchmark','orderbook')),
+      kind TEXT NOT NULL CHECK(kind IN ('BAR','ORDERBOOK')),
+      symbol TEXT NOT NULL,
+      exchange_at TEXT,
+      known_at TEXT NOT NULL,
+      retrieved_at TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      source TEXT NOT NULL,
+      tr_id TEXT NOT NULL,
+      schema_version INTEGER NOT NULL DEFAULT 1,
+      sequence INTEGER NOT NULL,
+      completed INTEGER NOT NULL CHECK(completed IN (0,1)),
+      observation_json TEXT NOT NULL,
+      UNIQUE(run_id, series, exchange_at)
     );
     CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, detail TEXT NOT NULL, at TEXT NOT NULL);
     -- Safe receipt only: no credentials, account data, headers, raw KIS payload, or order effects.

@@ -15,11 +15,23 @@ from pydantic import BaseModel, Field, StrictInt, ValidationError, field_validat
 from .auth import csrf_origin_ok, current_user, hash_password, issue_session, verify_password
 from .config import COOKIE_SECURE, LIVE_TRADING, SIGNUP_ENABLED
 from .db import connect
-from .domain import Quote, parse_kst, now_kst
+from .domain import Quote, is_krx_business_date, parse_kst, now_kst
 from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, current_filter_head, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML, PROTOTYPE_HTML
 from .kis_readonly import KISReadOnlyClient
+from .intraday_market_context import (
+    INTRADAY_BENCHMARK_SYMBOL,
+    INTRADAY_SOURCE_TOPIC,
+    evaluate_intraday_market_context,
+    latest_market_context_for_card,
+    market_context_run_detail,
+    resolve_intraday_lineage_context,
+    same_time_history_for_symbol,
+    _result_signature,
+    persist_intraday_market_context_run,
+    render_market_context_response,
+)
 from .market_data import build_premarket_snapshot, filter_inputs_from_snapshot
 from .live_dry_run import existing_live_dry_run_receipt, persist_live_dry_run
 from .event_scenarios import create as create_scenario_set, detail as scenario_set_detail, observe as observe_scenario
@@ -120,6 +132,16 @@ class PaperSettingsIn(BaseModel):
 
 class LiveDryRunIn(BaseModel):
     dry_run_key: str = Field(pattern=r"^[A-Za-z0-9_-]{8,64}$")
+
+
+class MarketContextIn(BaseModel):
+    run_key: str = Field(pattern=r"^[A-Za-z0-9_-]{8,128}$")
+    as_of: str
+
+    @field_validator("as_of")
+    @classmethod
+    def as_of_kst(cls, value):
+        return parse_kst(value).isoformat()
 
 
 # Single-process contract: keyed locks serialize work without retaining every seen key.
@@ -477,6 +499,16 @@ def _kis_orderbook_provider():
     return provider
 
 
+def _kis_intraday_minute_provider():
+    provider = getattr(app.state, "kis_intraday_minute_provider", None)
+    if provider is None:
+        global _default_kis_client
+        if _default_kis_client is None:
+            _default_kis_client = KISReadOnlyClient()
+        provider = _default_kis_client.intraday_minute_bars
+    return provider
+
+
 def _card_tracking_scenario(db, card_id: int):
     """Resolve only server-owned active card/scenario identity for polling."""
     scenario = db.execute("SELECT * FROM event_scenario_sets WHERE card_id=? ORDER BY version DESC,id DESC LIMIT 1", (card_id,)).fetchone()
@@ -531,14 +563,27 @@ async def card_scenario_observation(card_id: int, request: Request):
         quote = _safe_kis_orderbook(scenario["symbol"], outcome)
         if quote.get("status") != "ok":
             raise HTTPException(503, {"code": "QUOTE_UNAVAILABLE", "message": "호가를 안전하게 확인하지 못했습니다"})
+        market_context = latest_market_context_for_card(db, card_id)
+        market_context_values = {}
+        if market_context and market_context.get("card_id") == card_id and market_context.get("market_context_status") == "VERIFIED":
+            market_context_values = market_context["result"].get("metrics", {})
+        volume_ratio = market_context_values.get("same_time_baseline_volume_ratio")
+        benchmark_excess_pct = market_context_values.get("benchmark_excess_pct")
+        sector_excess_pct = market_context_values.get("sector_excess_pct")
+        market_context_status = "VERIFIED" if volume_ratio is not None and benchmark_excess_pct is not None and sector_excess_pct is not None else "UNAVAILABLE"
+        source_provider = "TRUSTED_MARKET_CONTEXT" if market_context_values else "KIS"
+        source = source_provider
+        source_receipt = f"MARKET_CONTEXT:{market_context['run_key']}" if market_context_values else f"KIS:{quote['quote_known_at']}"
+        known_at = market_context["known_at"] if market_context_values else quote["quote_known_at"]
+        retrieved_at = market_context["retrieved_at"] if market_context_values else quote["retrieved_at"]
         observation = {
-            "provider": "KIS", "source": "KIS", "source_receipt": f"KIS:{quote['quote_known_at']}",
-            "symbol": scenario["symbol"], "known_at": quote["quote_known_at"], "retrieved_at": quote["retrieved_at"],
+            "provider": source_provider, "source": source, "source_receipt": source_receipt,
+            "symbol": scenario["symbol"], "known_at": known_at, "retrieved_at": retrieved_at,
             "price_krw": quote["last_price"], "best_bid": quote["best_bid"], "best_ask": quote["best_ask"],
             "top_bid_qty": quote["top_bid_qty"], "top_ask_qty": quote["top_ask_qty"],
             "idempotency_key": body.get("idempotency_key", quote["quote_known_at"]),
-            "volume_ratio": 1.0, "benchmark_excess_pct": 0.0, "sector_excess_pct": 0.0,
-            "market_context_status": "UNAVAILABLE",
+            "volume_ratio": volume_ratio, "benchmark_excess_pct": benchmark_excess_pct, "sector_excess_pct": sector_excess_pct,
+            "market_context_status": market_context_status,
         }
         result = observe_scenario(db, scenario["event_identity"], observation)
         return {"tracking_health": _tracking_health(quote, result), "observation": result}
@@ -792,6 +837,119 @@ async def internal_card_save(request: Request, _: None = Depends(require_interna
     db=connect()
     try:return save_card(db,await request.json())
     finally:db.close()
+
+@app.post('/api/internal/cards/{card_id}/market-context')
+async def internal_card_market_context(card_id: int, request: Request, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try:
+        try:
+            data = MarketContextIn.model_validate(await request.json())
+        except (ValidationError, ValueError):
+            raise HTTPException(422, "invalid market context request")
+        card = db.execute("SELECT * FROM decision_cards WHERE id=?", (card_id,)).fetchone()
+        if not card:
+            raise HTTPException(404, "decision card not found")
+        evidence = evidence_detail(db, card["evidence_id"])
+        if not evidence:
+            raise HTTPException(409, "market context requires current 08:00 lineage")
+        if card["invalidated_at"] or evidence["invalidated_at"] or evidence["status"] == "invalidated":
+            raise HTTPException(409, "market context requires current 08:00 lineage")
+        filter_result = filter_detail(db, card["filter_id"])
+        if (
+            filter_result["evidence_id"] != evidence["id"]
+            or filter_result["evidence_version"] != evidence["version"]
+            or db.execute("SELECT 1 FROM deterministic_filter_results WHERE parent_filter_id=?", (filter_result["id"],)).fetchone()
+        ):
+            raise HTTPException(409, "market context requires current 08:00 lineage")
+        as_of = parse_kst(data.as_of)
+        if not is_krx_business_date(as_of.date()) or as_of.time() < time(9, 5) or as_of.time() >= time(9, 6):
+            raise HTTPException(409, "market context outside operational window")
+        benchmark_symbol, previous_close = resolve_intraday_lineage_context(card=dict(card), evidence=evidence, filter_result=filter_result)
+        signature = _result_signature(card["id"], evidence["id"], filter_result["id"], data.run_key, data.as_of, INTRADAY_SOURCE_TOPIC)
+        orderbook_provider = _kis_orderbook_provider()
+        intraday_provider = _kis_intraday_minute_provider()
+        orderbook = None
+        stock_snapshot = None
+        benchmark_snapshot = None
+        try:
+            orderbook = orderbook_provider(evidence["symbol"])
+        except Exception:
+            orderbook = None
+        try:
+            stock_snapshot = intraday_provider(evidence["symbol"], as_of)
+        except Exception:
+            stock_snapshot = None
+        try:
+            benchmark_snapshot = intraday_provider(benchmark_symbol, as_of)
+        except Exception:
+            benchmark_snapshot = None
+        def _retrieval_out_of_window(value: str | None) -> bool:
+            if not isinstance(value, str):
+                return False
+            retrieved = parse_kst(value)
+            return retrieved.date() != as_of.date() or retrieved.time() < time(9, 5) or retrieved.time() >= time(9, 6)
+
+        if _retrieval_out_of_window(orderbook.get("retrieved_at") if isinstance(orderbook, dict) else None):
+            raise HTTPException(409, "market context outside operational window")
+        if stock_snapshot is not None and _retrieval_out_of_window(stock_snapshot.retrieved_at.isoformat()):
+            raise HTTPException(409, "market context outside operational window")
+        if benchmark_snapshot is not None and _retrieval_out_of_window(benchmark_snapshot.retrieved_at.isoformat()):
+            raise HTTPException(409, "market context outside operational window")
+        same_time_history = []
+        if stock_snapshot is not None:
+            completed_count = len([row for row in stock_snapshot.bars if row["completion_status"] == "completed"])
+            same_time_history = same_time_history_for_symbol(db, symbol=evidence["symbol"], requested_as_of=data.as_of, completed_interval_count=completed_count)
+        result = evaluate_intraday_market_context(stock_snapshot=stock_snapshot, benchmark_snapshot=benchmark_snapshot, orderbook=orderbook, same_time_history=same_time_history, previous_close_krw=previous_close)
+        known_candidates = []
+        for candidate in (
+            orderbook.get("retrieved_at") if isinstance(orderbook, dict) else None,
+            orderbook.get("quote_known_at") if isinstance(orderbook, dict) else None,
+            stock_snapshot.retrieved_at.isoformat() if stock_snapshot is not None else None,
+            benchmark_snapshot.retrieved_at.isoformat() if benchmark_snapshot is not None else None,
+        ):
+            if not isinstance(candidate, str):
+                continue
+            try:
+                known_candidates.append(parse_kst(candidate))
+            except (TypeError, ValueError):
+                continue
+        known_at = max(known_candidates).isoformat() if known_candidates else as_of.isoformat()
+        result["known_at"] = known_at
+        result["retrieved_at"] = known_at
+        return persist_intraday_market_context_run(
+            db,
+            run_key=data.run_key,
+            card=dict(card),
+            evidence=dict(evidence),
+            filter_result=dict(filter_result),
+            requested_as_of=data.as_of,
+            stock_snapshot=stock_snapshot,
+            benchmark_snapshot=benchmark_snapshot,
+            orderbook=orderbook,
+            result=result,
+            source_topic=INTRADAY_SOURCE_TOPIC,
+        )
+    finally:
+        db.close()
+
+@app.get('/api/internal/market-context-runs/{run_key}')
+def internal_market_context_run_detail(run_key: str, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try:
+        return render_market_context_response(market_context_run_detail(db, run_key=run_key), idempotent=False)
+    finally:
+        db.close()
+
+@app.get('/api/internal/cards/{card_id}/market-context')
+def internal_card_market_context_detail(card_id: int, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try:
+        detail = latest_market_context_for_card(db, card_id)
+        if not detail:
+            raise HTTPException(404, "market context run not found")
+        return render_market_context_response(detail, idempotent=False)
+    finally:
+        db.close()
 
 @app.post('/api/internal/order-plans/{plan_id}/evaluate')
 async def internal_order_evaluate(plan_id: int, request: Request, _: None = Depends(require_internal_api_key)):

@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import pytest
-from kr_stock_autotrader.kis_readonly import KISReadOnlyClient, OAUTH_PATH, QUOTE_PATH, QUOTE_TR_ID, ORDERBOOK_PATH, ORDERBOOK_TR_ID, PRODUCTION_BASE_URL, DAILY_CHART_PATH, DAILY_CHART_TR_ID, DAILY_CHART_OFFICIAL_REFERENCE
+from kr_stock_autotrader.kis_readonly import KISReadOnlyClient, OAUTH_PATH, QUOTE_PATH, QUOTE_TR_ID, ORDERBOOK_PATH, ORDERBOOK_TR_ID, PRODUCTION_BASE_URL, DAILY_CHART_PATH, DAILY_CHART_TR_ID, DAILY_CHART_OFFICIAL_REFERENCE, INTRADAY_MINUTE_PATH, INTRADAY_MINUTE_TR_ID
 from kr_stock_autotrader.live_dry_run import evaluate_live_dry_run
 
 KST=ZoneInfo('Asia/Seoul')
@@ -149,6 +149,65 @@ def test_daily_snapshot_rejects_missing_or_invalid_official_output1_market_cap(o
     transport = FakeTransport([Response({'access_token':'x','expires_in':86400}), Response({'rt_cd':'0', 'output1': output1, 'output2': []})])
     with pytest.raises(ValueError, match='daily snapshot unavailable'):
         KISReadOnlyClient('key', 'value', transport=transport).daily_snapshot('005930', datetime(2026, 9, 2, 8, tzinfo=KST))
+
+
+def _actual_intraday_payload(**overrides):
+    payload = {
+        "rt_cd": "0",
+        "output2": [
+            {"stck_bsop_date": "20260907", "stck_cntg_hour": "090500", "stck_prpr": "70500", "stck_oprc": "70100", "stck_hgpr": "70600", "stck_lwpr": "70050", "cntg_vol": "7", "acml_tr_pbmn": "490000"},
+            {"stck_bsop_date": "20260907", "stck_cntg_hour": "090400", "stck_prpr": "70400", "stck_oprc": "70100", "stck_hgpr": "70550", "stck_lwpr": "70050", "cntg_vol": "6", "acml_tr_pbmn": "422400"},
+            {"stck_bsop_date": "20260907", "stck_cntg_hour": "090300", "stck_prpr": "70300", "stck_oprc": "70100", "stck_hgpr": "70450", "stck_lwpr": "70050", "cntg_vol": "5", "acml_tr_pbmn": "351500"},
+            {"stck_bsop_date": "20260907", "stck_cntg_hour": "090300", "stck_prpr": "70300", "stck_oprc": "70100", "stck_hgpr": "70450", "stck_lwpr": "70050", "cntg_vol": "5", "acml_tr_pbmn": "351500"},
+            {"stck_bsop_date": "20260907", "stck_cntg_hour": "090200", "stck_prpr": "70200", "stck_oprc": "70100", "stck_hgpr": "70350", "stck_lwpr": "70050", "cntg_vol": "4", "acml_tr_pbmn": "280800"},
+            {"stck_bsop_date": "20260907", "stck_cntg_hour": "090100", "stck_prpr": "70100", "stck_oprc": "70100", "stck_hgpr": "70200", "stck_lwpr": "70050", "cntg_vol": "3", "acml_tr_pbmn": "210300"},
+            {"stck_bsop_date": "20260907", "stck_cntg_hour": "090000", "stck_prpr": "70000", "stck_oprc": "70000", "stck_hgpr": "70100", "stck_lwpr": "69900", "cntg_vol": "2", "acml_tr_pbmn": "140000"},
+            {"stck_bsop_date": "20260904", "stck_cntg_hour": "153000", "stck_prpr": "69000", "stck_oprc": "68900", "stck_hgpr": "69100", "stck_lwpr": "68800", "cntg_vol": "9", "acml_tr_pbmn": "621000"},
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_intraday_minute_snapshot_filters_mixed_prior_day_padding_and_descending_rows():
+    transport = FakeTransport([
+        Response({'access_token':'x','expires_in':86400}),
+        Response(_actual_intraday_payload()),
+    ])
+    snapshot = KISReadOnlyClient('key', 'value', transport=transport).intraday_minute_bars('005930', datetime(2026, 9, 7, 9, 5, tzinfo=KST))
+    assert snapshot.provider == "KIS"
+    assert snapshot.source == "KIS"
+    assert snapshot.tr_id == INTRADAY_MINUTE_TR_ID
+    assert snapshot.requested_as_of.isoformat() == "2026-09-07T09:05:00+09:00"
+    assert snapshot.retrieved_at.tzinfo is not None
+    assert [row["exchange_at"] for row in snapshot.bars] == [
+        "2026-09-07T09:00:00+09:00",
+        "2026-09-07T09:01:00+09:00",
+        "2026-09-07T09:02:00+09:00",
+        "2026-09-07T09:03:00+09:00",
+        "2026-09-07T09:04:00+09:00",
+        "2026-09-07T09:05:00+09:00",
+    ]
+    assert [row["completion_status"] for row in snapshot.bars] == ["completed", "completed", "completed", "completed", "completed", "in_progress"]
+    assert snapshot.bars[0]["minute_volume"] == 2.0 and snapshot.bars[-1]["minute_volume"] == 7.0
+    assert snapshot.bars[-1]["cumulative_trade_value"] == 490000.0
+    assert transport.calls[-1][2]["params"]["FID_INPUT_HOUR_1"] == "090500"
+    assert transport.calls[-1][2]["params"]["FID_PW_DATA_INCU_YN"] == "Y"
+
+
+@pytest.mark.parametrize("as_of,retrieved_at,payload", [
+    (datetime(2026, 9, 7, 9, 6, tzinfo=KST), datetime(2026, 9, 7, 9, 5, tzinfo=KST), _actual_intraday_payload()),
+    (datetime(2026, 9, 7, 9, 5, tzinfo=KST), datetime(2026, 9, 7, 9, 5, tzinfo=KST), _actual_intraday_payload(output2=[{"stck_bsop_date": "20260907", "stck_cntg_hour": "090600", "stck_prpr": "70500", "stck_oprc": "70100", "stck_hgpr": "70600", "stck_lwpr": "70050", "cntg_vol": "7", "acml_tr_pbmn": "490000"}])),
+])
+def test_intraday_minute_snapshot_rejects_future_as_of_or_future_provider_rows(monkeypatch, as_of, retrieved_at, payload):
+    monkeypatch.setattr(__import__("kr_stock_autotrader.kis_readonly", fromlist=["now_kst"]), "now_kst", lambda: retrieved_at)
+    transport = FakeTransport([
+        Response({'access_token':'x','expires_in':86400}),
+        Response(payload),
+    ])
+    client = KISReadOnlyClient('key', 'value', transport=transport)
+    with pytest.raises(ValueError, match='intraday snapshot unavailable'):
+        client.intraday_minute_bars('005930', as_of)
 
 def plan(**overrides):
     x={'id':1,'card_id':2,'card_version':1,'version_hash':'frozen','status':'approved','symbol':'005930','valid_until':'2026-08-28T12:00:00+09:00','expires_at':'2026-08-28T12:00:00+09:00','window_start':'2026-08-28T09:00:00+09:00','window_end':'2026-08-28T15:00:00+09:00','price_cap':71000,'max_qty':2,'max_amount':140000,'bought_qty':0,'bought_amount':0}

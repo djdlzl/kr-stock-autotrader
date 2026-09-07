@@ -35,6 +35,12 @@ def number(value: Any, name: str, *, positive: bool = False, nonnegative: bool =
     return result
 
 
+def optional_number(value: Any, name: str, *, positive: bool = False, nonnegative: bool = False, ratio: bool = False) -> float | None:
+    if value is None:
+        return None
+    return number(value, name, positive=positive, nonnegative=nonnegative, ratio=ratio)
+
+
 def positive_integer(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0: fail(f"invalid {name}")
     return value
@@ -279,10 +285,16 @@ def observe(db, identity, data):
         fail("best_bid above best_ask")
     spread = (ask - bid) / price * 100
     imbalance = (bid_qty - ask_qty) / (bid_qty + ask_qty)
-    volume, bench, sector = (
-        number(data.get(field), field, positive=field == "volume_ratio")
-        for field in ("volume_ratio", "benchmark_excess_pct", "sector_excess_pct")
-    )
+    if status == "UNAVAILABLE":
+        volume, bench, sector = (
+            optional_number(data.get(field), field, positive=field == "volume_ratio")
+            for field in ("volume_ratio", "benchmark_excess_pct", "sector_excess_pct")
+        )
+    else:
+        volume, bench, sector = (
+            number(data.get(field), field, positive=field == "volume_ratio")
+            for field in ("volume_ratio", "benchmark_excess_pct", "sector_excess_pct")
+        )
     material = canon({
         "provider": provider, "source": source, "source_receipt": receipt, "symbol": symbol,
         "known_at": known.isoformat(), "retrieved_at": retrieved.isoformat(), "price_krw": price,
