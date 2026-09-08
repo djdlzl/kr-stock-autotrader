@@ -159,6 +159,13 @@ def connect() -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS positions (id INTEGER PRIMARY KEY, order_plan_id INTEGER NOT NULL UNIQUE REFERENCES order_plans(id), symbol TEXT NOT NULL, qty INTEGER NOT NULL, avg_price REAL, status TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS exit_lineage (id INTEGER PRIMARY KEY, order_plan_id INTEGER NOT NULL REFERENCES order_plans(id), fill_id INTEGER NOT NULL REFERENCES order_fills(id), rule TEXT NOT NULL, quote_known_at TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS scheduler_runs (id INTEGER PRIMARY KEY, run_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, detail TEXT NOT NULL DEFAULT '{}');
+    -- One opaque KIS OAuth token per non-secret application-key digest.  The
+    -- row is deliberately not exposed through any API or audit projection.
+    CREATE TABLE IF NOT EXISTS kis_oauth_token_cache (
+      cache_key TEXT PRIMARY KEY CHECK(length(cache_key)=64),
+      access_token TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
     -- Additive immutable event scenario records. These tables have no order/allocation foreign keys.
     CREATE TABLE IF NOT EXISTS event_scenario_sets (
       id INTEGER PRIMARY KEY, event_identity TEXT NOT NULL, version INTEGER NOT NULL, symbol TEXT NOT NULL, event_type TEXT NOT NULL,

@@ -1,5 +1,7 @@
 import os
+import sqlite3
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -118,6 +120,52 @@ def test_daily_snapshot_uses_official_output1_summary_and_output2_bars():
     assert snapshot.retrieved_at.tzinfo is not None
     assert transport.calls[-1][2]['params']['FID_INPUT_DATE_2'] == '20260901'
     assert 'output1' not in repr(snapshot) and 'output2' not in repr(snapshot)
+
+
+@pytest.mark.parametrize("rejection_payload, rejection_status", [
+    ({}, 401),
+    ({"msg_cd": "EGW00121"}, 200),
+    ({"msg_cd": "EGW00123"}, 200),
+])
+def test_daily_snapshot_replaces_broker_rejected_durable_token_once(monkeypatch, tmp_path, rejection_payload, rejection_status):
+    """A daily-chart auth rejection must evict only its rejected durable row."""
+    from kr_stock_autotrader import db as dbmod
+    import kr_stock_autotrader.kis_readonly as kis
+
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "daily-token-cache.db"))
+    monkeypatch.setattr(kis, "now_kst", lambda: NOW)
+    rejected = "durable-rejected-token"
+    refreshed = "newly-issued-token"
+    cache = dbmod.connect()
+    try:
+        cache.execute(
+            "INSERT INTO kis_oauth_token_cache(cache_key, access_token, expires_at) VALUES(?, ?, ?)",
+            (KISReadOnlyClient("key", "value")._token_cache_key(), rejected, (NOW + timedelta(hours=1)).isoformat()),
+        )
+        cache.commit()
+    finally:
+        cache.close()
+
+    rows = [{"stck_bsop_date": "20260901", "stck_clpr": "70000"}]
+    transport = FakeTransport([
+        Response(rejection_payload, rejection_status),
+        Response({"access_token": refreshed, "expires_in": 3600}),
+        Response({"rt_cd": "0", "output1": {"hts_avls": "6503"}, "output2": rows}),
+    ])
+    snapshot = KISReadOnlyClient("key", "value", transport=transport).daily_snapshot(
+        "005930", datetime(2026, 9, 2, 8, tzinfo=KST)
+    )
+
+    assert snapshot.summary_market_cap_100m == 6503.0
+    assert [call[0] for call in transport.calls] == ["GET", "POST", "GET"]
+    assert all(rejected not in value for value in (repr(snapshot), str(snapshot.bars)))
+    cache = dbmod.connect()
+    try:
+        durable_tokens = [row["access_token"] for row in cache.execute("SELECT access_token FROM kis_oauth_token_cache")]
+    finally:
+        cache.close()
+    assert rejected not in durable_tokens
+    assert durable_tokens == [refreshed]
 
 
 @pytest.mark.parametrize(("as_of", "expected_end"), [
@@ -505,3 +553,70 @@ def test_failure_provider_outcomes_are_sanitized_at_quote_and_dry_run_boundaries
     finally:
         check.close()
     assert secret not in str(quote_response.json()) + str(dry_response.json()) + serialized_db + caplog.text
+
+
+def test_db_token_cache_reuses_one_oauth_issuance_across_fresh_clients(monkeypatch, tmp_path):
+    """A fresh client must reuse the durable cache rather than mint a token."""
+    from kr_stock_autotrader import db as dbmod
+    import kr_stock_autotrader.kis_readonly as kis
+
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "token-cache.db"))
+    monkeypatch.setattr(kis, "now_kst", lambda: NOW)
+    first = FakeTransport([Response({"access_token": "test-issued-token", "expires_in": 3600})])
+    second = FakeTransport()
+
+    assert KISReadOnlyClient("key", "value", transport=first)._token_value() == "test-issued-token"
+    assert KISReadOnlyClient("key", "value", transport=second)._token_value() == "test-issued-token"
+    assert [call[0] for call in first.calls] == ["POST"]
+    assert second.calls == []
+
+
+def test_db_token_cache_coordinates_concurrent_refresh_to_one_oauth_issuance(monkeypatch, tmp_path):
+    """BEGIN IMMEDIATE must serialize fresh-process refresh and recheck the row."""
+    from kr_stock_autotrader import db as dbmod
+    import kr_stock_autotrader.kis_readonly as kis
+
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "concurrent-token-cache.db"))
+    monkeypatch.setattr(kis, "now_kst", lambda: NOW)
+    issued = []
+    issued_lock = threading.Lock()
+
+    class SharedOAuthTransport:
+        def request(self, method, url, **kwargs):
+            assert method == "POST" and url.endswith(OAUTH_PATH)
+            with issued_lock:
+                issued.append(1)
+            return Response({"access_token": "test-issued-token", "expires_in": 3600})
+
+    clients = [KISReadOnlyClient("key", "value", transport=SharedOAuthTransport()) for _ in range(4)]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        values = list(pool.map(lambda client: client._token_value(), clients))
+    assert values == ["test-issued-token"] * 4
+    assert issued == [1]
+
+
+def test_db_token_cache_refreshes_expired_rows_and_fails_closed_for_malformed_rows(monkeypatch, tmp_path):
+    from kr_stock_autotrader import db as dbmod
+    import kr_stock_autotrader.kis_readonly as kis
+
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "expiry-token-cache.db"))
+    monkeypatch.setattr(kis, "now_kst", lambda: NOW)
+    expired = FakeTransport([Response({"access_token": "test-issued-token", "expires_in": 1})])
+    assert KISReadOnlyClient("key", "value", transport=expired)._token_value() == "test-issued-token"
+
+    refreshed = FakeTransport([Response({"access_token": "test-refreshed-token", "expires_in": 3600})])
+    assert KISReadOnlyClient("key", "value", transport=refreshed)._token_value() == "test-refreshed-token"
+    assert [call[0] for call in refreshed.calls] == ["POST"]
+
+    cache = dbmod.connect()
+    cache.execute("UPDATE kis_oauth_token_cache SET expires_at=?", ("not-an-iso-timestamp",))
+    cache.commit()
+    cache.close()
+    no_oauth = FakeTransport()
+    with pytest.raises(RuntimeError, match="KIS OAuth cache unavailable"):
+        KISReadOnlyClient("key", "value", transport=no_oauth)._token_value()
+    assert no_oauth.calls == []
+
+    monkeypatch.setattr(dbmod, "connect", lambda: (_ for _ in ()).throw(sqlite3.OperationalError("cache offline")))
+    with pytest.raises(RuntimeError, match="KIS OAuth cache unavailable"):
+        KISReadOnlyClient("key", "value", transport=FakeTransport())._token_value()
