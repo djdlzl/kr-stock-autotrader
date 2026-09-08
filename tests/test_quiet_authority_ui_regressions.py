@@ -241,6 +241,50 @@ const emptyState = () => '<article>empty</article>';
     }
 
 
+def test_invalidation_renderer_distinguishes_replacement_from_hypothesis_discard_and_escapes_reason():
+    """A regenerated card is history; genuine and legacy invalidations retain an explicit reason."""
+    script = re.search(r"<script>(.*?)</script>", APP_HTML, re.S).group(1)
+    invalidation = re.search(r"function invalidationState\(c\)\{.*?\}(?=\s*function statusFor)", script, re.S).group(0)
+    status = re.search(r"function statusFor\(c\)\{.*?\}(?=\s*function deadline)", script, re.S).group(0)
+    node = (
+        invalidation
+        + status
+        + "\nconsole.log(JSON.stringify(["
+        + "invalidationState({invalidated_at:'2026-09-08',invalidation_reason:'new_card'}),"
+        + "invalidationState({invalidated_at:'2026-09-08',invalidation_reason:'evidence_invalidated'}),"
+        + "invalidationState({invalidated_at:'2026-09-08',invalidation_reason:'<legacy>'}),"
+        + "invalidationState({invalidated_at:'2026-09-08'}),"
+        + "statusFor({card:{verdict:'매수 검토 가능'}})"
+        + "]));"
+    )
+    states = json.loads(subprocess.check_output(["node", "-e", node], text=True))
+    assert states == [
+        {"label": "새 카드로 대체됨 · 이전 판단 기록", "kind": "history", "detail": "새 카드가 생성되어 이 카드는 이전 판단 기록으로 보관됩니다."},
+        {"label": "가설 폐기 조건 충족", "kind": "danger", "detail": "가설 폐기 사유: 근거 자료가 무효화되었습니다."},
+        {"label": "가설 폐기 조건 충족", "kind": "danger", "detail": "가설 폐기 사유: <legacy>"},
+        {"label": "판단 종료 · 사유 확인 필요", "kind": "history", "detail": "이 판단은 종료되었지만 종료 사유가 기록되지 않았습니다."},
+        ["매수 검토 가능", ""],
+    ]
+    korean = re.search(r"function korean.*?(?=function blockerItems)", script, re.S).group(0)
+    blockers = re.search(r"function blockerItems.*?(?=function kst)", script, re.S).group(0)
+    detail = re.search(r"function renderDetail.*?(?=function visibleFocusable)", script, re.S).group(0)
+    rendered = subprocess.check_output(
+        [
+            "node",
+            "-e",
+            "const esc=v=>String(v??'').replace(/[&<>\\\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\\\"':'&quot;',\"'\":'&#39;'}[c]));const marketContext=()=>'';const scenarios=()=>'';const sourceFacts=()=>'';"
+            + invalidation
+            + korean
+            + blockers
+            + detail
+            + "console.log(renderDetail({invalidated_at:'2026-09-08',invalidation_reason:'<legacy>',card:{}}));",
+        ],
+        text=True,
+    )
+    assert "<h3>판단 종료 사유</h3><p>가설 폐기 사유: &lt;legacy&gt;</p>" in rendered
+    assert "가설 폐기 사유: <legacy>" not in rendered
+
+
 def test_legacy_scenario_renderer_adapts_provenance_fail_closed_with_escaping():
     """Historical v1 rows use the actionable adapter without inventing GOOD facts."""
     script = re.search(r"<script>(.*?)</script>", APP_HTML, re.S).group(1)
