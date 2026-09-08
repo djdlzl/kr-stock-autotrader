@@ -300,6 +300,26 @@ def current_filter_head(db, evidence_id, as_of, known_at):
         raise HTTPException(404, "current filter head not found")
     return filter_detail(db, head["id"])
 
+
+def _bind_observation_scenario_prices(card, raw_inputs):
+    """Reject observation prices not literally frozen in the saved market input."""
+    scenarios = card.get("observation_scenarios")
+    if scenarios is None:
+        return
+    market = raw_inputs.get("post_close_market") if isinstance(raw_inputs, dict) else None
+    source_keys = {
+        "market.pre_event_low": "pre_event_low",
+        "market.pre_event_close": "pre_event_close",
+        "market.event_window_high": "event_window_high",
+    }
+    for scenario in scenarios:
+        expected = market.get(source_keys[scenario["source_field"]]) if isinstance(market, dict) else None
+        if (isinstance(expected, bool) or not isinstance(expected, (int, float))
+                or not math.isfinite(expected) or expected <= 0
+                or float(scenario["level_krw"]) != float(expected)):
+            raise HTTPException(422, "observation scenario price source mismatch")
+
+
 def save_card(db,data):
     """One transaction owns card lineage, audit/status and conditional append."""
     try: card=validate_card(data["card"])
@@ -314,6 +334,7 @@ def save_card(db,data):
         if db.execute("SELECT 1 FROM deterministic_filter_results WHERE parent_filter_id=?", (fi["id"],)).fetchone(): raise HTTPException(409,"card requires current filter head")
         if card["filter_verdict"] != fi["verdict"]: raise HTTPException(422,"card source evidence/filter mismatch")
         if fi["verdict"] == "FAIL" and card["verdict"] == "매수 검토 가능": raise HTTPException(422,"FAIL filter cannot be buy-review")
+        _bind_observation_scenario_prices(card, fi["raw_inputs"])
         lineage=data.get("lineage_key",f"{ev['symbol']}:{ev['id']}"); version=db.execute("SELECT COALESCE(MAX(version),0)+1 n FROM decision_cards WHERE lineage_key=?",(lineage,)).fetchone()["n"]
         if version>1:
             for old in db.execute("SELECT id FROM decision_cards WHERE lineage_key=?", (lineage,)): invalidate_lineage(db, card_id=old["id"], reason="new_card")

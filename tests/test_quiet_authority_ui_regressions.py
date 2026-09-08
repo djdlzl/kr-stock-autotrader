@@ -425,7 +425,7 @@ console.log(JSON.stringify({{closes, compatibilityPointerDidNotDoubleClose, canc
 
 
 def test_compact_decision_sections_render_grounded_actions_prices_and_legacy_gaps():
-    """The default card/modal summary exposes only action, basis, and BAD/BASE/GOOD risk."""
+    """The default card/modal summary exposes price, meaning, and review action."""
     script = re.search(r"<script>(.*?)</script>", APP_HTML, re.S).group(1)
     invalidation = re.search(r"function invalidationState\(c\)\{.*?\}(?=\s*function statusFor)", script, re.S).group(0)
     compact = re.search(r"function compactAction\(c\)\{.*?\}(?=\s*function row)", script, re.S).group(0)
@@ -434,9 +434,9 @@ def test_compact_decision_sections_render_grounded_actions_prices_and_legacy_gap
             "verdict": "매수 검토 가능", "proof_point": "계약 이행 확인", "business_value": "반복 매출 확대",
             "stop_loss": 80, "price_cap": 100, "take_profit": [{"price": 110}],
             "observation_scenarios": [
-                {"label": "BAD", "level_krw": 95, "meaning": "이벤트 전 저점", "source_field": "market.pre_event_low"},
-                {"label": "BASE", "level_krw": 100, "meaning": "이벤트 전 종가", "source_field": "market.pre_event_close"},
-                {"label": "GOOD", "level_krw": 110, "meaning": "이벤트 구간 고점", "source_field": "market.event_window_high"},
+                {"label": "BAD", "level_krw": 95, "meaning": "이벤트 전 저점", "action": "95원 이하이면 보유 축소 여부를 검토", "checks": "저점 이탈 후 공시 무효화 여부 확인", "source_field": "market.pre_event_low"},
+                {"label": "BASE", "level_krw": 100, "meaning": "이벤트 전 종가", "action": "100원 부근에서는 신규 판단을 보류하고 근거를 검토", "checks": "종가와 거래량의 지속 여부 확인", "source_field": "market.pre_event_close"},
+                {"label": "GOOD", "level_krw": 110, "meaning": "이벤트 구간 고점", "action": "110원 이상이면 보유 근거와 분할 대응 필요성을 검토", "checks": "고점 갱신과 후속 공시 확인", "source_field": "market.event_window_high"},
             ],
             "evidence_invalidation": {"condition": "계약 취소", "risk_policy": "종목 손실 한도 0.15% · 명목 한도 3%", "policy_version": "v1"},
         },
@@ -445,14 +445,22 @@ def test_compact_decision_sections_render_grounded_actions_prices_and_legacy_gap
     node = (
         "const esc=v=>String(v??'').replace(/[&<>\\\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\\\"':'&quot;',\"'\":'&#39;'}[c]));"
         + invalidation + compact
-        + "console.log(JSON.stringify([compactSections(" + json.dumps(payload, ensure_ascii=False) + "),compactSections(" + json.dumps(legacy, ensure_ascii=False) + ")]));"
+        + "const scenarioLabel=label=>({GOOD:'상방 조건',BASE:'기준 조건',BAD:'하방 조건'})[label]||'확인 필요';"
+        + "console.log(JSON.stringify([compactSections(" + json.dumps(payload, ensure_ascii=False) + "),compactSections(" + json.dumps(legacy, ensure_ascii=False) + "),observationDetails(" + json.dumps(payload, ensure_ascii=False) + ")]));"
     )
-    populated, no_price = json.loads(subprocess.check_output(["node", "-e", node], text=True))
+    populated, no_price, detail = json.loads(subprocess.check_output(["node", "-e", node], text=True))
     assert "조건부 매수 검토" in populated
     assert "계약 이행 확인" in populated and "반복 매출 확대" not in populated
-    assert "하방 95원 · 기준 100원 · 상방 110원" in populated
+    assert "하방 95원 · 이벤트 전 저점 · 95원 이하이면 보유 축소 여부를 검토" in populated
+    assert "기준 100원 · 이벤트 전 종가 · 100원 부근에서는 신규 판단을 보류하고 근거를 검토" in populated
+    assert "상방 110원 · 이벤트 구간 고점 · 110원 이상이면 보유 근거와 분할 대응 필요성을 검토" in populated
+    assert "저점 이탈 후 공시 무효화 여부 확인" in detail
+    assert "종가와 거래량의 지속 여부 확인" in detail
+    assert "고점 갱신과 후속 공시 확인" in detail
     assert "80원" not in populated
     assert "위험 한도 종목 손실 한도 0.15% · 명목 한도 3%" in populated
     assert "지금 매수하지 않음 · 관찰" in no_price
     assert "확인된 사업 가치" in no_price
-    assert "하방 가격 미설정 · 기준 가격 미설정 · 상방 가격 미설정" in no_price
+    assert "하방 가격 미설정 · 의미 확인 필요 · 검토 지침 확인 필요" in no_price
+    assert "기준 가격 미설정 · 의미 확인 필요 · 검토 지침 확인 필요" in no_price
+    assert "상방 가격 미설정 · 의미 확인 필요 · 검토 지침 확인 필요" in no_price

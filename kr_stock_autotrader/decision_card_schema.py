@@ -86,11 +86,13 @@ class SourceEvidence(BaseModel):
 
 
 class ObservationScenario(BaseModel):
-    """Read-only price reference; never an entry, exit, or order instruction."""
+    """Read-only observation guidance; never an entry, exit, or order instruction."""
     model_config = ConfigDict(extra='forbid')
     label: Literal['BAD', 'BASE', 'GOOD']
     level_krw: float = Field(gt=0)
     meaning: str = Field(min_length=1)
+    action: str = Field(min_length=1)
+    checks: str = Field(min_length=1)
     source_field: Literal['market.pre_event_low', 'market.pre_event_close', 'market.event_window_high']
 
     @field_validator('level_krw', mode='before')
@@ -107,12 +109,15 @@ class ObservationScenario(BaseModel):
             raise ValueError('must be finite')
         return value
 
-    @field_validator('meaning')
+    @field_validator('meaning', 'action', 'checks')
     @classmethod
-    def nonblank_meaning(cls, value: str) -> str:
+    def nonblank_korean_guidance(cls, value: str) -> str:
         if not value.strip():
             raise ValueError('must be nonempty')
-        return value.strip()
+        normalized = value.strip()
+        if not any('\uac00' <= char <= '\ud7a3' for char in normalized):
+            raise ValueError('must contain Korean text')
+        return normalized
 
 
 class DecisionCard(BaseModel):
