@@ -1,4 +1,5 @@
 """FastAPI boundary for Giraffe's paper-only trading planner."""
+import json
 import math
 import sqlite3
 import re
@@ -15,7 +16,7 @@ from pydantic import BaseModel, Field, StrictInt, ValidationError, field_validat
 from .auth import csrf_origin_ok, current_user, hash_password, issue_session, verify_password
 from .config import COOKIE_SECURE, LIVE_TRADING, SIGNUP_ENABLED
 from .db import connect
-from .domain import Quote, is_krx_business_date, parse_kst, now_kst
+from .domain import Quote, is_krx_business_date, market_open, parse_kst, now_kst
 from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, current_filter_head, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML, PROTOTYPE_HTML
@@ -516,6 +517,80 @@ def _card_tracking_scenario(db, card_id: int):
     if not scenario or not card or card["invalidated_at"] or scenario["symbol"] != card["symbol"]:
         raise HTTPException(409, {"code": "TRACKING_STOPPED", "message": "추적할 현재 시나리오가 없습니다"})
     return scenario
+
+
+_OBSERVATION_LEVEL_FIELDS = {
+    "BAD": "market.pre_event_low",
+    "BASE": "market.pre_event_close",
+    "GOOD": "market.event_window_high",
+}
+
+
+def _immutable_observation_levels(card_json: object) -> list[tuple[str, float]] | None:
+    """Read the card's frozen BAD/BASE/GOOD levels without repairing old data."""
+    if not isinstance(card_json, str):
+        return None
+    try:
+        card = json.loads(card_json)
+    except (TypeError, ValueError):
+        return None
+    scenarios = card.get("observation_scenarios") if isinstance(card, dict) else None
+    if not isinstance(scenarios, list) or len(scenarios) != len(_OBSERVATION_LEVEL_FIELDS):
+        return None
+    levels: dict[str, float] = {}
+    for scenario in scenarios:
+        if not isinstance(scenario, dict):
+            return None
+        label = scenario.get("label")
+        level = scenario.get("level_krw")
+        if (label not in _OBSERVATION_LEVEL_FIELDS or scenario.get("source_field") != _OBSERVATION_LEVEL_FIELDS[label]
+                or label in levels or isinstance(level, bool) or not isinstance(level, (int, float))
+                or not math.isfinite(level) or level <= 0):
+            return None
+        levels[label] = float(level)
+    return [(label, levels[label]) for label in ("BAD", "BASE", "GOOD")] if set(levels) == set(_OBSERVATION_LEVEL_FIELDS) else None
+
+
+def _current_quote_unavailable(symbol: str, *, market_state: str) -> dict:
+    return {"status": "unavailable", "symbol": symbol, "market_state": market_state, "freshness": "UNAVAILABLE",
+            "last_price_krw": None, "best_bid_krw": None, "best_ask_krw": None, "retrieved_at": None,
+            "source": "KIS", "comparisons": []}
+
+
+@app.get("/api/cards/{card_id}/current-quote")
+def card_current_quote(card_id: int, request: Request):
+    """Read-only, card-scoped KIS orderbook projection and frozen level deltas."""
+    current_user(request)
+    db = connect()
+    try:
+        row = db.execute("""SELECT e.symbol,c.card_json,c.invalidated_at
+                            FROM decision_cards c JOIN material_evidence e ON e.id=c.evidence_id
+                            WHERE c.id=?""", (card_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "카드를 찾을 수 없습니다")
+        observed_now = now_kst()
+        market_state = "OPEN" if market_open(observed_now) else "CLOSED"
+        symbol = row["symbol"]
+        levels = None if row["invalidated_at"] else _immutable_observation_levels(row["card_json"])
+        if not isinstance(symbol, str) or re.fullmatch(r"\d{6}", symbol) is None or levels is None:
+            return _current_quote_unavailable(symbol if isinstance(symbol, str) else "", market_state=market_state)
+        try:
+            quote = _safe_kis_orderbook(symbol, _kis_orderbook_provider()(symbol))
+        except Exception:
+            quote = _safe_kis_orderbook(symbol, None)
+        if quote.get("status") != "ok":
+            return _current_quote_unavailable(symbol, market_state=market_state)
+        last = quote["last_price"]
+        comparisons = []
+        for label, level in levels:
+            difference = last - level
+            comparison = "EQUAL" if math.isclose(last, level, rel_tol=1e-12, abs_tol=1e-9) else ("ABOVE" if difference > 0 else "BELOW")
+            comparisons.append({"label": label, "level_krw": level, "difference_krw": difference, "difference_pct": difference / level * 100, "comparison": comparison})
+        return {"status": "ok", "symbol": symbol, "market_state": market_state, "freshness": "FRESH",
+                "last_price_krw": last, "best_bid_krw": quote["best_bid"], "best_ask_krw": quote["best_ask"],
+                "retrieved_at": quote["retrieved_at"], "source": "KIS", "comparisons": comparisons}
+    finally:
+        db.close()
 
 
 @app.get("/api/cards/{card_id}/tracking-health")

@@ -451,9 +451,8 @@ def test_compact_decision_sections_render_grounded_actions_prices_and_legacy_gap
     populated, no_price, detail = json.loads(subprocess.check_output(["node", "-e", node], text=True))
     assert "조건부 매수 검토" in populated
     assert "계약 이행 확인" in populated and "반복 매출 확대" not in populated
-    assert "하방 95원 · 이벤트 전 저점 · 95원 이하이면 보유 축소 여부를 검토" in populated
-    assert "기준 100원 · 이벤트 전 종가 · 100원 부근에서는 신규 판단을 보류하고 근거를 검토" in populated
-    assert "상방 110원 · 이벤트 구간 고점 · 110원 이상이면 보유 근거와 분할 대응 필요성을 검토" in populated
+    assert all(text in populated for text in ("하방 · 95원", "기준 · 100원", "상방 · 110원", "이벤트 전 저점", "이벤트 전 종가", "이벤트 구간 고점", "95원 이하이면 보유 축소 여부를 검토"))
+    assert 'scenario-level-bad' in populated and 'scenario-level-base' in populated and 'scenario-level-good' in populated
     assert "저점 이탈 후 공시 무효화 여부 확인" in detail
     assert "종가와 거래량의 지속 여부 확인" in detail
     assert "고점 갱신과 후속 공시 확인" in detail
@@ -461,6 +460,4 @@ def test_compact_decision_sections_render_grounded_actions_prices_and_legacy_gap
     assert "위험 한도 종목 손실 한도 0.15% · 명목 한도 3%" in populated
     assert "지금 매수하지 않음 · 관찰" in no_price
     assert "확인된 사업 가치" in no_price
-    assert "하방 가격 미설정 · 의미 확인 필요 · 검토 지침 확인 필요" in no_price
-    assert "기준 가격 미설정 · 의미 확인 필요 · 검토 지침 확인 필요" in no_price
-    assert "상방 가격 미설정 · 의미 확인 필요 · 검토 지침 확인 필요" in no_price
+    assert "관찰 가격 기준이 아직 설정되지 않았습니다." in no_price
