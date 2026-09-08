@@ -69,9 +69,15 @@ def test_current_quote_fails_closed_for_missing_levels_and_stale_quote(monkeypat
     assert missing["status"] == "unavailable" and missing["comparisons"] == []
 
 
-def test_dashboard_has_stacked_safe_scenario_blocks_and_bounded_quote_polling():
+def test_dashboard_has_honest_historical_observation_labels_and_bounded_quote_polling():
     html = open("kr_stock_autotrader/decision_card_app.html", encoding="utf-8").read()
-    for marker in ("scenario-level-bad", "scenario-level-base", "scenario-level-good", "<strong>", "current-quote", "current-quote", "CURRENT_QUOTE_POLL_MS", "setTimeout", "clearTimeout", "AbortController", "current-quote"):
+    for marker in ("scenario-level-bad", "scenario-level-base", "scenario-level-good", "<strong>", "current-quote", "CURRENT_QUOTE_POLL_MS", "setTimeout", "clearTimeout", "AbortController"):
         assert marker in html
+    for label in ("재료 전 저점", "재료 전 종가", "이벤트 구간 고점"):
+        assert label in html
+    assert html.count("과거 관찰 기준 · 주문 가격이 아님") == 1
+    assert "현재가 비교 기준" in html
+    assert "현재가가 이 과거 기준보다" in html
+    assert "하방·기준·상방" not in html
     assert "current-quote" in html and "마지막 조회" in html and "현재가 확인 불가" in html
     assert "scenario-observations" not in html.split("function beginQuoteTracking", 1)[-1]

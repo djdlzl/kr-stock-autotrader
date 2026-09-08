@@ -36,7 +36,7 @@ def test_release0_primary_surface_is_change_first_and_record_only():
         "오늘 바뀐 근거와 아직 결론을 낼 수 없는 항목을 먼저 확인합니다.",
         "지금 판단",
         "핵심 근거",
-        "위험 관리",
+        "현재가 비교 기준",
         "상세 정보",
         "판단을 막는 누락·충돌",
         "조건별 시나리오",
