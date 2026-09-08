@@ -13,7 +13,7 @@ import os
 from datetime import datetime, time, timedelta
 from typing import Callable
 from .domain import KRX_REGULAR_OPEN, KST, is_krx_business_date, now_kst, parse_kst, previous_krx_business_dates
-from .kis_readonly import DailySnapshot
+from .kis_readonly import DailySnapshot, KISOAuthCacheError
 
 BENCHMARK_SYMBOL = "229200"
 # KIS's official daily-chart sample has hts_avls=815363 for SK hynix alongside
@@ -182,6 +182,10 @@ def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Calla
                 "observability": observability,
                 "horizons": {"stock_return_pct": "20 completed aligned sessions", "benchmark_return_pct": "20 completed aligned sessions", "recent_rise_pct": "20 completed aligned sessions", "pre_announcement_return_pct": "20 completed aligned sessions ending at announcement boundary", "short_term_stock_return_pct": f"{short_sessions} completed aligned sessions", "short_term_benchmark_return_pct": f"{short_sessions} completed aligned sessions", "short_term_excess_return_pct": f"{short_sessions} completed aligned sessions; stock minus benchmark"},
                 "units": {"returns": "percent", "short_term_window": f"KST ISO date range; {short_sessions} completed aligned sessions", "trading_value_krw": "KRW", "market_cap_krw": "KRW (hts_avls x 100,000,000)"}}
+    except KISOAuthCacheError:
+        # A cache failure is not missing/invalid daily bars.  Its public shape
+        # remains secret-free and unavailable.
+        return _unavailable(symbol, "kis_oauth_cache_unavailable", retrieved)
     except Exception:
         # Provider/OAuth/HTTP/malformed responses are all intentionally collapsed.
         return _unavailable(symbol, "daily_bars_unavailable_or_invalid", retrieved)

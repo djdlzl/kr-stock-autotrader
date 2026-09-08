@@ -92,6 +92,19 @@ def test_snapshot_boundary_sanitizes_provider_failures(monkeypatch, provider):
     assert "secret" not in str(result)
 
 
+def test_snapshot_classifies_oauth_cache_failure_without_secret_leak():
+    from kr_stock_autotrader.kis_readonly import KISOAuthCacheError
+    from kr_stock_autotrader.market_data import build_premarket_snapshot
+
+    result = build_premarket_snapshot(
+        "005930", datetime(2026, 9, 2, 8, tzinfo=KST),
+        lambda *_: (_ for _ in ()).throw(KISOAuthCacheError("KIS OAuth cache unavailable")),
+    )
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "kis_oauth_cache_unavailable"
+    assert "token" not in str(result).lower()
+
+
 def test_same_day_bar_is_a_fail_closed_provider_error():
     from kr_stock_autotrader.market_data import build_premarket_snapshot
     as_of = datetime(2026, 9, 2, 8, tzinfo=KST)

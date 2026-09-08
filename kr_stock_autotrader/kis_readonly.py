@@ -3,10 +3,13 @@ from __future__ import annotations
 import os
 import re
 import math
+import hashlib
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
 import httpx
+from . import db as dbmod
 from .domain import KST, now_kst, previous_krx_business_date
 from .intraday_market_context import INTRADAY_MINUTE_PATH as _INTRADAY_MINUTE_PATH, INTRADAY_MINUTE_TR_ID as _INTRADAY_MINUTE_TR_ID, IntradayMinuteSnapshot, project_intraday_minute_snapshot
 
@@ -27,6 +30,10 @@ INTRADAY_MINUTE_PATH = _INTRADAY_MINUTE_PATH
 INTRADAY_MINUTE_TR_ID = _INTRADAY_MINUTE_TR_ID
 TOKEN_REFRESH_SKEW = timedelta(seconds=30)
 MAX_TOKEN_LIFETIME = timedelta(hours=24)
+
+
+class KISOAuthCacheError(RuntimeError):
+    """Internal fail-closed signal for unavailable or malformed token storage."""
 
 
 @dataclass(frozen=True, repr=False)
@@ -111,25 +118,99 @@ class KISReadOnlyClient:
         self._token = None
         self._token_expiry = None
 
+    def _invalidate_cached_token(self, rejected_token: str) -> None:
+        """Remove a broker-rejected token so the retry cannot read it back."""
+        cache = None
+        try:
+            cache = dbmod.connect()
+            cache.execute("BEGIN IMMEDIATE")
+            cache.execute(
+                "DELETE FROM kis_oauth_token_cache WHERE cache_key=? AND access_token=?",
+                (self._token_cache_key(), rejected_token),
+            )
+            cache.commit()
+        except sqlite3.Error as exc:
+            if cache is not None:
+                cache.rollback()
+            raise KISOAuthCacheError("KIS OAuth cache unavailable") from exc
+        finally:
+            if cache is not None:
+                cache.close()
+
+    def _token_cache_key(self) -> str:
+        """Scope durable tokens without persisting an application credential."""
+        return hashlib.sha256(self._app_key.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _cached_expiry(value: object) -> datetime:
+        if not isinstance(value, str):
+            raise KISOAuthCacheError("KIS OAuth cache unavailable")
+        try:
+            expiry = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise KISOAuthCacheError("KIS OAuth cache unavailable") from exc
+        if expiry.tzinfo is None:
+            raise KISOAuthCacheError("KIS OAuth cache unavailable")
+        return expiry.astimezone(KST)
+
     def _token_value(self) -> str:
         now = now_kst()
         if self._token and self._token_expiry and now + TOKEN_REFRESH_SKEW < self._token_expiry:
             return self._token
         self._clear_token()
-        if not self._app_key or not self._app_secret:
-            raise RuntimeError("KIS app credentials missing")
-        response = self._request("POST", OAUTH_PATH, json={"grant_type":"client_credentials", "appkey":self._app_key, "appsecret":self._app_secret}, headers={"content-type":"application/json"})
-        if not _response_ok(response):
-            raise RuntimeError("KIS OAuth HTTP failure")
+        cache = None
         try:
-            payload = response.json(); token = payload["access_token"]
-            expiry = _expiry_from(payload, now)
-        except (ValueError, KeyError, TypeError):
-            raise RuntimeError("KIS OAuth response malformed")
-        if not isinstance(token, str) or not token:
-            raise RuntimeError("KIS OAuth response malformed")
-        self._token, self._token_expiry = token, expiry
-        return token
+            cache = dbmod.connect()
+            # This spans the refresh so another process waits, then observes
+            # the committed row instead of independently issuing a token.
+            cache.execute("BEGIN IMMEDIATE")
+            row = cache.execute(
+                "SELECT access_token, expires_at FROM kis_oauth_token_cache WHERE cache_key=?",
+                (self._token_cache_key(),),
+            ).fetchone()
+            if row is not None:
+                token, expiry = row["access_token"], self._cached_expiry(row["expires_at"])
+                if isinstance(token, str) and token and now + TOKEN_REFRESH_SKEW < expiry:
+                    cache.commit()
+                    self._token, self._token_expiry = token, expiry
+                    return token
+                if not isinstance(token, str) or not token:
+                    raise KISOAuthCacheError("KIS OAuth cache unavailable")
+            if not self._app_key or not self._app_secret:
+                raise RuntimeError("KIS app credentials missing")
+            response = self._request("POST", OAUTH_PATH, json={"grant_type":"client_credentials", "appkey":self._app_key, "appsecret":self._app_secret}, headers={"content-type":"application/json"})
+            if not _response_ok(response):
+                raise RuntimeError("KIS OAuth HTTP failure")
+            try:
+                payload = response.json(); token = payload["access_token"]
+                expiry = _expiry_from(payload, now)
+            except (ValueError, KeyError, TypeError):
+                raise RuntimeError("KIS OAuth response malformed")
+            if not isinstance(token, str) or not token:
+                raise RuntimeError("KIS OAuth response malformed")
+            cache.execute(
+                """INSERT INTO kis_oauth_token_cache(cache_key,access_token,expires_at) VALUES(?,?,?)
+                   ON CONFLICT(cache_key) DO UPDATE SET access_token=excluded.access_token, expires_at=excluded.expires_at""",
+                (self._token_cache_key(), token, expiry.isoformat()),
+            )
+            cache.commit()
+            self._token, self._token_expiry = token, expiry
+            return token
+        except KISOAuthCacheError:
+            if cache is not None:
+                cache.rollback()
+            raise
+        except sqlite3.Error as exc:
+            if cache is not None:
+                cache.rollback()
+            raise KISOAuthCacheError("KIS OAuth cache unavailable") from exc
+        except Exception:
+            if cache is not None:
+                cache.rollback()
+            raise
+        finally:
+            if cache is not None:
+                cache.close()
 
     @staticmethod
     def _auth_expired(response, payload: dict | None) -> bool:
@@ -163,10 +244,12 @@ class KISReadOnlyClient:
         retrieved = now_kst()
         try:
             for attempt in range(2):
-                quote, retrieved, auth_expired = self._quote_once(symbol, self._token_value())
+                token = self._token_value()
+                quote, retrieved, auth_expired = self._quote_once(symbol, token)
                 if not auth_expired:
                     return {"symbol":symbol, **quote, "quote_known_at":retrieved.isoformat(), "retrieved_at":retrieved.isoformat(), "timestamp_source":"network_retrieved_at", "source":"KIS", "environment":"production", "status":"ok"}
                 self._clear_token()
+                self._invalidate_cached_token(token)
                 if attempt == 1:
                     raise ValueError("KIS quote authentication failed")
         except (RuntimeError, ValueError, TypeError, KeyError, httpx.HTTPError):
@@ -197,10 +280,12 @@ class KISReadOnlyClient:
         retrieved = now_kst()
         try:
             for attempt in range(2):
-                book, retrieved, expired = self._orderbook_once(symbol, self._token_value())
+                token = self._token_value()
+                book, retrieved, expired = self._orderbook_once(symbol, token)
                 if not expired:
                     return {"symbol":symbol, **book, "quote_known_at":retrieved.isoformat(), "retrieved_at":retrieved.isoformat(), "timestamp_source":"network_retrieved_at", "source":"KIS", "environment":"production", "status":"ok"}
                 self._clear_token()
+                self._invalidate_cached_token(token)
                 if attempt == 1: raise ValueError("KIS orderbook authentication failed")
         except (RuntimeError, ValueError, TypeError, KeyError, httpx.HTTPError): pass
         return {"symbol":symbol, "source":"KIS", "environment":"production", "status":"unavailable", "retrieved_at":retrieved.isoformat(), "timestamp_source":"network_retrieved_at"}
@@ -271,9 +356,11 @@ class KISReadOnlyClient:
             raise ValueError("intraday snapshot unavailable")
         try:
             for attempt in range(2):
-                payload, retrieved, auth_expired = self._intraday_once(symbol, requested_as_of.astimezone(KST), self._token_value())
+                token = self._token_value()
+                payload, retrieved, auth_expired = self._intraday_once(symbol, requested_as_of.astimezone(KST), token)
                 if auth_expired:
                     self._clear_token()
+                    self._invalidate_cached_token(token)
                     if attempt == 1:
                         raise ValueError("intraday snapshot unavailable")
                     continue
