@@ -122,6 +122,52 @@ def test_daily_snapshot_uses_official_output1_summary_and_output2_bars():
     assert 'output1' not in repr(snapshot) and 'output2' not in repr(snapshot)
 
 
+@pytest.mark.parametrize("rejection_payload, rejection_status", [
+    ({}, 401),
+    ({"msg_cd": "EGW00121"}, 200),
+    ({"msg_cd": "EGW00123"}, 200),
+])
+def test_daily_snapshot_replaces_broker_rejected_durable_token_once(monkeypatch, tmp_path, rejection_payload, rejection_status):
+    """A daily-chart auth rejection must evict only its rejected durable row."""
+    from kr_stock_autotrader import db as dbmod
+    import kr_stock_autotrader.kis_readonly as kis
+
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "daily-token-cache.db"))
+    monkeypatch.setattr(kis, "now_kst", lambda: NOW)
+    rejected = "durable-rejected-token"
+    refreshed = "newly-issued-token"
+    cache = dbmod.connect()
+    try:
+        cache.execute(
+            "INSERT INTO kis_oauth_token_cache(cache_key, access_token, expires_at) VALUES(?, ?, ?)",
+            (KISReadOnlyClient("key", "value")._token_cache_key(), rejected, (NOW + timedelta(hours=1)).isoformat()),
+        )
+        cache.commit()
+    finally:
+        cache.close()
+
+    rows = [{"stck_bsop_date": "20260901", "stck_clpr": "70000"}]
+    transport = FakeTransport([
+        Response(rejection_payload, rejection_status),
+        Response({"access_token": refreshed, "expires_in": 3600}),
+        Response({"rt_cd": "0", "output1": {"hts_avls": "6503"}, "output2": rows}),
+    ])
+    snapshot = KISReadOnlyClient("key", "value", transport=transport).daily_snapshot(
+        "005930", datetime(2026, 9, 2, 8, tzinfo=KST)
+    )
+
+    assert snapshot.summary_market_cap_100m == 6503.0
+    assert [call[0] for call in transport.calls] == ["GET", "POST", "GET"]
+    assert all(rejected not in value for value in (repr(snapshot), str(snapshot.bars)))
+    cache = dbmod.connect()
+    try:
+        durable_tokens = [row["access_token"] for row in cache.execute("SELECT access_token FROM kis_oauth_token_cache")]
+    finally:
+        cache.close()
+    assert rejected not in durable_tokens
+    assert durable_tokens == [refreshed]
+
+
 @pytest.mark.parametrize(("as_of", "expected_end"), [
     (datetime(2026, 9, 7, 8, tzinfo=KST), "20260904"),  # Monday
     (datetime(2026, 9, 6, 8, tzinfo=KST), "20260904"),  # Sunday

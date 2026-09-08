@@ -310,19 +310,28 @@ class KISReadOnlyClient:
         # At least 45 calendar days are needed for the declared 20-session
         # denominator after holidays/mismatched trading calendars; use 60.
         start = (as_of.astimezone(KST) - timedelta(days=60)).strftime("%Y%m%d")
-        response = self._request("GET", DAILY_CHART_PATH, params={"FID_COND_MRKT_DIV_CODE":"J", "FID_INPUT_ISCD":symbol, "FID_INPUT_DATE_1":start, "FID_INPUT_DATE_2":end, "FID_PERIOD_DIV_CODE":"D", "FID_ORG_ADJ_PRC":"0"}, headers={"authorization":f"Bearer {self._token_value()}", "appkey":self._app_key, "appsecret":self._app_secret, "tr_id":DAILY_CHART_TR_ID})
         try:
-            payload = response.json()
-            output1, output2 = payload.get("output1"), payload.get("output2")
-            if not _response_ok(response) or payload.get("rt_cd") != "0" or not isinstance(output1, dict) or not isinstance(output2, list):
-                raise ValueError("KIS daily snapshot unavailable")
-            # KIS documents hts_avls in output1, not in daily output2 bars.
-            cap = _positive_number(output1.get("hts_avls"))
-            if not all(isinstance(row, dict) for row in output2):
-                raise ValueError("KIS daily snapshot unavailable")
-            return DailySnapshot(summary_market_cap_100m=cap, bars=tuple(output2), retrieved_at=now_kst())
+            for attempt in range(2):
+                token = self._token_value()
+                response = self._request("GET", DAILY_CHART_PATH, params={"FID_COND_MRKT_DIV_CODE":"J", "FID_INPUT_ISCD":symbol, "FID_INPUT_DATE_1":start, "FID_INPUT_DATE_2":end, "FID_PERIOD_DIV_CODE":"D", "FID_ORG_ADJ_PRC":"0"}, headers={"authorization":f"Bearer {token}", "appkey":self._app_key, "appsecret":self._app_secret, "tr_id":DAILY_CHART_TR_ID})
+                payload = response.json()
+                if self._auth_expired(response, payload):
+                    self._clear_token()
+                    self._invalidate_cached_token(token)
+                    if attempt == 1:
+                        raise ValueError("KIS daily snapshot unavailable")
+                    continue
+                output1, output2 = payload.get("output1"), payload.get("output2")
+                if not _response_ok(response) or payload.get("rt_cd") != "0" or not isinstance(output1, dict) or not isinstance(output2, list):
+                    raise ValueError("KIS daily snapshot unavailable")
+                # KIS documents hts_avls in output1, not in daily output2 bars.
+                cap = _positive_number(output1.get("hts_avls"))
+                if not all(isinstance(row, dict) for row in output2):
+                    raise ValueError("KIS daily snapshot unavailable")
+                return DailySnapshot(summary_market_cap_100m=cap, bars=tuple(output2), retrieved_at=now_kst())
         except (TypeError, ValueError, KeyError):
             raise ValueError("KIS daily snapshot unavailable")
+        raise ValueError("KIS daily snapshot unavailable")
 
     def _intraday_once(self, symbol: str, requested_as_of: datetime, token: str) -> tuple[object, datetime, bool]:
         response = self._request(
