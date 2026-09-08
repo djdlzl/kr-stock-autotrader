@@ -85,6 +85,41 @@ class SourceEvidence(BaseModel):
         return _url(value)
 
 
+class ObservationScenario(BaseModel):
+    """Read-only observation guidance; never an entry, exit, or order instruction."""
+    model_config = ConfigDict(extra='forbid')
+    label: Literal['BAD', 'BASE', 'GOOD']
+    level_krw: float = Field(gt=0)
+    meaning: str = Field(min_length=1)
+    action: str = Field(min_length=1)
+    checks: str = Field(min_length=1)
+    source_field: Literal['market.pre_event_low', 'market.pre_event_close', 'market.event_window_high']
+
+    @field_validator('level_krw', mode='before')
+    @classmethod
+    def numeric_level(cls, value: object) -> object:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError('must be a numeric scalar')
+        return value
+
+    @field_validator('level_krw')
+    @classmethod
+    def finite_level(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError('must be finite')
+        return value
+
+    @field_validator('meaning', 'action', 'checks')
+    @classmethod
+    def nonblank_korean_guidance(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError('must be nonempty')
+        normalized = value.strip()
+        if not any('\uac00' <= char <= '\ud7a3' for char in normalized):
+            raise ValueError('must contain Korean text')
+        return normalized
+
+
 class DecisionCard(BaseModel):
     model_config = ConfigDict(extra='forbid')
     schema_version: Literal[1]
@@ -107,6 +142,7 @@ class DecisionCard(BaseModel):
     stop_loss: float | None = Field(default=None, gt=0)
     take_profit: list[TakeProfit] | None = None
     evidence_invalidation: dict | str | None = None
+    observation_scenarios: list[ObservationScenario] | None = None
     holding_until: str | None = None
     review_at: str | None = None
     false_positive: str = Field(min_length=1)
@@ -159,6 +195,22 @@ class DecisionCard(BaseModel):
     @classmethod
     def dates(cls, value: str | None) -> str | None:
         return _kst(value) if value not in (None, '') else value
+
+    @field_validator('observation_scenarios')
+    @classmethod
+    def complete_observation_scenarios(cls, value: list[ObservationScenario] | None) -> list[ObservationScenario] | None:
+        if value is None:
+            return value
+        expected_source_fields = {
+            'BAD': 'market.pre_event_low',
+            'BASE': 'market.pre_event_close',
+            'GOOD': 'market.event_window_high',
+        }
+        if len(value) != 3 or {item.label for item in value} != set(expected_source_fields):
+            raise ValueError('requires exactly BAD, BASE, and GOOD observation scenarios')
+        if any(item.source_field != expected_source_fields[item.label] for item in value):
+            raise ValueError('requires exact provenance for each observation scenario label')
+        return value
 
     @model_validator(mode='after')
     def buy_review_requires_concrete_order_plan(self):

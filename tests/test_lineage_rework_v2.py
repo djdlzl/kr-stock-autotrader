@@ -71,6 +71,28 @@ def test_operation_summary_is_immutable_processing_history(client):
     assert api.get("/api/cards?operation_date=2026-09-05").json()[0]["id"] == successor_card["id"]
 
 
+def test_operation_date_current_only_projects_active_heads_and_matching_counts(client):
+    api, _, monkeypatch = client
+    import kr_stock_autotrader.decision_cards as cards
+
+    monkeypatch.setattr(cards, "now", lambda: D1)
+    item = post_evidence(api, "today-successor")
+    root = post_filter(api, item["id"], raw(market_data_known_at=D1), D1).json()
+    old = api.post("/api/internal/cards/results", headers=INTERNAL, json=nonbuy(item["id"], root["id"])).json()
+    successor = post_filter(api, item["id"], raw(economic_terms="corrected", market_data_known_at=D1), D1, root["id"]).json()
+    current = api.post("/api/internal/cards/results", headers=INTERNAL, json=nonbuy(item["id"], successor["id"])).json()
+    assert api.post("/api/signup", json={"email": "today-current@example.test", "password": "long-password"}).status_code == 200
+
+    history = api.get("/api/cards?operation_date=2026-09-04")
+    current_only = api.get("/api/cards?operation_date=2026-09-04&current_only=true")
+    assert [row["id"] for row in history.json()] == [current["id"], old["id"]]
+    assert [row["id"] for row in current_only.json()] == [current["id"]]
+    history_summary = api.get("/api/cards/summary?operation_date=2026-09-04").json()
+    current_summary = api.get("/api/cards/summary?operation_date=2026-09-04&current_only=true").json()
+    assert (history_summary["카드 생성"], history_summary["필터 PASS"]) == (2, 2)
+    assert (current_summary["카드 생성"], current_summary["필터 PASS"], current_summary["필터 FAIL"]) == (1, 1, 0)
+
+
 def test_filter_trigger_abort_is_not_conflict_and_rolls_back_audit(client):
     api, path, _ = client
     item = post_evidence(api, "trigger-abort")

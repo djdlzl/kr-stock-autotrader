@@ -34,12 +34,13 @@ def test_release0_primary_surface_is_change_first_and_record_only():
     for expected in (
         "투자 판단 오피스",
         "오늘 바뀐 근거와 아직 결론을 낼 수 없는 항목을 먼저 확인합니다.",
-        "무엇이 달라졌나",
-        "현재 판단",
-        "지금 할 일과 다음 확인 항목",
+        "지금 판단",
+        "핵심 근거",
+        "위험 관리",
+        "상세 정보",
         "판단을 막는 누락·충돌",
         "조건별 시나리오",
-        "Provenance · 원문과 변경 이력",
+        "출처와 변경 이력",
         "현재 단계: 기록 전용",
         "주문 기능 없음",
         "role=\"dialog\"",
@@ -47,7 +48,8 @@ def test_release0_primary_surface_is_change_first_and_record_only():
         "inert",
         "visibleFocusable",
         "operation_date=${day}",
-        "api('cards/summary'+q,{sessionNotice:false}),api('cards'+q,{sessionNotice:false}),api('cards/missing'+q,{sessionNotice:false})",
+        "q=`?operation_date=${day}&current_only=true`",
+        "api('cards/summary'+q,{sessionNotice:false}),api('cards'+q,{sessionNotice:false}),api('cards/missing'+missingQ,{sessionNotice:false})",
         "min-height:44px",
         ":focus-visible",
         "prefers-reduced-motion",
@@ -368,7 +370,7 @@ def test_release0_persisted_blockers_keep_string_items_whole_and_fail_closed(mon
     market_context = re.search(r"function marketContext.*?(?=function renderDetail)", script, re.S).group(0)
     renderer = re.search(r"function renderDetail.*?(?=function visibleFocusable)", script, re.S).group(0)
     node = (
-        "const esc=v=>String(v??'');const scenarios=()=>'';const sourceFacts=()=>'';"
+        "const esc=v=>String(v??'');const compactSections=()=>'';const scenarios=()=>'';const sourceFacts=()=>'';"
         + invalidation + korean + normalizer + market_context + renderer
         + "\nconsole.log(JSON.stringify([renderDetail(" + json.dumps(detail.json()) + "),"
         + "renderDetail({card:{unknowns:['첫 항목','둘째 항목',null,7,{}]},filter:{reasons:['셋째 항목',false,{}]}})]));"

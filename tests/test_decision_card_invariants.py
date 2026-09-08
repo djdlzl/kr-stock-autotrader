@@ -1,3 +1,4 @@
+import copy
 import tempfile
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -46,6 +47,91 @@ def card(eid, fid, **card_override):
     payload = {"schema_version":1, "symbol":"005930", "headline":"h", "conclusion":"c", "change":"c", "source_evidence":[{"id":eid,"source":"dart","url":"https://dart.fss.or.kr"}], "source_urls":["https://dart.fss.or.kr"], "business_value":"x", "certainty":"high", "priced_in":"low", "filter_verdict":"PASS", "price_cap":100, "window":{"start":"2026-08-31T09:00:00+09:00", "end":"2026-08-31T15:00:00+09:00"}, "max_amount":250, "max_qty":3, "stop_loss":80, "take_profit":[{"price":110,"qty":1}], "evidence_invalidation":{"rule":"disclosure_retracted"}, "holding_until":"2026-09-01T10:00:00+09:00", "review_at":"2026-09-01T09:00:00+09:00", "valid_until":"2026-09-01T10:00:00+09:00", "expires":"2026-09-01T10:00:00+09:00", "order_type":"limit", "false_positive":"x", "unknowns":"x", "proof_point":"계약 이행 확인", "next_check":"다음 공시 확인", "verdict":"매수 검토 가능", "confidence":0.5}
     payload.update(card_override)
     return {"evidence_id":eid, "filter_id":fid, "model":"m", "provider":"p", "card":payload}
+
+
+def test_observation_scenarios_are_strict_non_executable_references():
+    from kr_stock_autotrader.decision_card_schema import validate_card
+
+    payload = card(1, 1)["card"]
+    payload["observation_scenarios"] = [
+        {"label": "BAD", "level_krw": 95, "meaning": "이벤트 전 저점 관찰", "action": "95원 이하이면 보유 축소 여부를 검토", "checks": "저점 이탈 후 공시 무효화 여부 확인", "source_field": "market.pre_event_low"},
+        {"label": "BASE", "level_krw": 100, "meaning": "이벤트 전 종가 관찰", "action": "100원 부근에서는 신규 판단을 보류하고 근거를 검토", "checks": "종가와 거래량의 지속 여부 확인", "source_field": "market.pre_event_close"},
+        {"label": "GOOD", "level_krw": 110, "meaning": "이벤트 구간 고점 관찰", "action": "110원 이상이면 보유 근거와 분할 대응 필요성을 검토", "checks": "고점 갱신과 후속 공시 확인", "source_field": "market.event_window_high"},
+    ]
+    saved = validate_card(payload)
+    assert saved["observation_scenarios"] == payload["observation_scenarios"]
+    assert saved["observation_scenarios"][0]["level_krw"] != saved["stop_loss"]
+    for bad in (
+        payload["observation_scenarios"][:2],
+        [{**item, "source_field": "card.stop_loss"} for item in payload["observation_scenarios"]],
+        [{**item, "level_krw": True} for item in payload["observation_scenarios"]],
+        [{key: value for key, value in item.items() if key != "action"} for item in payload["observation_scenarios"]],
+        [{key: value for key, value in item.items() if key != "checks"} for item in payload["observation_scenarios"]],
+        [{**item, "action": "   "} for item in payload["observation_scenarios"]],
+        [{**item, "checks": "   "} for item in payload["observation_scenarios"]],
+        [{**item, "action": "review only"} for item in payload["observation_scenarios"]],
+        [{**item, "checks": "check only"} for item in payload["observation_scenarios"]],
+    ):
+        with pytest.raises(ValueError):
+            validate_card({**payload, "observation_scenarios": bad})
+
+
+def test_observation_scenarios_reject_swapped_allowed_provenance():
+    from kr_stock_autotrader.decision_card_schema import validate_card
+
+    payload = card(1, 1)["card"]
+    scenarios = [
+        {"label": "BAD", "level_krw": 95, "meaning": "이벤트 전 저점 관찰", "action": "95원 이하이면 보유 축소 여부를 검토", "checks": "저점 이탈 후 공시 무효화 여부 확인", "source_field": "market.pre_event_low"},
+        {"label": "BASE", "level_krw": 100, "meaning": "이벤트 전 종가 관찰", "action": "100원 부근에서는 신규 판단을 보류하고 근거를 검토", "checks": "종가와 거래량의 지속 여부 확인", "source_field": "market.pre_event_close"},
+        {"label": "GOOD", "level_krw": 110, "meaning": "이벤트 구간 고점 관찰", "action": "110원 이상이면 보유 근거와 분할 대응 필요성을 검토", "checks": "고점 갱신과 후속 공시 확인", "source_field": "market.event_window_high"},
+    ]
+    swapped = [dict(item) for item in scenarios]
+    swapped[0]["source_field"], swapped[1]["source_field"] = (
+        swapped[1]["source_field"],
+        swapped[0]["source_field"],
+    )
+
+    with pytest.raises(ValueError, match="exact provenance"):
+        validate_card({**payload, "observation_scenarios": swapped})
+
+
+def test_save_card_binds_observation_prices_to_immutable_filter_market_data(db):
+    e = evidence(db)
+    market = {"pre_event_low": 95, "pre_event_close": 100, "event_window_high": 110}
+    f = save_filter(db, e["id"], raw(post_close_market=market), AS_OF, "2026-08-31T09:00:00+09:00")
+    payload = card(
+        e["id"], f["id"], verdict="관찰", price_cap=None, window=None, max_amount=None, max_qty=None,
+        stop_loss=None, take_profit=None, evidence_invalidation=None, holding_until=None, review_at=None,
+        valid_until=None, expires=None, order_type=None,
+        observation_scenarios=[
+            {"label": "BAD", "level_krw": 95, "meaning": "이벤트 전 저점", "action": "95원 이하이면 보유 축소 여부를 검토", "checks": "저점 이탈 뒤 공시 무효화 여부 확인", "source_field": "market.pre_event_low"},
+            {"label": "BASE", "level_krw": 100, "meaning": "이벤트 전 종가", "action": "100원 부근에서는 근거를 다시 검토", "checks": "종가와 거래량 지속 여부 확인", "source_field": "market.pre_event_close"},
+            {"label": "GOOD", "level_krw": 110, "meaning": "이벤트 구간 고점", "action": "110원 이상이면 보유 근거를 재검토", "checks": "고점 갱신과 후속 공시 확인", "source_field": "market.event_window_high"},
+        ],
+    )
+    raw_before = db.execute("SELECT raw_inputs FROM deterministic_filter_results WHERE id=?", (f["id"],)).fetchone()["raw_inputs"]
+
+    saved = save_card(db, payload)
+    assert [item["level_krw"] for item in saved["card"]["observation_scenarios"]] == [95, 100, 110]
+    assert all(saved["card"][field] is None for field in ("price_cap", "window", "max_amount", "max_qty", "stop_loss", "take_profit", "holding_until", "review_at", "valid_until", "expires", "order_type"))
+    assert db.execute("SELECT count(*) FROM order_plans").fetchone()[0] == 0
+    assert db.execute("SELECT raw_inputs FROM deterministic_filter_results WHERE id=?", (f["id"],)).fetchone()["raw_inputs"] == raw_before
+
+    forged = copy.deepcopy(payload)
+    forged["card"]["observation_scenarios"][0]["level_krw"] = 96
+    missing_evidence = evidence(db, "e2")
+    missing_filter = save_filter(
+        db, missing_evidence["id"], raw(post_close_market={"pre_event_low": 95, "pre_event_close": 100}),
+        AS_OF, "2026-08-31T09:00:00+09:00",
+    )
+    missing_source = copy.deepcopy(payload)
+    missing_source["evidence_id"] = missing_evidence["id"]
+    missing_source["filter_id"] = missing_filter["id"]
+    for invalid in (forged, missing_source):
+        with pytest.raises(HTTPException, match="observation scenario price source mismatch"):
+            save_card(db, invalid)
+    assert db.execute("SELECT count(*) FROM decision_cards").fetchone()[0] == 1
+
 
 def make_plan(d):
     e=evidence(d); f=save_filter(d,e['id'],raw(),AS_OF,"2026-08-31T09:00:00+09:00"); c=save_card(d,card(e['id'],f['id'])); d.execute("INSERT INTO users(email,password) VALUES('u','p')"); d.commit(); user_decision(d,c['id'],1,'approve'); return c, d.execute("SELECT id FROM order_plans ORDER BY id DESC").fetchone()['id']

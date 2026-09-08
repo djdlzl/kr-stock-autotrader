@@ -72,7 +72,7 @@ def test_short_term_excess_blocks_promotion_and_reports_units_window(monkeypatch
 
 def test_card_detail_ui_prioritizes_release0_read_only_sections():
     from kr_stock_autotrader.ui import APP_HTML
-    for text in ("무엇이 달라졌나", "현재 판단", "지금 할 일과 다음 확인 항목", "판단을 막는 누락·충돌", "자동화 단계"):
+    for text in ("지금 판단", "핵심 근거", "위험 관리", "상세 정보", "판단을 막는 누락·충돌", "자동화 단계"):
         assert text in APP_HTML
     for text in ("매수 승인", "short_term_excess_return_pct", "수익률"):
         assert text not in APP_HTML
