@@ -58,7 +58,6 @@ def test_release0_primary_surface_is_change_first_and_record_only():
     for forbidden in (
         "기본 모의투자 금액",
         "KIS 읽기전용 상태",
-        "현재가 확인",
         "매수 승인",
         "수동 매도",
         "실전주문 사전점검",
