@@ -47,6 +47,27 @@ def card(eid, fid, **card_override):
     payload.update(card_override)
     return {"evidence_id":eid, "filter_id":fid, "model":"m", "provider":"p", "card":payload}
 
+
+def test_observation_scenarios_are_strict_non_executable_references():
+    from kr_stock_autotrader.decision_card_schema import validate_card
+
+    payload = card(1, 1)["card"]
+    payload["observation_scenarios"] = [
+        {"label": "BAD", "level_krw": 95, "meaning": "이벤트 전 저점 관찰", "source_field": "market.pre_event_low"},
+        {"label": "BASE", "level_krw": 100, "meaning": "이벤트 전 종가 관찰", "source_field": "market.pre_event_close"},
+        {"label": "GOOD", "level_krw": 110, "meaning": "이벤트 구간 고점 관찰", "source_field": "market.event_window_high"},
+    ]
+    saved = validate_card(payload)
+    assert saved["observation_scenarios"] == payload["observation_scenarios"]
+    assert saved["observation_scenarios"][0]["level_krw"] != saved["stop_loss"]
+    for bad in (
+        payload["observation_scenarios"][:2],
+        [{**item, "source_field": "card.stop_loss"} for item in payload["observation_scenarios"]],
+        [{**item, "level_krw": True} for item in payload["observation_scenarios"]],
+    ):
+        with pytest.raises(ValueError):
+            validate_card({**payload, "observation_scenarios": bad})
+
 def make_plan(d):
     e=evidence(d); f=save_filter(d,e['id'],raw(),AS_OF,"2026-08-31T09:00:00+09:00"); c=save_card(d,card(e['id'],f['id'])); d.execute("INSERT INTO users(email,password) VALUES('u','p')"); d.commit(); user_decision(d,c['id'],1,'approve'); return c, d.execute("SELECT id FROM order_plans ORDER BY id DESC").fetchone()['id']
 

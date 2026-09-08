@@ -1096,7 +1096,7 @@ def _date_axis(date: str | None, operation_date: str | None) -> tuple[str, bool]
 
 
 @app.get('/api/cards/summary')
-def user_cards_summary(request: Request, date: str | None = None, operation_date: str | None = None):
+def user_cards_summary(request: Request, date: str | None = None, operation_date: str | None = None, current_only: bool = False):
     """Summarize legacy known_at history or explicit operation timestamp axes."""
     uid = current_user(request)
     day, operational = _date_axis(date, operation_date)
@@ -1127,6 +1127,10 @@ def user_cards_summary(request: Request, date: str | None = None, operation_date
                   AND NOT EXISTS (SELECT 1 FROM deterministic_filter_results child WHERE child.parent_filter_id=head.id)
                  ORDER BY head.as_of DESC,head.known_at DESC,head.lineage_version DESC LIMIT 1)
               GROUP BY f.verdict""",(day,)).fetchall()
+        if current_only:
+            selected_cards += """ AND c.invalidated_at IS NULL AND NOT EXISTS (SELECT 1 FROM decision_cards newer
+              WHERE newer.lineage_key=c.lineage_key AND newer.version>c.version AND newer.invalidated_at IS NULL)"""
+            filters=db.execute("SELECT f.verdict,count(*) n FROM (" + selected_cards + ") c JOIN deterministic_filter_results f ON f.id=c.filter_id GROUP BY f.verdict",(day,)).fetchall()
         cards=db.execute("SELECT verdict,count(*) n FROM (" + selected_cards + ") GROUP BY verdict",(day,)).fetchall()
         by_verdict={x['verdict']:x['n'] for x in cards}
         by_filter={x['verdict']:x['n'] for x in filters}
@@ -1148,9 +1152,11 @@ def user_cards_summary(request: Request, date: str | None = None, operation_date
 
 
 @app.get('/api/cards')
-def user_cards(request: Request, date: str | None = None, operation_date: str | None = None):
+def user_cards(request: Request, date: str | None = None, operation_date: str | None = None, current_only: bool | None = None):
     uid=current_user(request); day, operational=_date_axis(date, operation_date); db=connect()
-    try:return [user_card_view(db, item['id'], uid) for item in list_cards(db, date=day if (date is not None or operation_date is not None) else None, current_only=date is None and operation_date is None, operation_date=operational)]
+    try:
+        heads = current_only if current_only is not None else date is None and operation_date is None
+        return [user_card_view(db, item['id'], uid) for item in list_cards(db, date=day if (date is not None or operation_date is not None) else None, current_only=heads, operation_date=operational)]
     finally:db.close()
 
 

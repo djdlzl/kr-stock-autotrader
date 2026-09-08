@@ -127,7 +127,7 @@ def test_date_ui_keeps_operation_date_contract_and_mobile_constraints(monkeypatc
     html = client.get("/app").text
     for text in ("선택 운영일", "type=\"date\"", "@media(max-width:390px)", "현재 정보를 갱신하지 못했습니다"):
         assert text in html
-    assert "cards/summary'+q" in html and "cards/missing'+q" in html
+    assert "cards/summary'+q" in html and "cards/missing'+missingQ" in html
     assert "api('cards'+q,{sessionNotice:false})" in html and "api('cards')" not in html
 
 def test_date_ui_does_not_add_a_client_side_legacy_date_axis():

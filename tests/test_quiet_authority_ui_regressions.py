@@ -20,7 +20,7 @@ const values = {{'date': {{value: '2026-08-30'}}, 'reviewable-count': {{textCont
 const $ = selector => values[selector.slice(1)];
 let summary = null, cards = [], missing = [], lastGood = [], loadGeneration = 0;
 const calls = [];
-const api = async path => {{ calls.push(path); return {{'cards/summary?operation_date=2026-08-30': {json.dumps(summary, ensure_ascii=False)}, 'cards?operation_date=2026-08-30': {json.dumps(cards, ensure_ascii=False)}, 'cards/missing?operation_date=2026-08-30': {json.dumps(missing, ensure_ascii=False)}}}[path]; }};
+const api = async path => {{ calls.push(path); return {{'cards/summary?operation_date=2026-08-30&current_only=true': {json.dumps(summary, ensure_ascii=False)}, 'cards?operation_date=2026-08-30&current_only=true': {json.dumps(cards, ensure_ascii=False)}, 'cards/missing?operation_date=2026-08-30': {json.dumps(missing, ensure_ascii=False)}}}[path]; }};
 const invalidateDetail = () => {{}};
 const resetSheetMotion = () => {{}};
 const row = item => `<article>${{item.id}}</article>`;
@@ -45,8 +45,8 @@ def test_summary_strip_assigns_explicit_api_semantics_to_rendered_dom_for_operat
     )
     assert rendered == {
         "calls": [
-            "cards/summary?operation_date=2026-08-30",
-            "cards?operation_date=2026-08-30",
+            "cards/summary?operation_date=2026-08-30&current_only=true",
+            "cards?operation_date=2026-08-30&current_only=true",
             "cards/missing?operation_date=2026-08-30",
         ],
         "reviewable": "9",
@@ -68,8 +68,8 @@ let summary = null, cards = [], missing = [], lastGood = [], loadGeneration = 0;
 const api = async path => {{
   if (path.includes('2026-08-31')) throw new Error('refresh failed');
   return {{
-    'cards/summary?operation_date=2026-08-30': {{'카드 생성': 9, '판단 보류': 4, '카드 미생성': 2}},
-    'cards?operation_date=2026-08-30': [{{id: 'prior-row'}}],
+    'cards/summary?operation_date=2026-08-30&current_only=true': {{'카드 생성': 9, '판단 보류': 4, '카드 미생성': 2}},
+    'cards?operation_date=2026-08-30&current_only=true': [{{id: 'prior-row'}}],
     'cards/missing?operation_date=2026-08-30': []
   }}[path];
 }};
@@ -116,8 +116,8 @@ const fetch = async url => {{
   if (url.includes('2026-08-31')) return {{status: 401, ok: false, json: async () => ({{}})}};
   const path = url.slice('/api/'.length);
   return {{status: 200, ok: true, json: async () => ({{
-    'cards/summary?operation_date=2026-08-30': {{'카드 생성': 9, '판단 보류': 4, '카드 미생성': 2}},
-    'cards?operation_date=2026-08-30': [{{id: 'prior-row'}}],
+    'cards/summary?operation_date=2026-08-30&current_only=true': {{'카드 생성': 9, '판단 보류': 4, '카드 미생성': 2}},
+    'cards?operation_date=2026-08-30&current_only=true': [{{id: 'prior-row'}}],
     'cards/missing?operation_date=2026-08-30': []
   }}[path])}};
 }};
@@ -165,8 +165,8 @@ const pendingA = [];
 const fetch = url => {{
   if (url.includes('2026-08-31')) return Promise.resolve({{status: 401, ok: false, json: async () => ({{}})}});
   return new Promise(resolve => pendingA.push(() => resolve({{status: 200, ok: true, json: async () => ({{
-    'cards/summary?operation_date=2026-08-30': {{'카드 생성': 9, '판단 보류': 4, '카드 미생성': 2}},
-    'cards?operation_date=2026-08-30': [{{id: 'stale-A'}}],
+    'cards/summary?operation_date=2026-08-30&current_only=true': {{'카드 생성': 9, '판단 보류': 4, '카드 미생성': 2}},
+    'cards?operation_date=2026-08-30&current_only=true': [{{id: 'stale-A'}}],
     'cards/missing?operation_date=2026-08-30': []
   }}[url.slice('/api/'.length)])}})));
 }};
@@ -209,8 +209,8 @@ let summary = null, cards = [], missing = [], lastGood = [], loadGeneration = 0;
 const pendingA = [];
 const fetch = url => {{
   if (url.includes('2026-08-31')) return Promise.resolve({{status: 200, ok: true, json: async () => ({{
-    'cards/summary?operation_date=2026-08-31': {{'카드 생성': 7, '판단 보류': 3, '카드 미생성': 1}},
-    'cards?operation_date=2026-08-31': [{{id: 'current-B'}}],
+    'cards/summary?operation_date=2026-08-31&current_only=true': {{'카드 생성': 7, '판단 보류': 3, '카드 미생성': 1}},
+    'cards?operation_date=2026-08-31&current_only=true': [{{id: 'current-B'}}],
     'cards/missing?operation_date=2026-08-31': []
   }}[url.slice('/api/'.length)])}});
   return new Promise(resolve => pendingA.push(() => resolve({{status: 401, ok: false, json: async () => ({{}})}})));
@@ -272,7 +272,7 @@ def test_invalidation_renderer_distinguishes_replacement_from_hypothesis_discard
         [
             "node",
             "-e",
-            "const esc=v=>String(v??'').replace(/[&<>\\\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\\\"':'&quot;',\"'\":'&#39;'}[c]));const marketContext=()=>'';const scenarios=()=>'';const sourceFacts=()=>'';"
+            "const esc=v=>String(v??'').replace(/[&<>\\\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\\\"':'&quot;',\"'\":'&#39;'}[c]));const compactSections=()=>'';const marketContext=()=>'';const scenarios=()=>'';const sourceFacts=()=>'';"
             + invalidation
             + korean
             + blockers
@@ -422,3 +422,37 @@ console.log(JSON.stringify({{closes, compatibilityPointerDidNotDoubleClose, canc
         "control": True,
         "scrolled": True,
     }
+
+
+def test_compact_decision_sections_render_grounded_actions_prices_and_legacy_gaps():
+    """The default card/modal summary exposes only action, basis, and BAD/BASE/GOOD risk."""
+    script = re.search(r"<script>(.*?)</script>", APP_HTML, re.S).group(1)
+    invalidation = re.search(r"function invalidationState\(c\)\{.*?\}(?=\s*function statusFor)", script, re.S).group(0)
+    compact = re.search(r"function compactAction\(c\)\{.*?\}(?=\s*function row)", script, re.S).group(0)
+    payload = {
+        "card": {
+            "verdict": "매수 검토 가능", "proof_point": "계약 이행 확인", "business_value": "반복 매출 확대",
+            "stop_loss": 80, "price_cap": 100, "take_profit": [{"price": 110}],
+            "observation_scenarios": [
+                {"label": "BAD", "level_krw": 95, "meaning": "이벤트 전 저점", "source_field": "market.pre_event_low"},
+                {"label": "BASE", "level_krw": 100, "meaning": "이벤트 전 종가", "source_field": "market.pre_event_close"},
+                {"label": "GOOD", "level_krw": 110, "meaning": "이벤트 구간 고점", "source_field": "market.event_window_high"},
+            ],
+            "evidence_invalidation": {"condition": "계약 취소", "risk_policy": "종목 손실 한도 0.15% · 명목 한도 3%", "policy_version": "v1"},
+        },
+    }
+    legacy = {"card": {"verdict": "관찰", "business_value": "확인된 사업 가치"}}
+    node = (
+        "const esc=v=>String(v??'').replace(/[&<>\\\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\\\"':'&quot;',\"'\":'&#39;'}[c]));"
+        + invalidation + compact
+        + "console.log(JSON.stringify([compactSections(" + json.dumps(payload, ensure_ascii=False) + "),compactSections(" + json.dumps(legacy, ensure_ascii=False) + ")]));"
+    )
+    populated, no_price = json.loads(subprocess.check_output(["node", "-e", node], text=True))
+    assert "조건부 매수 검토" in populated
+    assert "계약 이행 확인" in populated and "반복 매출 확대" not in populated
+    assert "하방 95원 · 기준 100원 · 상방 110원" in populated
+    assert "80원" not in populated
+    assert "위험 한도 종목 손실 한도 0.15% · 명목 한도 3%" in populated
+    assert "지금 매수하지 않음 · 관찰" in no_price
+    assert "확인된 사업 가치" in no_price
+    assert "하방 가격 미설정 · 기준 가격 미설정 · 상방 가격 미설정" in no_price
