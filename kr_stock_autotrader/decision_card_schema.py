@@ -196,8 +196,15 @@ class DecisionCard(BaseModel):
     def complete_observation_scenarios(cls, value: list[ObservationScenario] | None) -> list[ObservationScenario] | None:
         if value is None:
             return value
-        if len(value) != 3 or {item.label for item in value} != {'BAD', 'BASE', 'GOOD'}:
+        expected_source_fields = {
+            'BAD': 'market.pre_event_low',
+            'BASE': 'market.pre_event_close',
+            'GOOD': 'market.event_window_high',
+        }
+        if len(value) != 3 or {item.label for item in value} != set(expected_source_fields):
             raise ValueError('requires exactly BAD, BASE, and GOOD observation scenarios')
+        if any(item.source_field != expected_source_fields[item.label] for item in value):
+            raise ValueError('requires exact provenance for each observation scenario label')
         return value
 
     @model_validator(mode='after')

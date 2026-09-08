@@ -68,6 +68,25 @@ def test_observation_scenarios_are_strict_non_executable_references():
         with pytest.raises(ValueError):
             validate_card({**payload, "observation_scenarios": bad})
 
+
+def test_observation_scenarios_reject_swapped_allowed_provenance():
+    from kr_stock_autotrader.decision_card_schema import validate_card
+
+    payload = card(1, 1)["card"]
+    scenarios = [
+        {"label": "BAD", "level_krw": 95, "meaning": "이벤트 전 저점 관찰", "source_field": "market.pre_event_low"},
+        {"label": "BASE", "level_krw": 100, "meaning": "이벤트 전 종가 관찰", "source_field": "market.pre_event_close"},
+        {"label": "GOOD", "level_krw": 110, "meaning": "이벤트 구간 고점 관찰", "source_field": "market.event_window_high"},
+    ]
+    swapped = [dict(item) for item in scenarios]
+    swapped[0]["source_field"], swapped[1]["source_field"] = (
+        swapped[1]["source_field"],
+        swapped[0]["source_field"],
+    )
+
+    with pytest.raises(ValueError, match="exact provenance"):
+        validate_card({**payload, "observation_scenarios": swapped})
+
 def make_plan(d):
     e=evidence(d); f=save_filter(d,e['id'],raw(),AS_OF,"2026-08-31T09:00:00+09:00"); c=save_card(d,card(e['id'],f['id'])); d.execute("INSERT INTO users(email,password) VALUES('u','p')"); d.commit(); user_decision(d,c['id'],1,'approve'); return c, d.execute("SELECT id FROM order_plans ORDER BY id DESC").fetchone()['id']
 
