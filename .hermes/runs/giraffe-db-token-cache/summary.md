@@ -1,7 +1,7 @@
 # KIS DB token cache — implementation summary
 
 ## Verdict
-Implemented and committed a DB-backed, fail-closed KIS OAuth cache with SQLite transaction coordination. No order, allocation, or live-trading behavior was changed.
+Implemented and committed a DB-backed, fail-closed KIS OAuth cache with SQLite transaction coordination. The daily-chart path now evicts a broker-rejected durable token conditionally and retries once with a newly persisted token. No order, allocation, or live-trading behavior was changed.
 
 Method: TDD + EDD — focused cache invariants; SQLite-backed fresh-client and concurrent-client runtime evaluation.
 
@@ -32,10 +32,17 @@ Result: **3 failed**. Fresh clients each issued OAuth; concurrent clients issued
 - `python -m py_compile kr_stock_autotrader/db.py kr_stock_autotrader/kis_readonly.py kr_stock_autotrader/market_data.py` → passed
 - `git diff --check` → passed before commit
 
+### Daily-chart rejected durable-token repair
+- RED: `.venv/bin/pytest -q tests/test_kis_readonly_dryrun.py -k 'daily_snapshot_replaces_broker_rejected_durable_token_once'` → **1 failed** before the production edit; daily returned `KIS daily snapshot unavailable` without invalidating or refreshing.
+- GREEN: the same command → **3 passed**. It covers a `401`, `EGW00121`, and `EGW00123`; each starts from a SQLite-durable rejected token, makes exactly `GET, POST, GET`, removes the rejected row conditionally, persists the replacement, and confirms neither token is in the returned closed snapshot.
+- `.venv/bin/pytest -q tests/test_kis_readonly_dryrun.py tests/test_market_data_pipeline.py` → **90 passed** (2 dependency deprecation warnings)
+- `.venv/bin/python -m compileall -q kr_stock_autotrader` and `git diff --check` → passed
+
 Full suite attempt: `.venv/bin/pytest -q` → **306 passed, 1 failed**. The unrelated existing test `tests/test_hybrid_decision_engine.py::test_hybrid_calibration_rejects_posthoc_windows_and_target_case_reuse` failed with `outcome known_at outside observation window`; it does not exercise the KIS cache files.
 
 ## Commit
 Implementation commit: `75dabd4c4ae0dff2f6fdf9aceebf6213046f8499` (`fix(kis): coordinate OAuth tokens through SQLite`).
+Daily-chart repair commit: `08d2ee1b805a571ddeba099fe8b7ffaa0c9ccbe6` (`fix(kis): retry daily chart after auth rejection`).
 
 ## Residual risks
 - SQLite coordinates writers within its configured five-second busy timeout; prolonged database lock contention fails closed rather than issuing an extra OAuth token.
