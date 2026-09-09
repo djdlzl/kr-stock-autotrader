@@ -32,6 +32,58 @@ class FakeTransport:
         if url.endswith(OAUTH_PATH): return Response({'access_token':'secret-token','expires_in':86400,'access_token_token_expired':'2026-08-29T10:00:00+09:00'})
         return Response({'rt_cd':'0','output':{'stck_prpr':'70000','acml_vol':'1234','unwanted':'raw'}})
 
+
+def test_allowlisted_requests_have_a_process_local_minimum_start_interval(monkeypatch):
+    import kr_stock_autotrader.kis_readonly as kis
+
+    clock = [100.0]
+    sleeps = []
+    monkeypatch.setattr(kis.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(kis.time, "sleep", lambda seconds: (sleeps.append(seconds), clock.__setitem__(0, clock[0] + seconds)))
+    monkeypatch.setattr(KISReadOnlyClient, "_last_request_started", None)
+
+    class TimestampedTransport:
+        def __init__(self): self.starts = []
+        def request(self, method, url, **kwargs):
+            self.starts.append(clock[0])
+            return Response({})
+
+    transport = TimestampedTransport()
+    client = KISReadOnlyClient("key", "value", transport=transport)
+    for method, path in (("POST", OAUTH_PATH), ("GET", QUOTE_PATH), ("GET", ORDERBOOK_PATH), ("GET", DAILY_CHART_PATH), ("GET", INTRADAY_MINUTE_PATH)):
+        client._request(method, path)
+
+    assert transport.starts == pytest.approx([100.0, 100.1, 100.2, 100.3, 100.4])
+    assert sleeps == pytest.approx([0.1, 0.1, 0.1, 0.1])
+
+
+def test_allowlisted_request_start_throttle_serializes_concurrent_clients(monkeypatch):
+    import kr_stock_autotrader.kis_readonly as kis
+
+    clock = [100.0]
+    clock_lock = threading.Lock()
+    monkeypatch.setattr(kis.time, "monotonic", lambda: clock[0])
+    def sleep(seconds):
+        with clock_lock:
+            clock[0] += seconds
+    monkeypatch.setattr(kis.time, "sleep", sleep)
+    monkeypatch.setattr(KISReadOnlyClient, "_last_request_started", None)
+
+    class TimestampedTransport:
+        def __init__(self): self.starts = []
+        def request(self, method, url, **kwargs):
+            with clock_lock:
+                self.starts.append(clock[0])
+            return Response({})
+
+    transport = TimestampedTransport()
+    clients = [KISReadOnlyClient("key", "value", transport=transport) for _ in range(4)]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda client: client._request("GET", QUOTE_PATH), clients))
+
+    starts = sorted(transport.starts)
+    assert starts == pytest.approx([100.0, 100.1, 100.2, 100.3])
+
 def test_kis_allowlist_pinned_host_and_safe_actual_projection(monkeypatch):
     t=FakeTransport(); k=KISReadOnlyClient('app-secret-key','app-secret-value',base_url=PRODUCTION_BASE_URL+'/',transport=t)
     q=k.current_price('005930')

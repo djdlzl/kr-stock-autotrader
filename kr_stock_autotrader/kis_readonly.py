@@ -5,6 +5,8 @@ import re
 import math
 import hashlib
 import sqlite3
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
@@ -30,6 +32,7 @@ INTRADAY_MINUTE_PATH = _INTRADAY_MINUTE_PATH
 INTRADAY_MINUTE_TR_ID = _INTRADAY_MINUTE_TR_ID
 TOKEN_REFRESH_SKEW = timedelta(seconds=30)
 MAX_TOKEN_LIFETIME = timedelta(hours=24)
+REQUEST_START_INTERVAL_SECONDS = 0.1
 
 
 class KISOAuthCacheError(RuntimeError):
@@ -88,6 +91,9 @@ def _expiry_from(payload: dict, now: datetime) -> datetime:
 
 class KISReadOnlyClient:
     """Only OAuth and one hard-coded domestic current-price request are callable."""
+    _request_start_lock = threading.Lock()
+    _last_request_started: float | None = None
+
     def __init__(self, app_key: str | None = None, app_secret: str | None = None, *, base_url: str | None = None, transport: Transport | None = None):
         self._app_key = app_key if app_key is not None else os.getenv("KIS_APP_KEY", "")
         self._app_secret = app_secret if app_secret is not None else os.getenv("KIS_APP_SECRET", "")
@@ -112,7 +118,15 @@ class KISReadOnlyClient:
     def _request(self, method: str, path: str, **kwargs):
         if (method, path) not in {("POST", OAUTH_PATH), ("GET", QUOTE_PATH), ("GET", ORDERBOOK_PATH), ("GET", DAILY_CHART_PATH), ("GET", INTRADAY_MINUTE_PATH)}:
             raise ValueError("non-allowlisted KIS request")
-        return self._transport.request(method, self._base_url + path, **kwargs)
+        # The lock is process-local and spans the actual transport start so a
+        # preempted caller cannot be overtaken after reserving its time slot.
+        with self._request_start_lock:
+            if self._last_request_started is not None:
+                deadline = self._last_request_started + REQUEST_START_INTERVAL_SECONDS
+                while (remaining := deadline - time.monotonic()) > 0:
+                    time.sleep(remaining)
+            self.__class__._last_request_started = time.monotonic()
+            return self._transport.request(method, self._base_url + path, **kwargs)
 
     def _clear_token(self) -> None:
         self._token = None
