@@ -42,6 +42,18 @@ def test_real_producer_output_passes_0800_filter_after_network_completion(monkey
     assert snapshot["pre_announcement_return_pct"] is not None
     assert snapshot["daily_bars_known_at"] == "2026-09-01T15:30:00+09:00"
     assert snapshot["market_data_known_at"] == snapshot["retrieved_at"] == "2026-09-02T08:00:03+09:00"
+    assert snapshot["expected_price_baseline"] == {
+        "schema_version": "giraffe-premarket-baseline-v1",
+        "security_id": "005930",
+        "source": "KIS",
+        "source_field": "previous_close_krw",
+        "price_krw": 130.0,
+        "unit": "KRW/share",
+        "session_date": "2026-09-01",
+        "price_known_at": "2026-09-01T15:30:00+09:00",
+        "retrieved_at": "2026-09-02T08:00:03+09:00",
+    }
+    assert filter_inputs_from_snapshot(snapshot)["expected_price_baseline"] == snapshot["expected_price_baseline"]
     inputs = filter_inputs_from_snapshot(snapshot) | {"source":"dart", "announcement_at":"2026-08-31T17:15:00+09:00", "economic_terms":"verified"}
     result = run_filter(inputs, snapshot["retrieved_at"], snapshot["retrieved_at"])
     assert result["verdict"] == "PASS", result["reasons"]

@@ -176,6 +176,13 @@ def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Calla
                 "short_term_provenance": {"source": "KIS", "daily_bars_known_at": bars_known.isoformat(),
                                             "market_data_known_at": retrieved.isoformat()},
                 "trading_value_krw": aligned[0][0]["value"],
+                "expected_price_baseline": {
+                    "schema_version": "giraffe-premarket-baseline-v1", "security_id": symbol,
+                    "source": "KIS", "source_field": "previous_close_krw",
+                    "price_krw": aligned[0][0]["close"], "unit": "KRW/share",
+                    "session_date": aligned[0][0]["day"].isoformat(),
+                    "price_known_at": bars_known.isoformat(), "retrieved_at": retrieved.isoformat(),
+                },
                 "market_cap_krw": market_cap, "recent_rise_pct": stock_return,
                 "pre_announcement_return_pct": pre_return, "trading_status": "premarket_unverified",
                 "gap_pct": None, "current_volume": None, "baseline_volume": None, "sector_return_pct": None,
@@ -227,7 +234,7 @@ def filter_inputs_from_snapshot(snapshot: object) -> dict:
         thresholds = {"min_trading_value": _threshold("GIRAFFE_MIN_TRADING_VALUE_KRW"), "min_market_cap": _threshold("GIRAFFE_MIN_MARKET_CAP_KRW"), "max_market_cap": _threshold("GIRAFFE_MAX_MARKET_CAP_KRW"), "max_recent_rise_pct": _threshold("GIRAFFE_MAX_RECENT_RISE_PCT"), "max_gap_pct": _threshold("GIRAFFE_MAX_GAP_PCT"), "max_pre_return_pct": _threshold("GIRAFFE_MAX_PRE_RETURN_PCT"), **_filter_config()}
         if thresholds["min_market_cap"] > thresholds["max_market_cap"]:
             raise ValueError("invalid market cap range")
-        return {"market_data_known_at": snapshot["market_data_known_at"], "trading_status": snapshot["trading_status"], "trading_value": snapshot["trading_value_krw"], "market_cap": snapshot["market_cap_krw"], "stock_return_pct": snapshot["stock_return_pct"], "benchmark_return_pct": snapshot["benchmark_return_pct"], "recent_rise_pct": snapshot["recent_rise_pct"], "pre_announcement_return_pct": snapshot["pre_announcement_return_pct"], "short_term_stock_return_pct": snapshot["short_term_stock_return_pct"], "short_term_benchmark_return_pct": snapshot["short_term_benchmark_return_pct"], "short_term_excess_return_pct": snapshot["short_term_excess_return_pct"], "short_term_window": snapshot["short_term_window"], "short_term_provenance": snapshot["short_term_provenance"], "gap_pct": snapshot.get("gap_pct"), "current_volume": snapshot.get("current_volume"), "baseline_volume": snapshot.get("baseline_volume"), "sector_return_pct": snapshot.get("sector_return_pct"), "observability": snapshot.get("observability", {}), **thresholds}
+        return {"market_data_known_at": snapshot["market_data_known_at"], "expected_price_baseline": snapshot["expected_price_baseline"], "trading_status": snapshot["trading_status"], "trading_value": snapshot["trading_value_krw"], "market_cap": snapshot["market_cap_krw"], "stock_return_pct": snapshot["stock_return_pct"], "benchmark_return_pct": snapshot["benchmark_return_pct"], "recent_rise_pct": snapshot["recent_rise_pct"], "pre_announcement_return_pct": snapshot["pre_announcement_return_pct"], "short_term_stock_return_pct": snapshot["short_term_stock_return_pct"], "short_term_benchmark_return_pct": snapshot["short_term_benchmark_return_pct"], "short_term_excess_return_pct": snapshot["short_term_excess_return_pct"], "short_term_window": snapshot["short_term_window"], "short_term_provenance": snapshot["short_term_provenance"], "gap_pct": snapshot.get("gap_pct"), "current_volume": snapshot.get("current_volume"), "baseline_volume": snapshot.get("baseline_volume"), "sector_return_pct": snapshot.get("sector_return_pct"), "observability": snapshot.get("observability", {}), **thresholds}
     except (KeyError, TypeError, ValueError):
         try:
             attempted_at = parse_kst(snapshot.get("retrieved_at"))
