@@ -107,6 +107,9 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertIn("정확히 한 번", prompt)
         self.assertIn("reviewed receipt", prompt)
         self.assertIn("scheduler-finish", prompt)
+        self.assertIn("giraffe-expected-price-input-v1", prompt)
+        self.assertIn("official_derived", prompt)
+        self.assertIn("HOLD_MISSING_INPUT", prompt)
 
 
 if __name__ == "__main__":

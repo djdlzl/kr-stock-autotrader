@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -407,3 +408,63 @@ def test_monotonic_reserve_refuses_before_aggregate_start(runner, monkeypatch):
         runner.execute(env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=near,
                        source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: 100.0)
     assert calls == []
+
+
+def test_manual_expected_price_uses_only_latest_same_day_card_run_and_reads_back_details(runner, monkeypatch, tmp_path):
+    """Manual recovery must never widen its target to historical cards."""
+    from kr_stock_autotrader import db as dbmod
+    from kr_stock_autotrader.decision_cards import create_evidence, save_card, save_filter
+    from tests.test_decision_card_invariants import card, raw
+
+    db_path = tmp_path / "manual.sqlite"
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(db_path))
+    db = dbmod.connect()
+    known = "2026-09-09T08:00:00+09:00"
+    cards = []
+    for sequence in range(3):
+        evidence = create_evidence(db, {
+            "symbol": f"0059{sequence:02d}", "name": "fixture", "kind": "disclosure",
+            "title": f"fixture-{sequence}", "summary": "fixture", "source": "dart",
+            "source_url": "https://example.test", "announcement_at": known, "collected_at": known,
+            "known_at": known, "snapshot": {"economic_terms": {}},
+            "dedupe_key": f"manual-target-{sequence}",
+        })
+        filt = save_filter(db, evidence["id"], raw(announcement_at=known, market_data_known_at=known), known, known)
+        cards.append(save_card(db, card(evidence["id"], filt["id"])))
+    db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,finished_at,detail) VALUES(?,?,?,?,?,?)", (
+        "card-2026-09-08", "card", "done", "2026-09-08T08:00:00+09:00", "2026-09-08T08:01:00+09:00",
+        json.dumps({"detail": {"cards": {"ids": [cards[0]["id"]]}}}),
+    ))
+    db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,finished_at,detail) VALUES(?,?,?,?,?,?)", (
+        "card-2026-09-09", "card", "done", known, "2026-09-09T08:01:00+09:00",
+        json.dumps({"detail": {"cards": {"ids": [cards[1]["id"], cards[2]["id"]]}}}),
+    ))
+    db.commit()
+    db.close()
+
+    report = runner.manual_expected_price(db_path, tmp_path / "report.json", now=now())
+
+    assert report["counts"] == {
+        "target": 2, "computed": 0, "hold_missing_input": 2, "hold_invalid_input": 0,
+        "calculation_error": 0, "persisted": 2, "readback": 2,
+    }
+    assert [item["card_id"] for item in report["results"]] == [cards[1]["id"], cards[2]["id"]]
+    assert all(item["reason"] == "missing_persisted_valuation_inputs" for item in report["results"])
+    assert all(item["missing_fields"] == ["economic_terms.expected_price_inputs"] for item in report["results"])
+    assert all(item["invalid_fields"] == [] and item["calculated_value"] is None for item in report["results"])
+
+
+@pytest.mark.parametrize("status,detail,reason", [
+    ("started", '{"detail":{"cards":{"ids":[1]}}}', "same_day_card_run_not_done"),
+    ("done", "not-json", "same_day_card_run_malformed"),
+])
+def test_manual_card_ids_fails_closed_for_nonterminal_or_malformed_scheduler_contract(runner, status, detail, reason):
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute("CREATE TABLE scheduler_runs (id INTEGER PRIMARY KEY, kind TEXT, status TEXT, started_at TEXT, finished_at TEXT, detail TEXT)")
+    db.execute("INSERT INTO scheduler_runs(kind,status,started_at,finished_at,detail) VALUES(?,?,?,?,?)", (
+        "card", status, "2026-09-09T08:00:00+09:00", "2026-09-09T08:01:00+09:00", detail,
+    ))
+    with pytest.raises(runner.RunFailure, match=reason):
+        runner.manual_card_ids(db, date="2026-09-09")
+    db.close()

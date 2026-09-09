@@ -55,7 +55,7 @@
 
 ## 08:00 snapshot → filter → card 실행 연결
 
-각 eligible evidence마다 `announcement_at`를 포함해 아래 순서로 실제 API/CLI를 호출한다. snapshot의 `filter_inputs` 전체 객체를 그대로 사용하고 숫자/관측가능성/임계값 필드를 임의 변경하지 않는다. `evidence 필드만 merge`한다. 즉 evidence에서 확인된 `source`, `announcement_at`, `economic_terms`, 중복/상충 여부만 안전하게 merge한다.
+각 eligible evidence마다 `announcement_at`를 포함해 아래 순서로 실제 API/CLI를 호출한다. snapshot의 `filter_inputs` 전체 객체를 그대로 사용하고 숫자/관측가능성/임계값 필드를 임의 변경하지 않는다. `evidence 필드만 merge`한다. 즉 evidence에서 확인된 `source`, `announcement_at`, `economic_terms` 객체 전체(있다면 `expected_price_inputs`를 drop/rename/stringify하지 않고 보존), 중복/상충 여부만 안전하게 merge한다.
 
 1. `market-snapshot SYMBOL AS_OF --announcement-at ANNOUNCEMENT_AT`를 호출한다.
 2. snapshot `status != ok` 또는 filter inputs `market_data_status=unavailable`이면 snapshot의 실제 `market_data_attempted_at`를 **filter `known_at`과 `as_of` 모두로 사용**해 market-data unavailable filter를 실행하고, 비매수 `판단 보류` 카드만 저장한다. requested historical as_of보다 attempt가 늦으면 422/error로 종료하며 과거 시장자료라고 backdate하지 않는다. API 오류를 무시하거나 null/0을 만들어 PASS시키지 않는다.

@@ -275,8 +275,26 @@ def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight:
     return "시장맥락 완료 count=%s" % verified
 
 
+def manual_card_ids(db: Any, *, date: str) -> list[int]:
+    """Read only the latest same-day card scheduler contract; never widen to card history."""
+    run = db.execute(
+        """SELECT status, finished_at, detail FROM scheduler_runs
+           WHERE kind='card' AND substr(started_at, 1, 10)=?
+           ORDER BY id DESC LIMIT 1""",
+        (date,),
+    ).fetchone()
+    if not run:
+        raise RunFailure("manual", "same_day_card_run_missing")
+    if run["status"] != "done" or not run["finished_at"]:
+        raise RunFailure("manual", "same_day_card_run_not_done")
+    try:
+        return card_ids({"detail": json.loads(run["detail"])})
+    except (RunFailure, TypeError, ValueError, json.JSONDecodeError):
+        raise RunFailure("manual", "same_day_card_run_malformed")
+
+
 def manual_expected_price(db_path: Path, artifact: Path, *, now: datetime) -> dict[str, Any]:
-    """Explicit out-of-window local-fixture path: no HTTP/KIS/backfill calls."""
+    """Explicit local-copy path: no HTTP/KIS/backfill calls and no historical-card scan."""
     root = str(Path(__file__).resolve().parents[1])
     if root not in sys.path:
         sys.path.insert(0, root)
@@ -288,22 +306,41 @@ def manual_expected_price(db_path: Path, artifact: Path, *, now: datetime) -> di
     dbmod.DATABASE_PATH = str(db_path)
     db = dbmod.connect()
     try:
-        cards = [dict(row) for row in db.execute("SELECT * FROM decision_cards ORDER BY id")]
+        target_ids = manual_card_ids(db, date=now.date().isoformat())
+        placeholders = ",".join("?" for _ in target_ids)
+        selected = {row["id"]: dict(row) for row in db.execute(
+            "SELECT * FROM decision_cards WHERE id IN (%s)" % placeholders, target_ids,
+        )}
+        if len(selected) != len(target_ids):
+            raise RunFailure("manual", "same_day_card_ids_missing")
+        cards = [selected[card_id] for card_id in target_ids]
         counts = {"target": len(cards), "computed": 0, "hold_missing_input": 0, "hold_invalid_input": 0,
                   "calculation_error": 0, "persisted": 0, "readback": 0}
         results = []
         for card in cards:
-            key = "expected-price-manual-%s-card-%s" % (now.date().isoformat(), card["id"])
+            key = "expected-price-manual-rework-%s-card-%s" % (now.date().isoformat(), card["id"])
             result = evaluate_and_persist_expected_price(db=db, run_key=key, card=card,
                 evidence=evidence_detail(db, card["evidence_id"]), filter_result=filter_detail(db, card["filter_id"]),
                 requested_as_of=now.isoformat())
             status = result["status"]
             counts[{"COMPUTED":"computed", "HOLD_MISSING_INPUT":"hold_missing_input", "HOLD_INVALID_INPUT":"hold_invalid_input", "CALCULATION_ERROR":"calculation_error"}[status]] += 1
-            counts["persisted"] += 1
             row = db.execute("SELECT result_json FROM expected_price_runs WHERE run_key=?", (key,)).fetchone()
-            if row and json.loads(row["result_json"]) == result["result"]:
-                counts["readback"] += 1
-            results.append({"card_id": card["id"], "status": status, "run_key": key})
+            if row:
+                counts["persisted"] += 1
+                persisted = json.loads(row["result_json"])
+                if persisted == result["result"]:
+                    counts["readback"] += 1
+                results.append({
+                    "card_id": card["id"], "run_key": key, "status": status,
+                    "reason": persisted.get("reason"),
+                    "missing_fields": persisted.get("missing_fields", []),
+                    "invalid_fields": persisted.get("invalid_fields", []),
+                    "calculated_value": persisted.get("calculated_value"),
+                })
+            else:
+                results.append({"card_id": card["id"], "run_key": key, "status": status,
+                                "reason": None, "missing_fields": [], "invalid_fields": [],
+                                "calculated_value": None})
         report = {"mode":"manual_out_of_window_local_fixture", "network_calls":0, "kis_calls":0, "intraday_calls":0,
                   "backfill_calls":0, "counts":counts, "results":results,
                   "status":"error" if counts["calculation_error"] or counts["persisted"] != counts["target"] or counts["readback"] != counts["target"] else "done"}

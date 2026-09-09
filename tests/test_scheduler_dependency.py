@@ -34,6 +34,12 @@ def test_0800_prompt_requires_same_day_completed_research_before_pending_cards()
     assert prompt.index(latest) < prompt.index("pending-cards")
 
 
+def test_0800_prompt_preserves_expected_price_input_object_for_0905_evaluation():
+    prompt = (Path(__file__).parents[1] / "prompts/giraffe-decision-card-scheduler-v1.md").read_text()
+    assert "expected_price_inputs" in prompt
+    assert "drop/rename/stringify하지 않고 보존" in prompt
+
+
 def test_0800_prompt_does_not_fabricate_observation_anchors_without_complete_market_inputs():
     prompt = (Path(__file__).parents[1] / "prompts/giraffe-decision-card-scheduler-v1.md").read_text()
     for marker in ("`post_close_market`", "`pre_event_low`", "`pre_event_close`", "`event_window_high`", "모두 있을 때만", "만들지 않는다"):

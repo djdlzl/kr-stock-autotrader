@@ -123,7 +123,9 @@ Giraffe는 paper-only이고 `LIVE_TRADING=False`다. 이 작업은 주문·자�
     "unknowns": [],
     "conflicts": [],
     "counter_evidence": [],
-    "economic_terms": {},
+    "economic_terms": {
+      "expected_price_inputs": "optional giraffe-expected-price-input-v1 object; omit when no qualifying issuer/event-specific fields are verified"
+    },
     "evidence_refs": [],
     "official_document_id": "공식 문서 ID 또는 null",
     "retrieved_at_kst": "KST ISO-8601"
@@ -135,6 +137,9 @@ Giraffe는 paper-only이고 `LIVE_TRADING=False`다. 이 작업은 주문·자�
 ```
 
 - 확인되지 않은 숫자·URL·시각·종목코드를 만들지 않는다.
+- `economic_terms.expected_price_inputs`는 선택사항이며, 제공할 때는 `giraffe-expected-price-input-v1` 전체 객체를 원문 그대로 저장한다. 09:05 평가자는 이 중첩 객체와 08:00 baseline만 읽으므로 root `expected_price`로 복사하거나 문자열 요약으로 바꾸지 않는다.
+- 이 패키지의 각 값은 해당 issuer/event의 `official_exact`, 재현 가능한 식·원문 reference가 있는 `official_derived`, 또는 `approved_scenarios`와 `approval_ref`를 갖춘 명시 승인 `assumption`만 허용한다. 근거가 없으면 필드를 생략하거나 `unavailable`/`not_searched`로 남긴다.
+- 마진, 이행확률, 세율, 할인율, 연도별 배분, peer multiple, normalized FCF, 희석주식수 및 기타 숫자를 추정·보완·평균·역산하지 않는다. 없는 값은 09:05에서 정확한 `HOLD_MISSING_INPUT`으로 남긴다.
 - 사실과 해석을 분리한다.
 - 정정 자료는 snapshot에 `correction_of` 또는 `supersedes` 대상 material ID/문서 ID를 기록한다.
 - `dedupe_key`는 `symbol|kind|official_document_id|source_url|announcement_at|핵심 사건 식별자`를 정규화한 뒤 SHA-256으로 만든다.
