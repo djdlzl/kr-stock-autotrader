@@ -36,7 +36,11 @@ from .intraday_market_context import (
 from .market_data import build_premarket_snapshot, filter_inputs_from_snapshot
 from .live_dry_run import existing_live_dry_run_receipt, persist_live_dry_run
 from .event_scenarios import create as create_scenario_set, detail as scenario_set_detail, observe as observe_scenario
-from .expected_price_runtime import evaluate_and_persist_expected_price, expected_price_run_detail
+from .expected_price_runtime import (
+    evaluate_and_persist_expected_price,
+    expected_price_run_detail,
+    market_context_expected_price_run_key,
+)
 
 
 # Public prototype-only source pages.  These deliberately have no connection to
@@ -1108,7 +1112,7 @@ async def internal_card_market_context(card_id: int, request: Request, _: None =
         known_at = max(known_candidates).isoformat() if known_candidates else as_of.isoformat()
         result["known_at"] = known_at
         result["retrieved_at"] = known_at
-        return persist_intraday_market_context_run(
+        market_context = persist_intraday_market_context_run(
             db,
             run_key=data.run_key,
             card=dict(card),
@@ -1121,6 +1125,15 @@ async def internal_card_market_context(card_id: int, request: Request, _: None =
             result=result,
             source_topic=INTRADAY_SOURCE_TOPIC,
         )
+        market_context["expected_price"] = evaluate_and_persist_expected_price(
+            db=db,
+            run_key=market_context_expected_price_run_key(data.run_key),
+            card=dict(card),
+            evidence=evidence,
+            filter_result=filter_result,
+            requested_as_of=data.as_of,
+        )
+        return market_context
     finally:
         db.close()
 
@@ -1128,7 +1141,11 @@ async def internal_card_market_context(card_id: int, request: Request, _: None =
 def internal_market_context_run_detail(run_key: str, _: None = Depends(require_internal_api_key)):
     db = connect()
     try:
-        return render_market_context_response(market_context_run_detail(db, run_key=run_key), idempotent=False)
+        response = render_market_context_response(market_context_run_detail(db, run_key=run_key), idempotent=False)
+        response["expected_price"] = expected_price_run_detail(
+            db, run_key=market_context_expected_price_run_key(run_key),
+        )
+        return response
     finally:
         db.close()
 

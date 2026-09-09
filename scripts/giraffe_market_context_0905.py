@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -126,6 +127,33 @@ def run_key(date: str) -> str:
 
 def card_run_key(date: str, card_id: int) -> str:
     return "market-context-%s-0905-kst-topic7923-card-%s" % (date, card_id)
+
+
+def expected_price_run_key(market_context_key: str) -> str:
+    return "%s-expected-price" % market_context_key
+
+
+EXPECTED_PRICE_TERMINAL_STATUSES = {"COMPUTED", "HOLD_MISSING_INPUT", "HOLD_INVALID_INPUT"}
+
+
+def expected_price_readback_matches(readback: Dict[str, Any], *, market_context_key: str,
+                                    card_id: int, requested_as_of: str) -> bool:
+    """The child is carried by the existing market-context readback, never fetched separately."""
+    expected = readback.get("expected_price")
+    if not isinstance(expected, dict):
+        return False
+    result = expected.get("result")
+    return (
+        expected.get("run_key") == expected_price_run_key(market_context_key)
+        and expected.get("card_id") == card_id
+        and expected.get("evidence_id") == readback.get("evidence_id")
+        and expected.get("filter_id") == readback.get("filter_id")
+        and expected.get("requested_as_of") == requested_as_of
+        and expected.get("source_topic") == API_SOURCE_TOPIC
+        and expected.get("status") in EXPECTED_PRICE_TERMINAL_STATUSES
+        and isinstance(result, dict)
+        and result.get("status") == expected.get("status")
+    )
 
 
 def failure_report(stage: str, count: int, reasons: Iterable[str]) -> str:
@@ -254,6 +282,10 @@ def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight:
                     or readback.get("requested_as_of") != as_of
                     or readback.get("source_topic") != API_SOURCE_TOPIC):
                 raise RunFailure("readback", "card_%s_mismatch" % card_id)
+            if not expected_price_readback_matches(
+                readback, market_context_key=key, card_id=card_id, requested_as_of=as_of,
+            ):
+                raise RunFailure("expected_price", "card_%s_expected_price_mismatch" % card_id)
             verified += 1
         except RunFailure as exc:
             reasons.append(exc.reason)
@@ -291,6 +323,19 @@ def manual_card_ids(db: Any, *, date: str) -> list[int]:
         return card_ids({"detail": json.loads(run["detail"])})
     except (RunFailure, TypeError, ValueError, json.JSONDecodeError):
         raise RunFailure("manual", "same_day_card_run_malformed")
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def candidate_identifier(root: Path) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unavailable"
 
 
 def manual_expected_price(db_path: Path, artifact: Path, *, now: datetime) -> dict[str, Any]:
@@ -343,7 +388,18 @@ def manual_expected_price(db_path: Path, artifact: Path, *, now: datetime) -> di
                                 "calculated_value": None})
         report = {"mode":"manual_out_of_window_local_fixture", "network_calls":0, "kis_calls":0, "intraday_calls":0,
                   "backfill_calls":0, "counts":counts, "results":results,
-                  "status":"error" if counts["calculation_error"] or counts["persisted"] != counts["target"] or counts["readback"] != counts["target"] else "done"}
+                  "status":"error" if counts["calculation_error"] or counts["persisted"] != counts["target"] or counts["readback"] != counts["target"] else "done",
+                  "manifest": {
+                      "candidate_identifier": candidate_identifier(Path(root)),
+                      "evaluator_module_sha256": sha256_file(Path(root) / "kr_stock_autotrader" / "expected_price_runtime.py"),
+                      "command": "giraffe_market_context_0905.py --manual-out-of-window",
+                      "mode": "manual_out_of_window_local_fixture",
+                      "local_db_sha256": sha256_file(db_path),
+                      "local_db_provenance": "explicit_local_fixture_copy",
+                      "scheduler_run_key": "card-%s" % now.date().isoformat(),
+                      "date": now.date().isoformat(),
+                      "card_ids": target_ids,
+                  }}
     finally:
         db.close()
     artifact.parent.mkdir(parents=True, exist_ok=True)

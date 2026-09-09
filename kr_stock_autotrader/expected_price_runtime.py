@@ -13,6 +13,11 @@ from .expected_price import evaluate_persisted_expected_price
 EXPECTED_PRICE_SOURCE_TOPIC = "mac:7923"
 
 
+def market_context_expected_price_run_key(market_context_run_key: str) -> str:
+    """One deterministic expected-price child per market-context run."""
+    return "%s-expected-price" % market_context_run_key
+
+
 def _canon(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -33,7 +38,12 @@ def evaluate_and_persist_expected_price(*, db: sqlite3.Connection, run_key: str,
     """Append one immutable result; exact run key reads back without recomputation."""
     existing = db.execute("SELECT * FROM expected_price_runs WHERE run_key=?", (run_key,)).fetchone()
     if existing:
-        if (existing["card_id"], existing["requested_as_of"], existing["source_topic"]) != (card["id"], requested_as_of, source_topic):
+        if (
+            existing["card_id"], existing["evidence_id"], existing["filter_id"],
+            existing["requested_as_of"], existing["source_topic"],
+        ) != (
+            card["id"], evidence["id"], filter_result["id"], requested_as_of, source_topic,
+        ):
             raise HTTPException(409, "expected price run key conflicts with persisted lineage")
         return {**_detail(existing), "idempotent": True}
     result = evaluate_persisted_expected_price(evidence=evidence, filter_result=filter_result, as_of=requested_as_of)

@@ -220,6 +220,13 @@ def test_0905_market_context_route_persists_reads_back_and_keeps_zero_order_side
     assert body["evidence_id"] == evidence["id"]
     assert body["filter_id"] == filt["id"]
     assert body["source_topic"] == "mac:7923"
+    assert body["expected_price"]["run_key"] == run_key + "-expected-price"
+    assert body["expected_price"]["card_id"] == saved["id"]
+    assert body["expected_price"]["evidence_id"] == evidence["id"]
+    assert body["expected_price"]["filter_id"] == filt["id"]
+    assert body["expected_price"]["requested_as_of"] == AS_OF
+    assert body["expected_price"]["status"] == "HOLD_MISSING_INPUT"
+    assert body["expected_price"]["result"]["status"] == "HOLD_MISSING_INPUT"
     assert body["market_context_status"] == "MARKET_CONTEXT_HOLD"
     assert body["metrics"]["open_price_krw"] == 70000.0
     assert body["metrics"]["last_price_krw"] == 70000.0
@@ -239,6 +246,7 @@ def test_0905_market_context_route_persists_reads_back_and_keeps_zero_order_side
     readback = client.get(f"/api/internal/market-context-runs/{run_key}", headers={"X-Internal-API-Key": "market-context-key"})
     assert readback.status_code == 200
     assert readback.json()["run_key"] == run_key
+    assert readback.json()["expected_price"] == {key: value for key, value in body["expected_price"].items() if key != "idempotent"}
     card_detail = client.get(f"/api/cards/{saved['id']}")
     assert card_detail.status_code == 200
     assert card_detail.json()["market_context"]["run_key"] == run_key
@@ -246,12 +254,14 @@ def test_0905_market_context_route_persists_reads_back_and_keeps_zero_order_side
 
     retry = client.post(f"/api/internal/cards/{saved['id']}/market-context", headers={"X-Internal-API-Key": "market-context-key"}, json={"run_key": run_key, "as_of": AS_OF})
     assert retry.status_code == 200 and retry.json()["idempotent"] is True
+    assert retry.json()["expected_price"]["idempotent"] is True
     mismatch = client.post(f"/api/internal/cards/{saved['id']}/market-context", headers={"X-Internal-API-Key": "market-context-key"}, json={"run_key": run_key, "as_of": "2026-09-07T09:06:00+09:00"})
     assert mismatch.status_code == 409
 
     db = dbmod.connect()
     try:
         assert db.execute("SELECT COUNT(*) FROM intraday_market_context_runs").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM expected_price_runs").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM intraday_market_context_observations").fetchone()[0] >= 3
         assert {table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("order_plans", "order_fills", "positions", "order_events")} == {"order_plans": 0, "order_fills": 0, "positions": 0, "order_events": 0}
     finally:
