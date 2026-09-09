@@ -52,7 +52,8 @@ class RequestBudget:
         remaining = self.deadline - self.monotonic()
         if remaining <= self.minimum_seconds * (reserve_slots + 1):
             raise RunFailure("deadline", "deadline_insufficient")
-        return min(MAX_REQUEST_TIMEOUT_SECONDS, remaining)
+        return min(MAX_REQUEST_TIMEOUT_SECONDS,
+                   remaining - self.minimum_seconds * (reserve_slots + 1))
 
 
 def load_env(path: Path) -> Dict[str, str]:

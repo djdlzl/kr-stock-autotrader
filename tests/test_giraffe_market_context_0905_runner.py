@@ -180,12 +180,36 @@ def test_request_budget_does_not_start_calls_when_expired_or_insufficient(runner
     assert calls == []
 
 
-def test_request_budget_caps_urlopen_timeout_to_remaining_time(runner, monkeypatch):
+def test_request_budget_caps_urlopen_timeout_after_mandatory_request_slot(runner, monkeypatch):
     calls = []
     monkeypatch.setattr(runner, "urlopen", lambda request, timeout: calls.append(timeout) or Response({"ok": True}))
     budget = runner.RequestBudget(deadline=105.0, monotonic=lambda: 102.5, minimum_seconds=1.0)
     assert runner.api({"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, "GET", "/safe", budget=budget) == {"ok": True}
-    assert calls == [2.5]
+    assert calls == [1.5]
+
+
+def test_request_budget_reserves_finish_and_readback_slots(runner, monkeypatch):
+    """The first request cannot consume the slots needed to finish and read back."""
+    clock = [0.0]
+    calls = []
+
+    def fake_urlopen(request, timeout):
+        calls.append((request.full_url, timeout))
+        clock[0] += timeout
+        return Response({"ok": True})
+
+    monkeypatch.setattr(runner, "urlopen", fake_urlopen)
+    budget = runner.RequestBudget(deadline=10.0, monotonic=lambda: clock[0], minimum_seconds=1.0)
+    env = {"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}
+
+    assert runner.api(env, "GET", "/work", budget=budget, reserve_slots=2) == {"ok": True}
+    assert runner.api(env, "POST", "/finish", budget=budget, reserve_slots=1) == {"ok": True}
+    assert runner.api(env, "GET", "/readback", budget=budget) == {"ok": True}
+    assert calls == [
+        ("http://giraffe.test/work", 7.0),
+        ("http://giraffe.test/finish", 1.0),
+        ("http://giraffe.test/readback", 1.0),
+    ]
 
 
 def test_execute_does_not_start_network_when_0906_deadline_budget_is_insufficient(runner, monkeypatch):
