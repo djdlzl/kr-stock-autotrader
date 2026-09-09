@@ -10,7 +10,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable
+from typing import Any, Callable, Dict, Iterable, NoReturn
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -40,9 +40,17 @@ class RequestBudget:
         self.monotonic = monotonic
         self.minimum_seconds = minimum_seconds
 
-    def timeout(self) -> float:
+    def timeout(self, *, reserve_slots: int = 0) -> float:
+        """Reserve whole minimum-duration request slots after this request.
+
+        A request is not allowed to borrow the time needed for mandatory
+        terminalization/readback requests.  The strict inequality keeps the
+        existing rule that a request needs more than one full minimum slot.
+        """
+        if reserve_slots < 0:
+            raise ValueError("reserve_slots must be non-negative")
         remaining = self.deadline - self.monotonic()
-        if remaining <= self.minimum_seconds:
+        if remaining <= self.minimum_seconds * (reserve_slots + 1):
             raise RunFailure("deadline", "deadline_insufficient")
         return min(MAX_REQUEST_TIMEOUT_SECONDS, remaining)
 
@@ -79,7 +87,7 @@ def check_prompt() -> None:
 
 
 def api(env: Dict[str, str], method: str, path: str, payload: Dict[str, Any] | None = None,
-        *, budget: RequestBudget) -> Dict[str, Any]:
+        *, budget: RequestBudget, reserve_slots: int = 0) -> Dict[str, Any]:
     body = None if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
     request = Request(
         env["GIRAFFE_URL"].rstrip("/") + path,
@@ -88,7 +96,7 @@ def api(env: Dict[str, str], method: str, path: str, payload: Dict[str, Any] | N
         headers={"X-Internal-API-Key": env["INTERNAL_API_KEY"], "Content-Type": "application/json"},
     )
     try:
-        with urlopen(request, timeout=budget.timeout()) as response:
+        with urlopen(request, timeout=budget.timeout(reserve_slots=reserve_slots)) as response:
             result = json.load(response)
     except HTTPError as exc:
         raise RunFailure("api", "http_%s" % exc.code)
@@ -124,8 +132,10 @@ def failure_report(stage: str, count: int, reasons: Iterable[str]) -> str:
     return "시장맥락 오류 stage=%s count=%s reasons=%s" % (stage, count, compact)
 
 
-def scheduler_latest(env: Dict[str, str], *, kind: str, date: str, budget: RequestBudget) -> Dict[str, Any]:
-    return api(env, "GET", "/api/internal/scheduler-runs/latest?" + urlencode({"kind": kind, "date": date}), budget=budget)
+def scheduler_latest(env: Dict[str, str], *, kind: str, date: str, budget: RequestBudget,
+                     reserve_slots: int = 0) -> Dict[str, Any]:
+    return api(env, "GET", "/api/internal/scheduler-runs/latest?" + urlencode({"kind": kind, "date": date}),
+               budget=budget, reserve_slots=reserve_slots)
 
 
 def terminal_readback_matches(latest: Dict[str, Any], *, aggregate_key: str, status: str, count: int) -> bool:
@@ -138,7 +148,8 @@ def finish_error(env: Dict[str, str], aggregate_key: str, date: str, count: int,
                  reasons: list[str], budget: RequestBudget) -> str | None:
     try:
         api(env, "POST", "/api/internal/scheduler-runs/%s/finish" % aggregate_key,
-            {"status": "error", "count": count, "detail": {"stage": stage, "reasons": reasons}}, budget=budget)
+            {"status": "error", "count": count, "detail": {"stage": stage, "reasons": reasons}},
+            budget=budget, reserve_slots=1)
         latest = scheduler_latest(env, kind="market_context", date=date, budget=budget)
         if not terminal_readback_matches(latest, aggregate_key=aggregate_key, status="error", count=count):
             return "readback_mismatch"
@@ -161,6 +172,34 @@ def raise_after_error_terminalization(env: Dict[str, str], *, aggregate_key: str
     raise failure
 
 
+def recover_ambiguous_start(env: Dict[str, str], *, aggregate_key: str, date: str,
+                            failure: RunFailure, budget: RequestBudget) -> NoReturn:
+    """Prove an uncertain start did not leave this deterministic key started."""
+    try:
+        latest = scheduler_latest(env, kind="market_context", date=date, budget=budget, reserve_slots=2)
+    except RunFailure as exc:
+        raise RunFailure(
+            "aggregate", "%s,aggregate_start_verification_failed:%s_%s" %
+            (failure.reason, exc.stage, exc.reason), failure.count,
+        )
+    if latest.get("run_key") != aggregate_key:
+        raise RunFailure(
+            "aggregate", "%s,aggregate_start_verification_failed:latest_mismatch" % failure.reason,
+            failure.count,
+        )
+    if latest.get("status") in {"done", "error"}:
+        raise failure
+    terminalization_error = finish_error(
+        env, aggregate_key, date, failure.count, "aggregate", [failure.reason], budget,
+    )
+    if terminalization_error:
+        raise RunFailure(
+            "aggregate", "%s,aggregate_start_verification_failed:%s" %
+            (failure.reason, terminalization_error), failure.count,
+        )
+    raise failure
+
+
 def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight: bool,
             monotonic: Callable[[], float] = time.monotonic) -> str:
     if source_topic != SOURCE_TOPIC:
@@ -179,15 +218,25 @@ def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight:
         deadline=monotonic() + max(0.0, (hard_deadline - current).total_seconds()),
         monotonic=monotonic,
     )
-    latest = scheduler_latest(env, kind="card", date=date, budget=budget)
+    # The card prerequisite must leave a start slot and three ambiguous-start
+    # recovery slots (latest, finish(error), final latest).
+    latest = scheduler_latest(env, kind="card", date=date, budget=budget, reserve_slots=4)
     if latest.get("status") != "done":
         raise RunFailure("cards", "same_day_card_run_not_done")
     ids = card_ids(latest)
     aggregate_key = run_key(date)
-    started = api(env, "POST", "/api/internal/scheduler-runs/%s/start" % aggregate_key,
-                  {"kind": "market_context"}, budget=budget)
+    try:
+        # A start response can be lost after persistence.  Leave latest,
+        # finish(error), and final latest slots before attempting it.
+        started = api(env, "POST", "/api/internal/scheduler-runs/%s/start" % aggregate_key,
+                      {"kind": "market_context"}, budget=budget, reserve_slots=3)
+    except RunFailure as exc:
+        recover_ambiguous_start(
+            env, aggregate_key=aggregate_key, date=date,
+            failure=RunFailure("aggregate", "aggregate_start_%s" % exc.reason), budget=budget,
+        )
     if started.get("kind") != "market_context" or started.get("run_key") != aggregate_key:
-        raise_after_error_terminalization(
+        recover_ambiguous_start(
             env, aggregate_key=aggregate_key, date=date,
             failure=RunFailure("aggregate", "aggregate_start_invalid"), budget=budget,
         )
@@ -197,8 +246,9 @@ def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight:
         key = card_run_key(date, card_id)
         try:
             api(env, "POST", "/api/internal/cards/%s/market-context" % card_id,
-                {"run_key": key, "as_of": as_of}, budget=budget)
-            readback = api(env, "GET", "/api/internal/market-context-runs/%s" % key, budget=budget)
+                {"run_key": key, "as_of": as_of}, budget=budget, reserve_slots=2)
+            readback = api(env, "GET", "/api/internal/market-context-runs/%s" % key,
+                           budget=budget, reserve_slots=2)
             if (readback.get("run_key") != key or readback.get("card_id") != card_id
                     or readback.get("requested_as_of") != as_of
                     or readback.get("source_topic") != API_SOURCE_TOPIC):
@@ -214,7 +264,8 @@ def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight:
         )
     try:
         api(env, "POST", "/api/internal/scheduler-runs/%s/finish" % aggregate_key,
-            {"status": "done", "count": verified, "detail": {"cards": {"ids": ids}, "as_of": as_of}}, budget=budget)
+            {"status": "done", "count": verified, "detail": {"cards": {"ids": ids}, "as_of": as_of}},
+            budget=budget, reserve_slots=1)
         fresh = scheduler_latest(env, kind="market_context", date=date, budget=budget)
         if not terminal_readback_matches(fresh, aggregate_key=aggregate_key, status="done", count=verified):
             raise RunFailure("aggregate", "aggregate_done_readback_mismatch", verified)

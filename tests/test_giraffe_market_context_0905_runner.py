@@ -231,3 +231,155 @@ def test_preflight_outside_window_makes_no_network_requests(runner, env_file, mo
     outside = datetime.fromisoformat("2026-09-09T08:00:00+09:00")
     assert runner.main(["--env-file", str(env_file), "--preflight"], now=outside) == 0
     assert capsys.readouterr().out.strip() == "시장맥락 사전점검 완료"
+
+
+def test_monotonic_mid_card_exhaustion_verifies_aggregate_error(runner, monkeypatch):
+    """A card request cannot spend the two slots needed to terminalize."""
+    clock = [0.0]
+    aggregate: dict[str, str | None] = {"status": None}
+    calls = []
+    key = "market-context-2026-09-09-0905-kst-topic7923"
+
+    def fake_urlopen(request, timeout):
+        path = request.full_url.replace("http://giraffe.test", "")
+        payload = json.loads(request.data) if request.data else None
+        calls.append(path)
+        if path.startswith("/api/internal/scheduler-runs/latest?"):
+            if "kind=card" in path:
+                return Response(card_latest((101,)))
+            return Response({"run_key": key, "status": aggregate["status"], "detail": {"count": 0}})
+        if path.endswith("/start"):
+            aggregate["status"] = "started"
+            clock[0] = 4.0  # Only error finish + fresh latest remain.
+            return Response({"run_key": key, "kind": "market_context", "status": "started"})
+        if path.endswith("/finish"):
+            aggregate["status"] = payload["status"]
+            return Response({"status": payload["status"]})
+        pytest.fail(path)
+
+    monkeypatch.setattr(runner, "urlopen", fake_urlopen)
+    near = datetime.fromisoformat("2026-09-09T09:05:53+09:00")
+    with pytest.raises(runner.RunFailure, match="deadline_insufficient"):
+        runner.execute(env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=near,
+                       source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: clock[0])
+    assert aggregate["status"] == "error"
+    assert not any("/cards/" in path for path in calls)
+
+
+def test_monotonic_done_needs_fresh_readback_or_never_leaves_started(runner, monkeypatch):
+    """The done finish cannot consume the last slot reserved for its readback."""
+    clock = [0.0]
+    aggregate: dict[str, str | None] = {"status": None}
+    key = "market-context-2026-09-09-0905-kst-topic7923"
+    latest_calls = []
+
+    def fake_urlopen(request, timeout):
+        path = request.full_url.replace("http://giraffe.test", "")
+        payload = json.loads(request.data) if request.data else None
+        if path.startswith("/api/internal/scheduler-runs/latest?"):
+            latest_calls.append(path)
+            if "kind=card" in path:
+                return Response(card_latest((101,)))
+            return Response({"run_key": key, "status": aggregate["status"], "detail": {"count": 1}})
+        if path.endswith("/start"):
+            aggregate["status"] = "started"
+            return Response({"run_key": key, "kind": "market_context", "status": "started"})
+        if "/cards/" in path:
+            return Response({"run_key": payload["run_key"]})
+        if "/market-context-runs/" in path:
+            return Response({"run_key": path.rsplit("/", 1)[1], "card_id": 101,
+                             "requested_as_of": "2026-09-09T09:05:00+09:00", "source_topic": "mac:7923"})
+        if path.endswith("/finish"):
+            aggregate["status"] = payload["status"]
+            clock[0] = 7.0  # Done was sent; its fresh readback has no slot.
+            return Response({"status": payload["status"]})
+        pytest.fail(path)
+
+    monkeypatch.setattr(runner, "urlopen", fake_urlopen)
+    near = datetime.fromisoformat("2026-09-09T09:05:53+09:00")
+    with pytest.raises(runner.RunFailure, match="error_terminalization_failed:deadline_deadline_insufficient"):
+        runner.execute(env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=near,
+                       source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: clock[0])
+    assert aggregate["status"] == "done"  # terminal, never silently left started
+    assert len(latest_calls) == 1  # no unbudgeted post-done readback was started
+
+
+def test_monotonic_slot_accounting_success_has_fresh_done_readback(runner, monkeypatch):
+    """One-slot fake requests fit exactly only when every terminal slot survives."""
+    clock = [0.0]
+    aggregate: dict[str, str | None] = {"status": None}
+    key = "market-context-2026-09-09-0905-kst-topic7923"
+    market_latest = []
+
+    def fake_urlopen(request, timeout):
+        path = request.full_url.replace("http://giraffe.test", "")
+        payload = json.loads(request.data) if request.data else {}
+        clock[0] += 1.0
+        if path.startswith("/api/internal/scheduler-runs/latest?"):
+            if "kind=card" in path:
+                return Response(card_latest((101,)))
+            market_latest.append(aggregate["status"])
+            return Response({"run_key": key, "status": aggregate["status"], "detail": {"count": 1}})
+        if path.endswith("/start"):
+            aggregate["status"] = "started"
+            return Response({"run_key": key, "kind": "market_context", "status": "started"})
+        if "/cards/" in path:
+            return Response({"run_key": payload["run_key"]})
+        if "/market-context-runs/" in path:
+            return Response({"run_key": path.rsplit("/", 1)[1], "card_id": 101,
+                             "requested_as_of": "2026-09-09T09:05:00+09:00", "source_topic": "mac:7923"})
+        if path.endswith("/finish"):
+            aggregate["status"] = payload["status"]
+            return Response({"status": payload["status"]})
+        pytest.fail(path)
+
+    monkeypatch.setattr(runner, "urlopen", fake_urlopen)
+    near = datetime.fromisoformat("2026-09-09T09:05:53+09:00")
+    assert runner.execute(env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=near,
+                          source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: clock[0]) == "시장맥락 완료 count=1"
+    assert aggregate["status"] == "done"
+    assert market_latest == ["done"]
+
+
+def test_ambiguous_start_is_recovered_to_verified_error(runner, monkeypatch):
+    """A lost start response is checked by deterministic key and terminalized."""
+    from urllib.error import URLError
+
+    aggregate: dict[str, str | None] = {"status": None}
+    key = "market-context-2026-09-09-0905-kst-topic7923"
+    calls = []
+
+    def fake_urlopen(request, timeout):
+        path = request.full_url.replace("http://giraffe.test", "")
+        payload = json.loads(request.data) if request.data else None
+        calls.append(path)
+        if path.startswith("/api/internal/scheduler-runs/latest?"):
+            if "kind=card" in path:
+                return Response(card_latest((101,)))
+            return Response({"run_key": key, "status": aggregate["status"], "detail": {"count": 0}})
+        if path.endswith("/start"):
+            aggregate["status"] = "started"  # persisted before response loss
+            raise URLError("lost response")
+        if path.endswith("/finish"):
+            aggregate["status"] = payload["status"]
+            return Response({"status": payload["status"]})
+        pytest.fail(path)
+
+    monkeypatch.setattr(runner, "urlopen", fake_urlopen)
+    with pytest.raises(runner.RunFailure, match="aggregate_start_request_failed"):
+        runner.execute(env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=now(),
+                       source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: 0.0)
+    assert aggregate["status"] == "error"
+    assert calls[-2].endswith("/finish")
+    assert "kind=market_context" in calls[-1]
+
+
+def test_monotonic_reserve_refuses_before_aggregate_start(runner, monkeypatch):
+    """The prerequisite lookup leaves start ambiguity recovery slots intact."""
+    calls = []
+    monkeypatch.setattr(runner, "urlopen", lambda *args, **kwargs: calls.append(args))
+    near = datetime.fromisoformat("2026-09-09T09:05:55+09:00")
+    with pytest.raises(runner.RunFailure, match="deadline_insufficient"):
+        runner.execute(env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=near,
+                       source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: 100.0)
+    assert calls == []
