@@ -155,6 +155,48 @@ def test_premarket_canary_timeout_fails_closed_before_open():
     assert result["diagnostic"] == {"category": "provider", "attempt_count": 0, "readiness": "premarket_deadline"}
 
 
+@pytest.mark.parametrize("current", [
+    datetime(2026, 9, 2, 9, tzinfo=KST),
+    datetime(2026, 9, 3, 9, 1, tzinfo=KST),
+])
+def test_premarket_deadline_is_absolute_not_tied_to_as_of_date(current):
+    from kr_stock_autotrader.market_data import build_premarket_snapshot_with_retry
+    calls = []
+    result = build_premarket_snapshot_with_retry(
+        "005930", datetime(2026, 9, 2, 8, tzinfo=KST),
+        lambda *args: calls.append(args), now=lambda: current, sleep=lambda _: None)
+    assert calls == []
+    assert result["diagnostic"] == {"category": "provider", "attempt_count": 0, "readiness": "premarket_deadline"}
+
+
+def test_cross_date_or_naive_as_of_never_starts_provider_requests():
+    from kr_stock_autotrader.market_data import build_premarket_snapshot_with_retry
+    for as_of in (datetime(2026, 9, 1, 8, tzinfo=KST), datetime(2026, 9, 2, 8)):
+        calls = []
+        result = build_premarket_snapshot_with_retry(
+            "005930", as_of, lambda *args: calls.append(args),
+            now=lambda: datetime(2026, 9, 2, 8, 1, tzinfo=KST), sleep=lambda _: None)
+        assert calls == []
+        assert result["diagnostic"]["attempt_count"] == 0
+        assert result["diagnostic"]["readiness"] == "invalid_as_of"
+
+
+@pytest.mark.parametrize("stock", [
+    lambda as_of: official_snapshot([bar(as_of.date(), 130)] + history()),
+    lambda as_of: official_snapshot([bar(as_of.date() - timedelta(days=1), 130)]),
+    lambda as_of: {"not": "a daily snapshot"},
+])
+def test_stock_canary_fully_validates_before_benchmark(stock):
+    from kr_stock_autotrader.market_data import build_premarket_snapshot
+    as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
+    calls = []
+    def provider(symbol, *_):
+        calls.append(symbol)
+        return stock(as_of) if symbol == "005930" else official_snapshot()
+    assert build_premarket_snapshot("005930", as_of, provider)["status"] == "unavailable"
+    assert calls == ["005930"]
+
+
 def test_same_day_bar_is_a_fail_closed_provider_error():
     from kr_stock_autotrader.market_data import build_premarket_snapshot
     as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
@@ -247,8 +289,9 @@ def test_snapshot_api_missing_credentials_is_safe_unavailable(monkeypatch):
 
 def test_material_3_after_close_0800_snapshot_filter_card_readback_persists(monkeypatch):
     from fastapi.testclient import TestClient
-    from kr_stock_autotrader import api, db as dbmod
+    from kr_stock_autotrader import api, db as dbmod, market_data
     thresholds(monkeypatch); monkeypatch.setenv("INTERNAL_API_KEY", "test-key")
+    monkeypatch.setattr(market_data, "now_kst", lambda: datetime(2026, 9, 2, 8, tzinfo=KST))
     path = tempfile.mktemp(suffix=".db"); monkeypatch.setattr(dbmod, "DATABASE_PATH", path)
     monkeypatch.setattr(api.app.state, "kis_daily_snapshot_provider", lambda *_: official_snapshot(), raising=False)
     client = TestClient(api.app); headers={"X-Internal-API-Key":"test-key"}

@@ -34,7 +34,7 @@
 - `collected_at`이 과거 날짜인 미처리 evidence는 자동으로 섞지 않는다. 별도 복구 run에서만 처리한다.
 - 같은 evidence version, filter lineage, prompt version/hash로 이미 카드가 있으면 재생성하지 않는다.
 - 처리 대상이 0건이면 두 API readback 정상 여부를 확인한 뒤 `done`, count=0으로 종료한다.
-- `scheduler-start`가 기존 terminal run을 `idempotent=true`로 반환하면 그 run의 stored count/detail을 readback하고 즉시 종료한다. 기존 `started` run은 같은 `run_key`로 재개하되, 마지막에는 반드시 terminal `scheduler-finish`를 한 번 호출한다; `started` residue를 남기지 않는다.
+- `scheduler-start`가 기존 terminal run을 `idempotent=true`로 반환하면 그 run의 stored count/detail을 readback하고 즉시 종료한다. 기존 `started` run은 같은 `run_key`로 재개한다. `scheduler-start` 성공 직후부터 전체 처리 본문을 `try/finally`로 감싸고, 예외·readback 실패·재개 실패를 포함한 모든 비terminal 경로에서 allowlisted secret-free `scheduler-finish ... error`를 한 번 호출한다; `started` residue를 남기지 않는다. terminal finish 뒤 idempotent start/finish readback으로 count/detail/status를 확인한다.
 
 ## scheduler 날짜 축 문서화
 
