@@ -7,9 +7,10 @@ import hashlib
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Callable, Dict, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -17,14 +18,33 @@ from zoneinfo import ZoneInfo
 
 KST = ZoneInfo("Asia/Seoul")
 SOURCE_TOPIC = "telegram:mac:7923"
+API_SOURCE_TOPIC = "mac:7923"
 PROMPT_SHA256 = "f7a1c1f16e168577222295af43aa05ca5ceaa6a7fc3d20b6a116b222e6fc3a7c"
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "giraffe-market-context-scheduler-v1.md"
+MIN_REQUEST_BUDGET_SECONDS = 1.0
+MAX_REQUEST_TIMEOUT_SECONDS = 20.0
 
 
 class RunFailure(Exception):
     def __init__(self, stage: str, reason: str, count: int = 0):
         self.stage, self.reason, self.count = stage, reason, count
         super().__init__(reason)
+
+
+class RequestBudget:
+    """Monotonic budget that prevents starting a request too close to 09:06."""
+
+    def __init__(self, *, deadline: float, monotonic: Callable[[], float] = time.monotonic,
+                 minimum_seconds: float = MIN_REQUEST_BUDGET_SECONDS):
+        self.deadline = deadline
+        self.monotonic = monotonic
+        self.minimum_seconds = minimum_seconds
+
+    def timeout(self) -> float:
+        remaining = self.deadline - self.monotonic()
+        if remaining <= self.minimum_seconds:
+            raise RunFailure("deadline", "deadline_insufficient")
+        return min(MAX_REQUEST_TIMEOUT_SECONDS, remaining)
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -58,7 +78,8 @@ def check_prompt() -> None:
         raise RunFailure("prompt", "prompt_sha256_mismatch")
 
 
-def api(env: Dict[str, str], method: str, path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def api(env: Dict[str, str], method: str, path: str, payload: Dict[str, Any] | None = None,
+        *, budget: RequestBudget) -> Dict[str, Any]:
     body = None if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
     request = Request(
         env["GIRAFFE_URL"].rstrip("/") + path,
@@ -67,7 +88,7 @@ def api(env: Dict[str, str], method: str, path: str, payload: Dict[str, Any] | N
         headers={"X-Internal-API-Key": env["INTERNAL_API_KEY"], "Content-Type": "application/json"},
     )
     try:
-        with urlopen(request, timeout=20) as response:
+        with urlopen(request, timeout=budget.timeout()) as response:
             result = json.load(response)
     except HTTPError as exc:
         raise RunFailure("api", "http_%s" % exc.code)
@@ -103,15 +124,45 @@ def failure_report(stage: str, count: int, reasons: Iterable[str]) -> str:
     return "시장맥락 오류 stage=%s count=%s reasons=%s" % (stage, count, compact)
 
 
-def finish_error(env: Dict[str, str], aggregate_key: str, count: int, stage: str, reasons: list[str]) -> None:
+def scheduler_latest(env: Dict[str, str], *, kind: str, date: str, budget: RequestBudget) -> Dict[str, Any]:
+    return api(env, "GET", "/api/internal/scheduler-runs/latest?" + urlencode({"kind": kind, "date": date}), budget=budget)
+
+
+def terminal_readback_matches(latest: Dict[str, Any], *, aggregate_key: str, status: str, count: int) -> bool:
+    detail = latest.get("detail")
+    return (latest.get("run_key") == aggregate_key and latest.get("status") == status
+            and isinstance(detail, dict) and detail.get("count") == count)
+
+
+def finish_error(env: Dict[str, str], aggregate_key: str, date: str, count: int, stage: str,
+                 reasons: list[str], budget: RequestBudget) -> str | None:
     try:
         api(env, "POST", "/api/internal/scheduler-runs/%s/finish" % aggregate_key,
-            {"status": "error", "count": count, "detail": {"stage": stage, "reasons": reasons}})
-    except RunFailure:
-        pass
+            {"status": "error", "count": count, "detail": {"stage": stage, "reasons": reasons}}, budget=budget)
+        latest = scheduler_latest(env, kind="market_context", date=date, budget=budget)
+        if not terminal_readback_matches(latest, aggregate_key=aggregate_key, status="error", count=count):
+            return "readback_mismatch"
+    except RunFailure as exc:
+        return "%s_%s" % (exc.stage, exc.reason)
+    return None
 
 
-def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight: bool) -> str:
+def raise_after_error_terminalization(env: Dict[str, str], *, aggregate_key: str, date: str,
+                                      failure: RunFailure, budget: RequestBudget) -> None:
+    terminalization_error = finish_error(
+        env, aggregate_key, date, failure.count, failure.stage, [failure.reason], budget,
+    )
+    if terminalization_error:
+        raise RunFailure(
+            failure.stage,
+            "%s,error_terminalization_failed:%s" % (failure.reason, terminalization_error),
+            failure.count,
+        )
+    raise failure
+
+
+def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight: bool,
+            monotonic: Callable[[], float] = time.monotonic) -> str:
     if source_topic != SOURCE_TOPIC:
         raise RunFailure("topic", "source_topic_not_allowed")
     check_prompt()
@@ -123,34 +174,52 @@ def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight:
 
     date = current.date().isoformat()
     as_of = date + "T09:05:00+09:00"
-    latest = api(env, "GET", "/api/internal/scheduler-runs/latest?" + urlencode({"kind": "card", "date": date}))
+    hard_deadline = current.replace(hour=9, minute=6, second=0, microsecond=0)
+    budget = RequestBudget(
+        deadline=monotonic() + max(0.0, (hard_deadline - current).total_seconds()),
+        monotonic=monotonic,
+    )
+    latest = scheduler_latest(env, kind="card", date=date, budget=budget)
     if latest.get("status") != "done":
         raise RunFailure("cards", "same_day_card_run_not_done")
     ids = card_ids(latest)
     aggregate_key = run_key(date)
-    started = api(env, "POST", "/api/internal/scheduler-runs/%s/start" % aggregate_key, {"kind": "market_context"})
+    started = api(env, "POST", "/api/internal/scheduler-runs/%s/start" % aggregate_key,
+                  {"kind": "market_context"}, budget=budget)
     if started.get("kind") != "market_context" or started.get("run_key") != aggregate_key:
-        finish_error(env, aggregate_key, 0, "aggregate", ["aggregate_start_invalid"])
-        raise RunFailure("aggregate", "aggregate_start_invalid")
+        raise_after_error_terminalization(
+            env, aggregate_key=aggregate_key, date=date,
+            failure=RunFailure("aggregate", "aggregate_start_invalid"), budget=budget,
+        )
 
     verified, reasons = 0, []
     for card_id in ids:
         key = card_run_key(date, card_id)
         try:
-            api(env, "POST", "/api/internal/cards/%s/market-context" % card_id, {"run_key": key, "as_of": as_of})
-            readback = api(env, "GET", "/api/internal/market-context-runs/%s" % key)
+            api(env, "POST", "/api/internal/cards/%s/market-context" % card_id,
+                {"run_key": key, "as_of": as_of}, budget=budget)
+            readback = api(env, "GET", "/api/internal/market-context-runs/%s" % key, budget=budget)
             if (readback.get("run_key") != key or readback.get("card_id") != card_id
-                    or readback.get("requested_as_of") != as_of):
+                    or readback.get("requested_as_of") != as_of
+                    or readback.get("source_topic") != API_SOURCE_TOPIC):
                 raise RunFailure("readback", "card_%s_mismatch" % card_id)
             verified += 1
         except RunFailure as exc:
             reasons.append(exc.reason)
 
     if verified != len(ids):
-        finish_error(env, aggregate_key, verified, "cards", reasons)
-        raise RunFailure("cards", ",".join(reasons), verified)
-    api(env, "POST", "/api/internal/scheduler-runs/%s/finish" % aggregate_key,
-        {"status": "done", "count": verified, "detail": {"cards": {"ids": ids}, "as_of": as_of}})
+        raise_after_error_terminalization(
+            env, aggregate_key=aggregate_key, date=date,
+            failure=RunFailure("cards", ",".join(reasons), verified), budget=budget,
+        )
+    try:
+        api(env, "POST", "/api/internal/scheduler-runs/%s/finish" % aggregate_key,
+            {"status": "done", "count": verified, "detail": {"cards": {"ids": ids}, "as_of": as_of}}, budget=budget)
+        fresh = scheduler_latest(env, kind="market_context", date=date, budget=budget)
+        if not terminal_readback_matches(fresh, aggregate_key=aggregate_key, status="done", count=verified):
+            raise RunFailure("aggregate", "aggregate_done_readback_mismatch", verified)
+    except RunFailure as exc:
+        raise_after_error_terminalization(env, aggregate_key=aggregate_key, date=date, failure=exc, budget=budget)
     return "시장맥락 완료 count=%s" % verified
 
 

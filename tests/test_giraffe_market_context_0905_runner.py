@@ -47,9 +47,11 @@ class Response:
         return json.dumps(self.payload).encode()
 
 
-def install_network(monkeypatch, runner, *, ids=(101, 202), missing_key=None, failed_card=None, starts=None):
+def install_network(monkeypatch, runner, *, ids=(101, 202), missing_key=None, failed_card=None, starts=None,
+                    latest_payloads=None, readback_source_topic="mac:7923", fail_finish=False):
     calls = []
     starts = starts if starts is not None else []
+    latest_payloads = list(latest_payloads or [])
 
     def fake_urlopen(request, timeout):
         path = request.full_url.replace("http://giraffe.test", "")
@@ -57,6 +59,8 @@ def install_network(monkeypatch, runner, *, ids=(101, 202), missing_key=None, fa
         payload = json.loads(request.data) if request.data else None
         calls.append((method, path, payload, dict(request.header_items())))
         if path.startswith("/api/internal/scheduler-runs/latest?"):
+            if latest_payloads:
+                return Response(latest_payloads.pop(0))
             return Response(card_latest(ids))
         if path.endswith("/start"):
             starts.append(payload)
@@ -73,8 +77,11 @@ def install_network(monkeypatch, runner, *, ids=(101, 202), missing_key=None, fa
                 from urllib.error import HTTPError
                 raise HTTPError(request.full_url, 404, "missing", None, None)
             card_id = int(key.rsplit("-", 1)[1])
-            return Response({"run_key": key, "card_id": card_id, "requested_as_of": "2026-09-09T09:05:00+09:00"})
+            return Response({"run_key": key, "card_id": card_id, "requested_as_of": "2026-09-09T09:05:00+09:00", "source_topic": readback_source_topic})
         if path.endswith("/finish"):
+            if fail_finish:
+                from urllib.error import HTTPError
+                raise HTTPError(request.full_url, 503, "unavailable", None, None)
             return Response({"status": payload["status"]})
         raise AssertionError(path)
 
@@ -83,7 +90,11 @@ def install_network(monkeypatch, runner, *, ids=(101, 202), missing_key=None, fa
 
 
 def test_success_uses_authoritative_cards_and_exact_readbacks(runner, env_file, monkeypatch, capsys):
-    calls = install_network(monkeypatch, runner)
+    aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
+    calls = install_network(monkeypatch, runner, latest_payloads=[
+        card_latest(),
+        {"run_key": aggregate_key, "status": "done", "detail": {"count": 2}},
+    ])
     assert runner.main(["--source-topic", "telegram:mac:7923", "--env-file", str(env_file)], now=now()) == 0
     assert capsys.readouterr().out.strip() == "시장맥락 완료 count=2"
     posted = [(path, payload) for method, path, payload, _ in calls if method == "POST" and "/cards/" in path]
@@ -95,29 +106,105 @@ def test_success_uses_authoritative_cards_and_exact_readbacks(runner, env_file, 
         "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-101",
         "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-202",
     ]
-    assert calls[-1][2]["status"] == "done"
+    assert calls[-2][2]["status"] == "done"
+    assert calls[-1][1] == "/api/internal/scheduler-runs/latest?kind=market_context&date=2026-09-09"
+    card_steps = [(method, path) for method, path, _, _ in calls if "/cards/" in path or "/market-context-runs/" in path]
+    assert card_steps == [
+        ("POST", "/api/internal/cards/101/market-context"),
+        ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-101"),
+        ("POST", "/api/internal/cards/202/market-context"),
+        ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-202"),
+    ]
+
+
+def test_card_readback_requires_api_canonical_source_topic(runner, env_file, monkeypatch, capsys):
+    aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
+    calls = install_network(monkeypatch, runner, ids=(101,), readback_source_topic="telegram:mac:7923", latest_payloads=[
+        card_latest((101,)),
+        {"run_key": aggregate_key, "status": "error", "detail": {"count": 0}},
+    ])
+    assert runner.main(["--source-topic", "telegram:mac:7923", "--env-file", str(env_file)], now=now()) == 1
+    assert "card_101_mismatch" in capsys.readouterr().out
+    assert calls[-1][1] == "/api/internal/scheduler-runs/latest?kind=market_context&date=2026-09-09"
 
 
 def test_missing_card_run_finishes_aggregate_error(runner, env_file, monkeypatch, capsys):
     missing = "market-context-2026-09-09-0905-kst-topic7923-card-202"
-    calls = install_network(monkeypatch, runner, missing_key=missing)
+    aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
+    calls = install_network(monkeypatch, runner, missing_key=missing, latest_payloads=[
+        card_latest(),
+        {"run_key": aggregate_key, "status": "error", "detail": {"count": 1}},
+    ])
     assert runner.main(["--source-topic", "telegram:mac:7923", "--env-file", str(env_file)], now=now()) == 1
     assert "stage=cards count=1 reasons=http_404" in capsys.readouterr().out
-    assert calls[-1][1].endswith("/finish")
-    assert calls[-1][2]["status"] == "error"
-    assert calls[-1][2]["count"] == 1
+    assert calls[-2][1].endswith("/finish")
+    assert calls[-2][2]["status"] == "error"
+    assert calls[-2][2]["count"] == 1
+    assert calls[-1][1] == "/api/internal/scheduler-runs/latest?kind=market_context&date=2026-09-09"
 
 
 def test_partial_failure_finishes_aggregate_error(runner, env_file, monkeypatch, capsys):
-    calls = install_network(monkeypatch, runner, failed_card=202)
+    aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
+    calls = install_network(monkeypatch, runner, failed_card=202, latest_payloads=[
+        card_latest(),
+        {"run_key": aggregate_key, "status": "error", "detail": {"count": 1}},
+    ])
     assert runner.main(["--source-topic", "telegram:mac:7923", "--env-file", str(env_file)], now=now()) == 1
     assert "stage=cards count=1 reasons=http_409" in capsys.readouterr().out
-    assert calls[-1][2]["status"] == "error"
+    assert calls[-2][2]["status"] == "error"
+
+
+def test_error_terminalization_failure_is_reported(runner, env_file, monkeypatch, capsys):
+    calls = install_network(monkeypatch, runner, failed_card=101, fail_finish=True)
+    assert runner.main(["--source-topic", "telegram:mac:7923", "--env-file", str(env_file)], now=now()) == 1
+    assert "error_terminalization_failed:api_http_503" in capsys.readouterr().out
+    assert calls[-1][1].endswith("/finish")
+
+
+def test_error_terminalization_readback_mismatch_is_reported(runner, env_file, monkeypatch, capsys):
+    calls = install_network(monkeypatch, runner, ids=(101,), failed_card=101, latest_payloads=[
+        card_latest((101,)), {"run_key": "wrong", "status": "error", "detail": {"count": 0}},
+    ])
+    assert runner.main(["--source-topic", "telegram:mac:7923", "--env-file", str(env_file)], now=now()) == 1
+    assert "error_terminalization_failed:readback_mismatch" in capsys.readouterr().out
+    assert calls[-1][1] == "/api/internal/scheduler-runs/latest?kind=market_context&date=2026-09-09"
+
+
+@pytest.mark.parametrize("current", [100.0, 100.5, 101.0])
+def test_request_budget_does_not_start_calls_when_expired_or_insufficient(runner, monkeypatch, current):
+    calls = []
+    monkeypatch.setattr(runner, "urlopen", lambda *args, **kwargs: calls.append((args, kwargs)))
+    budget = runner.RequestBudget(deadline=101.0, monotonic=lambda: current, minimum_seconds=1.0)
+    with pytest.raises(runner.RunFailure, match="deadline_insufficient"):
+        runner.api({"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, "GET", "/safe", budget=budget)
+    assert calls == []
+
+
+def test_request_budget_caps_urlopen_timeout_to_remaining_time(runner, monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner, "urlopen", lambda request, timeout: calls.append(timeout) or Response({"ok": True}))
+    budget = runner.RequestBudget(deadline=105.0, monotonic=lambda: 102.5, minimum_seconds=1.0)
+    assert runner.api({"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, "GET", "/safe", budget=budget) == {"ok": True}
+    assert calls == [2.5]
+
+
+def test_execute_does_not_start_network_when_0906_deadline_budget_is_insufficient(runner, monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner, "urlopen", lambda *args, **kwargs: calls.append((args, kwargs)))
+    near_boundary = datetime.fromisoformat("2026-09-09T09:05:59.500000+09:00")
+    with pytest.raises(runner.RunFailure, match="deadline_insufficient"):
+        runner.execute(env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=near_boundary,
+                       source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: 100.0)
+    assert calls == []
 
 
 def test_idempotent_rerun_reuses_deterministic_keys(runner, env_file, monkeypatch, capsys):
     starts = []
-    calls = install_network(monkeypatch, runner, ids=(101,), starts=starts)
+    aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
+    calls = install_network(monkeypatch, runner, ids=(101,), starts=starts, latest_payloads=[
+        card_latest((101,)), {"run_key": aggregate_key, "status": "done", "detail": {"count": 1}},
+        card_latest((101,)), {"run_key": aggregate_key, "status": "done", "detail": {"count": 1}},
+    ])
     args = ["--source-topic", "telegram:mac:7923", "--env-file", str(env_file)]
     assert runner.main(args, now=now()) == 0
     assert runner.main(args, now=now()) == 0
