@@ -210,6 +210,20 @@ def connect() -> sqlite3.Connection:
       result_json TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS expected_price_runs (
+      id INTEGER PRIMARY KEY,
+      run_key TEXT NOT NULL UNIQUE,
+      source_topic TEXT NOT NULL,
+      card_id INTEGER NOT NULL REFERENCES decision_cards(id),
+      evidence_id INTEGER NOT NULL REFERENCES material_evidence(id),
+      filter_id INTEGER NOT NULL REFERENCES deterministic_filter_results(id),
+      requested_as_of TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('COMPUTED','HOLD_MISSING_INPUT','HOLD_INVALID_INPUT','CALCULATION_ERROR')),
+      input_sha256 TEXT NOT NULL CHECK(length(input_sha256)=64),
+      result_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_expected_price_runs_card ON expected_price_runs(card_id,id DESC);
     CREATE TABLE IF NOT EXISTS intraday_market_context_observations (
       id INTEGER PRIMARY KEY,
       run_id INTEGER NOT NULL REFERENCES intraday_market_context_runs(id),

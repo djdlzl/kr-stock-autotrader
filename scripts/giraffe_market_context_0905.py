@@ -275,15 +275,69 @@ def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight:
     return "시장맥락 완료 count=%s" % verified
 
 
+def manual_expected_price(db_path: Path, artifact: Path, *, now: datetime) -> dict[str, Any]:
+    """Explicit out-of-window local-fixture path: no HTTP/KIS/backfill calls."""
+    root = str(Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    if not db_path.is_file():
+        raise RunFailure("manual", "local_fixture_db_missing")
+    from kr_stock_autotrader import db as dbmod
+    from kr_stock_autotrader.decision_cards import evidence_detail, filter_detail
+    from kr_stock_autotrader.expected_price_runtime import evaluate_and_persist_expected_price
+    dbmod.DATABASE_PATH = str(db_path)
+    db = dbmod.connect()
+    try:
+        cards = [dict(row) for row in db.execute("SELECT * FROM decision_cards ORDER BY id")]
+        counts = {"target": len(cards), "computed": 0, "hold_missing_input": 0, "hold_invalid_input": 0,
+                  "calculation_error": 0, "persisted": 0, "readback": 0}
+        results = []
+        for card in cards:
+            key = "expected-price-manual-%s-card-%s" % (now.date().isoformat(), card["id"])
+            result = evaluate_and_persist_expected_price(db=db, run_key=key, card=card,
+                evidence=evidence_detail(db, card["evidence_id"]), filter_result=filter_detail(db, card["filter_id"]),
+                requested_as_of=now.isoformat())
+            status = result["status"]
+            counts[{"COMPUTED":"computed", "HOLD_MISSING_INPUT":"hold_missing_input", "HOLD_INVALID_INPUT":"hold_invalid_input", "CALCULATION_ERROR":"calculation_error"}[status]] += 1
+            counts["persisted"] += 1
+            row = db.execute("SELECT result_json FROM expected_price_runs WHERE run_key=?", (key,)).fetchone()
+            if row and json.loads(row["result_json"]) == result["result"]:
+                counts["readback"] += 1
+            results.append({"card_id": card["id"], "status": status, "run_key": key})
+        report = {"mode":"manual_out_of_window_local_fixture", "network_calls":0, "kis_calls":0, "intraday_calls":0,
+                  "backfill_calls":0, "counts":counts, "results":results,
+                  "status":"error" if counts["calculation_error"] or counts["persisted"] != counts["target"] or counts["readback"] != counts["target"] else "done"}
+    finally:
+        db.close()
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+    return report
+
+
 def main(argv: list[str] | None = None, *, now: datetime | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-topic", default=SOURCE_TOPIC)
     parser.add_argument("--env-file", type=Path, default=Path.home() / ".hermes" / ".env")
     parser.add_argument("--preflight", action="store_true", help="local guard check only; makes no API requests")
+    parser.add_argument("--manual-out-of-window", action="store_true", help="require explicit local-fixture, no-network expected-price evaluation")
+    parser.add_argument("--manual-db", type=Path, help="local fixture SQLite database only")
+    parser.add_argument("--manual-artifact", type=Path, help="run-local JSON report path")
     args = parser.parse_args(argv)
+    current = now or datetime.now(KST)
+    if args.manual_out_of_window:
+        if not args.manual_db or not args.manual_artifact:
+            print(failure_report("manual", 0, ["manual_db_and_artifact_required"]))
+            return 1
+        try:
+            report = manual_expected_price(args.manual_db, args.manual_artifact, now=current.astimezone(KST))
+        except RunFailure as exc:
+            print(failure_report(exc.stage, exc.count, [exc.reason]))
+            return 1
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return 0 if report["status"] == "done" else 1
     try:
         env = load_env(args.env_file)
-        report = execute(env=env, now=now or datetime.now(KST), source_topic=args.source_topic, preflight=args.preflight)
+        report = execute(env=env, now=current, source_topic=args.source_topic, preflight=args.preflight)
     except RunFailure as exc:
         print(failure_report(exc.stage, exc.count, [exc.reason]))
         return 1

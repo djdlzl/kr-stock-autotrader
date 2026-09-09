@@ -36,6 +36,7 @@ from .intraday_market_context import (
 from .market_data import build_premarket_snapshot, filter_inputs_from_snapshot
 from .live_dry_run import existing_live_dry_run_receipt, persist_live_dry_run
 from .event_scenarios import create as create_scenario_set, detail as scenario_set_detail, observe as observe_scenario
+from .expected_price_runtime import evaluate_and_persist_expected_price, expected_price_run_detail
 
 
 # Public prototype-only source pages.  These deliberately have no connection to
@@ -990,6 +991,44 @@ async def internal_hybrid_evaluation_create(card_id: int, request: Request, _: N
         return create_evaluation(db, card_id, await request.json())
     finally:
         db.close()
+
+@app.post('/api/internal/cards/{card_id}/expected-price')
+async def internal_card_expected_price(card_id: int, request: Request, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try:
+        try:
+            data = MarketContextIn.model_validate(await request.json())
+        except (ValidationError, ValueError):
+            raise HTTPException(422, "invalid expected price request")
+        as_of = parse_kst(data.as_of)
+        if not is_krx_business_date(as_of.date()) or as_of.time() < time(9, 5) or as_of.time() >= time(9, 6):
+            raise HTTPException(409, "expected price outside operational window")
+        card = db.execute("SELECT * FROM decision_cards WHERE id=?", (card_id,)).fetchone()
+        if not card:
+            raise HTTPException(404, "decision card not found")
+        evidence = evidence_detail(db, card["evidence_id"])
+        filter_result = filter_detail(db, card["filter_id"])
+        if (not evidence or card["invalidated_at"] or evidence["invalidated_at"] or evidence["status"] == "invalidated"
+                or filter_result["evidence_id"] != evidence["id"]
+                or filter_result["evidence_version"] != evidence["version"]
+                or db.execute("SELECT 1 FROM deterministic_filter_results WHERE parent_filter_id=?", (filter_result["id"],)).fetchone()):
+            raise HTTPException(409, "expected price requires current 08:00 lineage")
+        return evaluate_and_persist_expected_price(
+            db=db, run_key=data.run_key, card=dict(card), evidence=evidence,
+            filter_result=filter_result, requested_as_of=data.as_of,
+        )
+    finally:
+        db.close()
+
+
+@app.get('/api/internal/expected-price-runs/{run_key}')
+def internal_expected_price_run_detail(run_key: str, _: None = Depends(require_internal_api_key)):
+    db = connect()
+    try:
+        return expected_price_run_detail(db, run_key=run_key)
+    finally:
+        db.close()
+
 
 @app.post('/api/internal/cards/{card_id}/market-context')
 async def internal_card_market_context(card_id: int, request: Request, _: None = Depends(require_internal_api_key)):

@@ -583,6 +583,8 @@ def user_card_view(db, ident, user_id):
         }
     else:
         result["market_context"] = None
+    expected_price = __import__('kr_stock_autotrader.expected_price_runtime', fromlist=['latest_expected_price_for_card']).latest_expected_price_for_card(db, ident)
+    result["expected_price"] = expected_price
     try:
         from .hybrid_recommendations import latest_evaluation_for_card
 
