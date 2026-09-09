@@ -232,6 +232,8 @@ backend `filter-run` 입력에는 snapshot이 준 `filter_inputs` 전체 객체�
 
 비매수 카드(`관찰`, `제외`, `판단 보류`)는 주문 관련 필드를 `null` 또는 schema가 허용한 빈 값으로 둔다. placeholder 가격·수량·시각·손절·익절을 만들지 않는다.
 
+`observation_scenarios`는 filter의 immutable `raw_inputs` 안의 `post_close_market`에 `pre_event_low`, `pre_event_close`, `event_window_high`가 모두 있을 때만(그리고 유한한 양수로 이미 기록된 경우에만) 선택적으로 넣는다. 각 BAD/BASE/GOOD `level_krw`는 그 세 원시값과 정확히 같아야 하며, 부족하거나 아직 관측할 수 없는 이벤트 구간 고점은 추정·현재가 대체·사후 보충으로 만들지 않는다. 08:00 snapshot 계약은 이 세 값을 제공하지 않으므로, 그 snapshot만으로 생성한 카드는 `observation_scenarios`를 생략한다.
+
 `매수 검토 가능` 카드만 다음을 모두 구체적으로 가져야 한다.
 
 - evidence가 뒷받침하는 `price_cap`

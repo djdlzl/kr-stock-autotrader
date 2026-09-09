@@ -551,10 +551,19 @@ def _immutable_observation_levels(card_json: object) -> list[tuple[str, float]] 
     return [(label, levels[label]) for label in ("BAD", "BASE", "GOOD")] if set(levels) == set(_OBSERVATION_LEVEL_FIELDS) else None
 
 
-def _current_quote_unavailable(symbol: str, *, market_state: str) -> dict:
+def _current_quote_unavailable(symbol: str, *, market_state: str, comparison_reason: str) -> dict:
     return {"status": "unavailable", "symbol": symbol, "market_state": market_state, "freshness": "UNAVAILABLE",
             "last_price_krw": None, "best_bid_krw": None, "best_ask_krw": None, "retrieved_at": None,
-            "source": "KIS", "comparisons": []}
+            "source": "KIS", "comparisons": [], "comparison_status": "unavailable",
+            "comparison_unavailable_reason": comparison_reason}
+
+
+def _comparison_unavailable_reason(*, invalidated: object, levels: list[tuple[str, float]] | None) -> str | None:
+    if invalidated:
+        return "CARD_INVALIDATED"
+    if levels is None:
+        return "MISSING_OBSERVATION_LEVELS"
+    return None
 
 
 @app.get("/api/cards/{card_id}/current-quote")
@@ -571,24 +580,28 @@ def card_current_quote(card_id: int, request: Request):
         observed_now = now_kst()
         market_state = "OPEN" if market_open(observed_now) else "CLOSED"
         symbol = row["symbol"]
-        levels = None if row["invalidated_at"] else _immutable_observation_levels(row["card_json"])
-        if not isinstance(symbol, str) or re.fullmatch(r"\d{6}", symbol) is None or levels is None:
-            return _current_quote_unavailable(symbol if isinstance(symbol, str) else "", market_state=market_state)
+        if not isinstance(symbol, str) or re.fullmatch(r"\d{6}", symbol) is None:
+            return _current_quote_unavailable(symbol if isinstance(symbol, str) else "", market_state=market_state, comparison_reason="INVALID_SYMBOL")
+        levels = _immutable_observation_levels(row["card_json"])
+        comparison_reason = _comparison_unavailable_reason(invalidated=row["invalidated_at"], levels=levels)
         try:
             quote = _safe_kis_orderbook(symbol, _kis_orderbook_provider()(symbol))
         except Exception:
             quote = _safe_kis_orderbook(symbol, None)
         if quote.get("status") != "ok":
-            return _current_quote_unavailable(symbol, market_state=market_state)
+            return _current_quote_unavailable(symbol, market_state=market_state, comparison_reason="QUOTE_UNAVAILABLE")
         last = quote["last_price"]
         comparisons = []
-        for label, level in levels:
-            difference = last - level
-            comparison = "EQUAL" if math.isclose(last, level, rel_tol=1e-12, abs_tol=1e-9) else ("ABOVE" if difference > 0 else "BELOW")
-            comparisons.append({"label": label, "level_krw": level, "difference_krw": difference, "difference_pct": difference / level * 100, "comparison": comparison})
+        if levels is not None and comparison_reason is None:
+            for label, level in levels:
+                difference = last - level
+                comparison = "EQUAL" if math.isclose(last, level, rel_tol=1e-12, abs_tol=1e-9) else ("ABOVE" if difference > 0 else "BELOW")
+                comparisons.append({"label": label, "level_krw": level, "difference_krw": difference, "difference_pct": difference / level * 100, "comparison": comparison})
         return {"status": "ok", "symbol": symbol, "market_state": market_state, "freshness": "FRESH",
                 "last_price_krw": last, "best_bid_krw": quote["best_bid"], "best_ask_krw": quote["best_ask"],
-                "retrieved_at": quote["retrieved_at"], "source": "KIS", "comparisons": comparisons}
+                "retrieved_at": quote["retrieved_at"], "source": "KIS", "comparisons": comparisons,
+                "comparison_status": "available" if comparison_reason is None else "unavailable",
+                "comparison_unavailable_reason": comparison_reason}
     finally:
         db.close()
 

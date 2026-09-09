@@ -32,3 +32,9 @@ def test_0800_prompt_requires_same_day_completed_research_before_pending_cards()
     assert "missing/error/not done" in prompt
     assert "scheduler-finish ... error" in prompt
     assert prompt.index(latest) < prompt.index("pending-cards")
+
+
+def test_0800_prompt_does_not_fabricate_observation_anchors_without_complete_market_inputs():
+    prompt = (Path(__file__).parents[1] / "prompts/giraffe-decision-card-scheduler-v1.md").read_text()
+    for marker in ("`post_close_market`", "`pre_event_low`", "`pre_event_close`", "`event_window_high`", "모두 있을 때만", "만들지 않는다"):
+        assert marker in prompt

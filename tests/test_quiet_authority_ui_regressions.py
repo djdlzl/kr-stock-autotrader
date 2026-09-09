@@ -460,4 +460,4 @@ def test_compact_decision_sections_render_grounded_actions_prices_and_legacy_gap
     assert "위험 한도 종목 손실 한도 0.15% · 명목 한도 3%" in populated
     assert "지금 매수하지 않음 · 관찰" in no_price
     assert "확인된 사업 가치" in no_price
-    assert "관찰 가격 기준이 아직 설정되지 않았습니다." in no_price
+    assert "이 카드의 생성 시점(08:00)에는 이벤트 구간 고점을 확정할 수 없어" in no_price
