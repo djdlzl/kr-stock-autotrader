@@ -33,19 +33,39 @@ class FakeTransport:
         return Response({'rt_cd':'0','output':{'stck_prpr':'70000','acml_vol':'1234','unwanted':'raw'}})
 
 
-def test_allowlisted_requests_have_a_process_local_minimum_start_interval(monkeypatch):
+REQUEST_INTERVAL_NS = 100_000_000
+
+
+def _install_monotonic_ns_clock(monkeypatch):
     import kr_stock_autotrader.kis_readonly as kis
 
-    clock = [100.0]
-    sleeps = []
-    monkeypatch.setattr(kis.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(kis.time, "sleep", lambda seconds: (sleeps.append(seconds), clock.__setitem__(0, clock[0] + seconds)))
-    monkeypatch.setattr(KISReadOnlyClient, "_last_request_started", None)
+    clock_ns = [100_000_000_000]
+    monkeypatch.setattr(kis.time, "monotonic_ns", lambda: clock_ns[0])
+    monkeypatch.setattr(
+        kis.time,
+        "sleep",
+        lambda seconds: clock_ns.__setitem__(
+            0, clock_ns[0] + round(seconds * 1_000_000_000)
+        ),
+    )
+    monkeypatch.setattr(KISReadOnlyClient, "_last_request_started_ns", None)
+    return clock_ns
+
+
+def _assert_minimum_start_interval(starts_ns):
+    assert all(
+        later - earlier >= REQUEST_INTERVAL_NS
+        for earlier, later in zip(starts_ns, starts_ns[1:])
+    )
+
+
+def test_allowlisted_requests_have_a_process_local_minimum_start_interval(monkeypatch):
+    clock_ns = _install_monotonic_ns_clock(monkeypatch)
 
     class TimestampedTransport:
-        def __init__(self): self.starts = []
+        def __init__(self): self.starts_ns = []
         def request(self, method, url, **kwargs):
-            self.starts.append(clock[0])
+            self.starts_ns.append(clock_ns[0])
             return Response({})
 
     transport = TimestampedTransport()
@@ -53,27 +73,19 @@ def test_allowlisted_requests_have_a_process_local_minimum_start_interval(monkey
     for method, path in (("POST", OAUTH_PATH), ("GET", QUOTE_PATH), ("GET", ORDERBOOK_PATH), ("GET", DAILY_CHART_PATH), ("GET", INTRADAY_MINUTE_PATH)):
         client._request(method, path)
 
-    assert transport.starts == pytest.approx([100.0, 100.1, 100.2, 100.3, 100.4])
-    assert sleeps == pytest.approx([0.1, 0.1, 0.1, 0.1])
+    assert transport.starts_ns == [100_000_000_000 + index * REQUEST_INTERVAL_NS for index in range(5)]
+    _assert_minimum_start_interval(transport.starts_ns)
 
 
 def test_allowlisted_request_start_throttle_serializes_concurrent_clients(monkeypatch):
-    import kr_stock_autotrader.kis_readonly as kis
-
-    clock = [100.0]
+    clock_ns = _install_monotonic_ns_clock(monkeypatch)
     clock_lock = threading.Lock()
-    monkeypatch.setattr(kis.time, "monotonic", lambda: clock[0])
-    def sleep(seconds):
-        with clock_lock:
-            clock[0] += seconds
-    monkeypatch.setattr(kis.time, "sleep", sleep)
-    monkeypatch.setattr(KISReadOnlyClient, "_last_request_started", None)
 
     class TimestampedTransport:
-        def __init__(self): self.starts = []
+        def __init__(self): self.starts_ns = []
         def request(self, method, url, **kwargs):
             with clock_lock:
-                self.starts.append(clock[0])
+                self.starts_ns.append(clock_ns[0])
             return Response({})
 
     transport = TimestampedTransport()
@@ -81,56 +93,86 @@ def test_allowlisted_request_start_throttle_serializes_concurrent_clients(monkey
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(lambda client: client._request("GET", QUOTE_PATH), clients))
 
-    starts = sorted(transport.starts)
-    assert starts == pytest.approx([100.0, 100.1, 100.2, 100.3])
+    starts_ns = sorted(transport.starts_ns)
+    assert starts_ns == [100_000_000_000 + index * REQUEST_INTERVAL_NS for index in range(4)]
+    _assert_minimum_start_interval(starts_ns)
 
 
-@pytest.mark.parametrize(
-    ("request_order", "expected_starts"),
-    [
-        ("subclass_then_base", [100.0, 100.1]),
-        ("base_then_subclass_then_base", [100.0, 100.1, 100.2]),
-    ],
-)
-def test_request_start_throttle_is_shared_across_base_and_subclass_clients(
-    monkeypatch, request_order, expected_starts
-):
+@pytest.mark.parametrize("request_order", [("subclass", "base"), ("base", "subclass", "base")])
+def test_request_start_throttle_is_shared_across_base_and_subclass_clients(monkeypatch, request_order):
     """Inherited clients cannot fork the process-local request-start timeline."""
-    import kr_stock_autotrader.kis_readonly as kis
-
-    clock = [100.0]
-    monkeypatch.setattr(kis.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(
-        kis.time,
-        "sleep",
-        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
-    )
-    monkeypatch.setattr(KISReadOnlyClient, "_last_request_started", None)
+    clock_ns = _install_monotonic_ns_clock(monkeypatch)
 
     class InheritedKISReadOnlyClient(KISReadOnlyClient):
         pass
 
     class TimestampedTransport:
-        def __init__(self):
-            self.starts = []
-
+        def __init__(self): self.starts_ns = []
         def request(self, method, url, **kwargs):
-            self.starts.append(clock[0])
+            self.starts_ns.append(clock_ns[0])
             return Response({})
 
     transport = TimestampedTransport()
     base = KISReadOnlyClient("key", "value", transport=transport)
     inherited = InheritedKISReadOnlyClient("key", "value", transport=transport)
-    clients = (
-        (inherited, base)
-        if request_order == "subclass_then_base"
-        else (base, inherited, base)
-    )
+    clients = {"base": base, "subclass": inherited}
+    for name in request_order:
+        clients[name]._request("GET", QUOTE_PATH)
 
-    for client in clients:
+    assert transport.starts_ns == [100_000_000_000 + index * REQUEST_INTERVAL_NS for index in range(len(request_order))]
+    _assert_minimum_start_interval(transport.starts_ns)
+
+
+def test_request_start_throttle_preserves_interval_after_transport_failure(monkeypatch):
+    clock_ns = _install_monotonic_ns_clock(monkeypatch)
+
+    class FailingThenTimestampedTransport:
+        def __init__(self): self.starts_ns = []; self.calls = 0
+        def request(self, method, url, **kwargs):
+            self.starts_ns.append(clock_ns[0])
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transport failed")
+            return Response({})
+
+    transport = FailingThenTimestampedTransport()
+    client = KISReadOnlyClient("key", "value", transport=transport)
+    with pytest.raises(RuntimeError, match="transport failed"):
         client._request("GET", QUOTE_PATH)
+    client._request("GET", INTRADAY_MINUTE_PATH)
 
-    assert transport.starts == pytest.approx(expected_starts)
+    assert len(transport.starts_ns) == 2
+    _assert_minimum_start_interval(transport.starts_ns)
+
+
+def test_request_start_throttle_rechecks_clock_after_an_early_sleep(monkeypatch):
+    import kr_stock_autotrader.kis_readonly as kis
+
+    clock_ns = [100_000_000_000]
+    sleeps_ns = []
+    monkeypatch.setattr(kis.time, "monotonic_ns", lambda: clock_ns[0])
+
+    def sleep(seconds):
+        requested_ns = round(seconds * 1_000_000_000)
+        sleeps_ns.append(requested_ns)
+        clock_ns[0] += requested_ns - 1 if len(sleeps_ns) == 1 else requested_ns
+
+    monkeypatch.setattr(kis.time, "sleep", sleep)
+    monkeypatch.setattr(KISReadOnlyClient, "_last_request_started_ns", None)
+
+    class TimestampedTransport:
+        def __init__(self): self.starts_ns = []
+        def request(self, method, url, **kwargs):
+            self.starts_ns.append(clock_ns[0])
+            return Response({})
+
+    transport = TimestampedTransport()
+    client = KISReadOnlyClient("key", "value", transport=transport)
+    client._request("GET", QUOTE_PATH)
+    client._request("GET", QUOTE_PATH)
+
+    assert sleeps_ns == [REQUEST_INTERVAL_NS, 1]
+    _assert_minimum_start_interval(transport.starts_ns)
 
 
 def test_kis_allowlist_pinned_host_and_safe_actual_projection(monkeypatch):

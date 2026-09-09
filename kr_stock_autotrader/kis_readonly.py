@@ -32,7 +32,7 @@ INTRADAY_MINUTE_PATH = _INTRADAY_MINUTE_PATH
 INTRADAY_MINUTE_TR_ID = _INTRADAY_MINUTE_TR_ID
 TOKEN_REFRESH_SKEW = timedelta(seconds=30)
 MAX_TOKEN_LIFETIME = timedelta(hours=24)
-REQUEST_START_INTERVAL_SECONDS = 0.1
+REQUEST_START_INTERVAL_NS = 100_000_000
 
 
 class KISOAuthCacheError(RuntimeError):
@@ -92,7 +92,7 @@ def _expiry_from(payload: dict, now: datetime) -> datetime:
 class KISReadOnlyClient:
     """Only OAuth and one hard-coded domestic current-price request are callable."""
     _request_start_lock = threading.Lock()
-    _last_request_started: float | None = None
+    _last_request_started_ns: int | None = None
 
     def __init__(self, app_key: str | None = None, app_secret: str | None = None, *, base_url: str | None = None, transport: Transport | None = None):
         self._app_key = app_key if app_key is not None else os.getenv("KIS_APP_KEY", "")
@@ -120,12 +120,17 @@ class KISReadOnlyClient:
             raise ValueError("non-allowlisted KIS request")
         # The base-class state is process-local and spans the actual transport
         # start, so inherited clients cannot fork the request-start timeline.
+        # Use the integer monotonic clock: float deadline arithmetic can produce
+        # adjacent starts that compare less than the required 100 ms interval.
         with KISReadOnlyClient._request_start_lock:
-            if KISReadOnlyClient._last_request_started is not None:
-                deadline = KISReadOnlyClient._last_request_started + REQUEST_START_INTERVAL_SECONDS
-                while (remaining := deadline - time.monotonic()) > 0:
-                    time.sleep(remaining)
-            KISReadOnlyClient._last_request_started = time.monotonic()
+            if KISReadOnlyClient._last_request_started_ns is not None:
+                while (
+                    remaining_ns := KISReadOnlyClient._last_request_started_ns
+                    + REQUEST_START_INTERVAL_NS
+                    - time.monotonic_ns()
+                ) > 0:
+                    time.sleep(remaining_ns / 1_000_000_000)
+            KISReadOnlyClient._last_request_started_ns = time.monotonic_ns()
             return self._transport.request(method, self._base_url + path, **kwargs)
 
     def _clear_token(self) -> None:
