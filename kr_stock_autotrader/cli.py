@@ -17,7 +17,7 @@ def main(argv=None):
     a=s.add_parser('filter-head');a.add_argument('evidence_id');a.add_argument('as_of');a.add_argument('known_at')
     for n in ('evidence-add','evidence-update','filter-run','card-request','card-save-result'): a=s.add_parser(n);a.add_argument('json')
     a=s.add_parser('evidence-invalidate');a.add_argument('evidence_id')
-    a=s.add_parser('market-snapshot');a.add_argument('symbol');a.add_argument('as_of');a.add_argument('--announcement-at')
+    a=s.add_parser('market-snapshot');a.add_argument('symbol');a.add_argument('as_of');a.add_argument('--announcement-at');a.add_argument('--premarket-retry', action='store_true')
     a=s.add_parser('market-context');a.add_argument('card_id');a.add_argument('run_key');a.add_argument('as_of')
     a=s.add_parser('scheduler-start');a.add_argument('run_key');a.add_argument('kind')
     a=s.add_parser('scheduler-finish');a.add_argument('run_key');a.add_argument('status');a.add_argument('--count',type=int,default=0);a.add_argument('--detail',default='{}')
@@ -33,7 +33,7 @@ def main(argv=None):
     elif x.cmd=='evidence-update':
         payload=json.loads(x.json); out=call('PATCH','/api/internal/evidence/'+str(payload.pop('id')),payload)
     elif x.cmd=='evidence-invalidate': out=call('POST','/api/internal/evidence/'+x.evidence_id+'/invalidate',{})
-    elif x.cmd=='market-snapshot': out=call('POST','/api/internal/market-snapshots/'+x.symbol,{'as_of':x.as_of, **({'announcement_at':x.announcement_at} if x.announcement_at else {})})
+    elif x.cmd=='market-snapshot': out=call('POST','/api/internal/market-snapshots/'+x.symbol,{'as_of':x.as_of, **({'announcement_at':x.announcement_at} if x.announcement_at else {}), **({'premarket_retry': True} if x.premarket_retry else {})})
     elif x.cmd=='filter-run': out=call('POST','/api/internal/filters',json.loads(x.json))
     elif x.cmd=='card-request': out=call('POST','/api/internal/cards/generate',json.loads(x.json))
     elif x.cmd=='card-save-result': out=call('POST','/api/internal/cards/results',json.loads(x.json))

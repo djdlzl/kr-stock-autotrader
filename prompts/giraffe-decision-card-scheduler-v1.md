@@ -34,7 +34,6 @@
 - `collected_at`이 과거 날짜인 미처리 evidence는 자동으로 섞지 않는다. 별도 복구 run에서만 처리한다.
 - 같은 evidence version, filter lineage, prompt version/hash로 이미 카드가 있으면 재생성하지 않는다.
 - 처리 대상이 0건이면 두 API readback 정상 여부를 확인한 뒤 `done`, count=0으로 종료한다.
-- `scheduler-start`가 기존 terminal run을 `idempotent=true`로 반환하면 그 run의 stored count/detail을 readback하고 즉시 종료한다. 기존 `started` run은 같은 `run_key`로 재개한다. `scheduler-start` 성공 직후부터 전체 처리 본문을 `try/finally`로 감싸고, 예외·readback 실패·재개 실패를 포함한 모든 비terminal 경로에서 allowlisted secret-free `scheduler-finish ... error`를 한 번 호출한다; `started` residue를 남기지 않는다. terminal finish 뒤 idempotent start/finish readback으로 count/detail/status를 확인한다.
 
 ## scheduler 날짜 축 문서화
 
@@ -65,7 +64,7 @@
 
 각 eligible evidence마다 `announcement_at`를 포함해 아래 순서로 실제 API/CLI를 호출한다. snapshot의 `filter_inputs` 전체 객체를 그대로 사용하고 숫자/관측가능성/임계값 필드를 임의 변경하지 않는다. `evidence 필드만 merge`한다. 즉 evidence에서 확인된 `source`, `announcement_at`, `economic_terms` 객체 전체(있다면 `expected_price_inputs`를 drop/rename/stringify하지 않고 보존), 중복/상충 여부만 안전하게 merge한다.
 
-1. `market-snapshot SYMBOL AS_OF --announcement-at ANNOUNCEMENT_AT`를 호출한다.
+1. `market-snapshot SYMBOL AS_OF --announcement-at ANNOUNCEMENT_AT --premarket-retry`를 호출한다.
 2. snapshot `status != ok` 또는 filter inputs `market_data_status=unavailable`이면 snapshot의 실제 `market_data_attempted_at`를 **filter `known_at`과 `as_of` 모두로 사용**해 market-data unavailable filter를 실행하고, 비매수 `판단 보류` 카드만 저장한다. requested historical as_of보다 attempt가 늦으면 422/error로 종료하며 과거 시장자료라고 backdate하지 않는다. API 오류를 무시하거나 null/0을 만들어 PASS시키지 않는다.
 3. 정상 snapshot은 merged JSON으로 `filter-run`을 실행하고 `filter-detail`로 filter ID, verdict, reasons, computed units를 readback한다.
 4. `card-request`로 immutable input package를 읽어 prompt에 따라 카드를 만들고 `card-save-result`로 저장한다. 항상 `card-detail` readback으로 lineage/filter/prompt hash를 확인한다.

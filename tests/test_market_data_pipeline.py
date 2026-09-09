@@ -145,6 +145,21 @@ def test_premarket_canary_persistent_failure_fails_closed_with_safe_category():
     assert "secret" not in str(result)
 
 
+def test_premarket_cutoff_is_checked_before_benchmark_call_after_stock_returns():
+    from kr_stock_autotrader.market_data import build_premarket_snapshot_with_retry
+    as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
+    calls = []
+    clock = iter((datetime(2026, 9, 2, 8, 59, 59, tzinfo=KST), datetime(2026, 9, 2, 9, tzinfo=KST)))
+    def provider(symbol, *_):
+        calls.append(symbol)
+        return official_snapshot()
+    result = build_premarket_snapshot_with_retry(
+        "005930", as_of, provider, now=lambda: next(clock), sleep=lambda _: None)
+    assert calls == ["005930"]
+    assert result["status"] == "unavailable"
+    assert result["diagnostic"] == {"category": "provider", "attempt_count": 1, "readiness": "premarket_deadline"}
+
+
 def test_premarket_canary_timeout_fails_closed_before_open():
     from kr_stock_autotrader.market_data import build_premarket_snapshot_with_retry
     as_of = datetime(2026, 9, 2, 8, tzinfo=KST)

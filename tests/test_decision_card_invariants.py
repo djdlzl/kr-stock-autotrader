@@ -197,59 +197,22 @@ def test_scheduler_start_is_idempotent_and_missing_finish_is_404(monkeypatch, tm
     assert done.status_code==200 and done.json()["count"]==2
 
 
-def test_scheduler_finish_is_idempotent_and_preserves_premarket_counts(monkeypatch, tmp_path):
-    monkeypatch.setenv("INTERNAL_API_KEY", "test-key")
-    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "scheduler-finish.db"))
-    from app import app
-    client=TestClient(app); headers={"X-Internal-API-Key":"test-key"}
-    client.post("/api/internal/scheduler-runs/card-2026-09-02-0800-kst/start",json={"kind":"card"},headers=headers)
-    detail={"attempt_count":2,"eligible_count":3,"completed_count":3,"failure_reasons":{"http":1},"readiness":"canary_recovered"}
-    first=client.post("/api/internal/scheduler-runs/card-2026-09-02-0800-kst/finish",json={"status":"done","count":3,"detail":detail},headers=headers)
-    assert first.status_code == 200 and first.json()["idempotent"] is False
-    duplicate=client.post("/api/internal/scheduler-runs/card-2026-09-02-0800-kst/finish",json={"status":"error","count":0,"detail":{}},headers=headers)
-    assert duplicate.status_code == 200
-    assert duplicate.json() == {"run_key":"card-2026-09-02-0800-kst","status":"done","count":3,"detail":detail,"idempotent":True}
-
-
 def test_premarket_scheduler_finish_projects_secret_detail_and_readback(monkeypatch, tmp_path):
     monkeypatch.setenv("INTERNAL_API_KEY", "test-key")
     monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "scheduler-safe-detail.db"))
     from app import app
     client = TestClient(app); headers={"X-Internal-API-Key":"test-key"}
     key = "card-2026-09-02-0800-kst"
-    assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind":"card", "headers":{"Authorization":"Bearer start-secret"}}, headers=headers).status_code == 200
+    assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind":"card"}, headers=headers).status_code == 200
     hostile = {"attempt_count":2,"eligible_count":3,"completed_count":1,"failure_reasons":{"http":1},"readiness":"persistent_failure","stage":"market_snapshot","body":{"token":"finish-secret"},"headers":{"X-Key":"secret"},"key":"secret","value":"secret"}
     response = client.post(f"/api/internal/scheduler-runs/{key}/finish", json={"status":"error","count":1,"detail":hostile}, headers=headers)
     safe = {"attempt_count":2,"eligible_count":3,"completed_count":1,"failure_reasons":{"http":1},"readiness":"persistent_failure","stage":"market_snapshot"}
-    assert response.json() == {"run_key":key,"status":"error","count":1,"detail":safe,"idempotent":False}
+    assert response.json() == {"run_key":key,"status":"error","count":1,"detail":safe}
     latest = client.get("/api/internal/scheduler-runs/latest?kind=card&date=2026-09-02", headers=headers)
     assert latest.status_code == 200 and latest.json()["detail"] == {"status":"error","count":1,"detail":safe}
     db = dbmod.connect()
     try:
         raw_detail = db.execute("SELECT detail FROM scheduler_runs WHERE run_key=?", (key,)).fetchone()["detail"]
-        assert all(secret not in raw_detail for secret in ("start-secret", "finish-secret", "Authorization", "X-Key"))
-    finally:
-        db.close()
-
-
-def test_premarket_started_run_resumes_to_terminal_error_without_orders(monkeypatch, tmp_path):
-    """EDD: a post-start failure has one durable terminal recovery and no trades."""
-    monkeypatch.setenv("INTERNAL_API_KEY", "test-key")
-    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "scheduler-recovery.db"))
-    from app import app
-    client = TestClient(app); headers={"X-Internal-API-Key":"test-key"}; key="card-2026-09-02-0800-kst"
-    assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind":"card"}, headers=headers).json()["status"] == "started"
-    # Simulate a process exception after start; the retry sees a resumable run
-    # and its finally/recovery terminalizes it instead of starting a second run.
-    resumed = client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind":"card"}, headers=headers).json()
-    assert resumed["idempotent"] is True and resumed["resume_required"] is True
-    terminal = client.post(f"/api/internal/scheduler-runs/{key}/finish", json={"status":"error","count":0,"detail":{"stage":"recovery","attempt_count":0,"eligible_count":0,"completed_count":0,"failure_reasons":{"provider":1},"readiness":"persistent_failure"}}, headers=headers)
-    assert terminal.status_code == 200 and terminal.json()["status"] == "error"
-    retry = client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind":"card"}, headers=headers).json()
-    assert retry["idempotent"] is True and retry["resume_required"] is False and retry["status"] == "error"
-    db = dbmod.connect()
-    try:
-        assert db.execute("SELECT status FROM scheduler_runs WHERE run_key=?", (key,)).fetchone()["status"] == "error"
-        assert {table: db.execute(f"SELECT COUNT(*) n FROM {table}").fetchone()["n"] for table in ("decision_cards", "order_plans", "order_fills", "positions", "order_events")} == {"decision_cards":0,"order_plans":0,"order_fills":0,"positions":0,"order_events":0}
+        assert all(secret not in raw_detail for secret in ("finish-secret", "X-Key"))
     finally:
         db.close()

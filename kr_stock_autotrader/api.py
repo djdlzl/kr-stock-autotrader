@@ -33,7 +33,7 @@ from .intraday_market_context import (
     persist_intraday_market_context_run,
     render_market_context_response,
 )
-from .market_data import build_premarket_snapshot_with_retry, filter_inputs_from_snapshot
+from .market_data import build_premarket_snapshot, build_premarket_snapshot_with_retry, filter_inputs_from_snapshot
 from .live_dry_run import existing_live_dry_run_receipt, persist_live_dry_run
 from .event_scenarios import create as create_scenario_set, detail as scenario_set_detail, observe as observe_scenario
 from .expected_price_runtime import (
@@ -971,7 +971,7 @@ async def internal_market_snapshot(symbol: str, request: Request, _: None = Depe
             _default_kis_client = KISReadOnlyClient()
         provider = _default_kis_client.daily_snapshot
     announcement_at = data.get("announcement_at") if isinstance(data.get("announcement_at"), str) else None
-    snapshot = build_premarket_snapshot_with_retry(symbol, as_of, provider, announcement_at)
+    snapshot = build_premarket_snapshot_with_retry(symbol, as_of, provider, announcement_at) if data.get("premarket_retry") is True else build_premarket_snapshot(symbol, as_of, provider, announcement_at)
     return {'snapshot': snapshot, 'filter_inputs': filter_inputs_from_snapshot(snapshot)}
 
 
@@ -1229,13 +1229,8 @@ async def scheduler_start(run_key: str, request: Request, _: None = Depends(requ
         existing=db.execute("SELECT kind,status FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
         if existing:
             if existing['kind'] != data['kind']: raise HTTPException(409,'run_key kind conflict')
-            # A prior interruption is explicitly resumable under the same key;
-            # callers must terminalize it in their finally/recovery path.
-            return {'run_key':run_key,'kind':existing['kind'],'status':existing['status'],'idempotent':True,'resume_required':existing['status'] == 'started'}
-        kind = data.get('kind') if isinstance(data, dict) else None
-        if not isinstance(kind, str): raise HTTPException(422, 'scheduler kind required')
-        initial = {'kind': kind} if _is_premarket_card_run(run_key, kind) else data
-        db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?, 'started',?,?)",(run_key,kind,__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(initial)))
+            return {'run_key':run_key,'kind':existing['kind'],'status':existing['status'],'idempotent':True}
+        db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?, 'started',?,?)",(run_key,data['kind'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(data)))
         db.commit(); return {'run_key':run_key,'kind':data['kind'],'status':'started','idempotent':False}
     finally: db.close()
 
@@ -1243,13 +1238,10 @@ async def scheduler_start(run_key: str, request: Request, _: None = Depends(requ
 async def scheduler_finish(run_key: str, request: Request, _: None = Depends(require_internal_api_key)):
     data=await request.json(); db=connect()
     try:
-        existing=db.execute("SELECT kind,status,detail FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
+        existing=db.execute("SELECT kind FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
         if not existing: raise HTTPException(404,'scheduler run not found')
-        if existing['status'] != 'started':
-            prior=__import__('json').loads(existing['detail'])
-            return {'run_key':run_key,'status':existing['status'],'count':prior.get('count',0),'detail':prior.get('detail',{}),'idempotent':True}
         finished = _safe_premarket_scheduler_finish(data) if _is_premarket_card_run(run_key, existing['kind']) else data
-        db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=?",(finished['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(finished),run_key)); db.commit(); return {'run_key':run_key,'status':finished['status'],'count':finished.get('count',0),'detail':finished.get('detail',{}),'idempotent':False}
+        db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=?",(finished['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(finished),run_key)); db.commit(); return {'run_key':run_key,'status':finished['status'],'count':finished.get('count',0),'detail':finished.get('detail',{})}
     finally: db.close()
 
 @app.get('/api/internal/scheduler-runs/latest')

@@ -162,7 +162,12 @@ def _current_premarket_retrieval(retrieved: datetime, requested_as_of: datetime)
     return retrieved_kst.date() == requested_kst.date() and retrieved_kst.time() < KRX_REGULAR_OPEN
 
 
-def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Callable[..., object], announcement_at: str | None = None) -> dict:
+class _PremarketProviderDeadline(Exception):
+    def __init__(self, current: datetime):
+        self.current = current
+
+
+def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Callable[..., object], announcement_at: str | None = None, *, before_provider_call: Callable[[], None] | None = None) -> dict:
     """Build a 20-session, aligned snapshot from completed sessions only."""
     retrieved = now_kst()
     try:
@@ -172,6 +177,8 @@ def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Calla
         # This is deliberately a complete stock canary, not merely a stock-first
         # request.  Do not ask the benchmark provider until every stock-only
         # provider boundary has passed.
+        if before_provider_call is not None:
+            before_provider_call()
         stock_source = daily_snapshot(symbol, as_of)
         if not isinstance(stock_source, DailySnapshot):
             raise ValueError("daily snapshot contract invalid")
@@ -179,6 +186,8 @@ def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Calla
             raise ValueError("summary retrieval is not current premarket data")
         market_cap = _number(stock_source.summary_market_cap_100m, positive=True) * MARKET_CAP_UNIT_KRW
         stock = _closed_bars(list(stock_source.bars), as_of)
+        if before_provider_call is not None:
+            before_provider_call()
         benchmark_source = daily_snapshot(BENCHMARK_SYMBOL, as_of)
         if not isinstance(benchmark_source, DailySnapshot):
             raise ValueError("daily snapshot contract invalid")
@@ -226,6 +235,8 @@ def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Calla
                 "observability": observability,
                 "horizons": {"stock_return_pct": "20 completed aligned sessions", "benchmark_return_pct": "20 completed aligned sessions", "recent_rise_pct": "20 completed aligned sessions", "pre_announcement_return_pct": "20 completed aligned sessions ending at announcement boundary", "short_term_stock_return_pct": f"{short_sessions} completed aligned sessions", "short_term_benchmark_return_pct": f"{short_sessions} completed aligned sessions", "short_term_excess_return_pct": f"{short_sessions} completed aligned sessions; stock minus benchmark"},
                 "units": {"returns": "percent", "short_term_window": f"KST ISO date range; {short_sessions} completed aligned sessions", "trading_value_krw": "KRW", "market_cap_krw": "KRW (hts_avls x 100,000,000)"}}
+    except _PremarketProviderDeadline:
+        raise
     except KISOAuthCacheError:
         # A cache failure is not missing/invalid daily bars.  Its public shape
         # remains secret-free and unavailable.
@@ -237,39 +248,54 @@ def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Calla
 
 
 def build_premarket_snapshot_with_retry(symbol: str, as_of: datetime, daily_snapshot: Callable[..., object], announcement_at: str | None = None, *, now: Callable[[], datetime] | None = None, sleep: Callable[[float], None] = clock.sleep, max_attempts: int = PREMARKET_MAX_ATTEMPTS) -> dict:
-    """Bounded stock+benchmark readiness canary for the 08:00 scheduler.
+    """Bounded 08:00-only readiness retry with a pre-call KST cutoff.
 
-    Each attempt calls the stock first; only a successful stock canary permits
-    the benchmark call inside ``build_premarket_snapshot``.  It never retries
-    after 09:00 KST and never turns an unavailable observation into data.
+    The gate runs immediately before each provider invocation, including the
+    benchmark call after a successful stock response. No provider call starts
+    at or after 09:00 KST, or on a date other than the scheduled ``as_of`` date.
     """
     if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
         raise ValueError("invalid premarket attempt budget")
-    # Resolve at invocation rather than import time so the scheduler's clock is
-    # testable and no stale function default can bypass the cutoff.
     now = now or now_kst
+    if not isinstance(as_of, datetime) or as_of.tzinfo is None:
+        current = now()
+        out = _unavailable(symbol, "premarket_readiness_deadline", current, category="provider")
+        out["diagnostic"] = {"category": "date_range", "attempt_count": 0, "readiness": "invalid_as_of"}
+        return out
     attempts = 0
     last: dict | None = None
     while attempts < max_attempts:
-        current = now()
-        # ``as_of`` is a scheduled current-date boundary, never a license to
-        # replay or to make an after-open request.  Check actual KST time before
-        # each attempt so a sleep cannot cross the open unnoticed.
-        if (
-            not isinstance(as_of, datetime)
-            or as_of.tzinfo is None
-            or not isinstance(current, datetime)
-            or current.tzinfo is None
-            or current.astimezone(KST).time() >= KRX_REGULAR_OPEN
-            or current.astimezone(KST).date() != as_of.astimezone(KST).date()
-        ):
-            out = _unavailable(symbol, "premarket_readiness_deadline", current, category="provider")
-            deadline = isinstance(current, datetime) and current.tzinfo is not None and current.astimezone(KST).time() >= KRX_REGULAR_OPEN
-            readiness = "premarket_deadline" if deadline else "invalid_as_of"
-            out["diagnostic"] = {"category": "provider" if readiness == "premarket_deadline" else "date_range", "attempt_count": attempts, "readiness": readiness}
-            return out
         attempts += 1
-        result = build_premarket_snapshot(symbol, as_of, daily_snapshot, announcement_at)
+        provider_started = False
+
+        def before_provider_call() -> None:
+            nonlocal provider_started
+            current = now()
+            invalid = (
+                not isinstance(as_of, datetime)
+                or as_of.tzinfo is None
+                or not isinstance(current, datetime)
+                or current.tzinfo is None
+                or current.astimezone(KST).date() != as_of.astimezone(KST).date()
+                or current.astimezone(KST).time() >= KRX_REGULAR_OPEN
+            )
+            if invalid:
+                raise _PremarketProviderDeadline(current)
+            provider_started = True
+
+        try:
+            result = build_premarket_snapshot(
+                symbol, as_of, daily_snapshot, announcement_at,
+                before_provider_call=before_provider_call,
+            )
+        except _PremarketProviderDeadline as deadline:
+            current = deadline.current
+            deadline_passed = isinstance(current, datetime) and current.tzinfo is not None and current.astimezone(KST).time() >= KRX_REGULAR_OPEN
+            readiness = "premarket_deadline" if deadline_passed else "invalid_as_of"
+            count = attempts if provider_started else attempts - 1
+            out = _unavailable(symbol, "premarket_readiness_deadline", current, category="provider")
+            out["diagnostic"] = {"category": "provider" if readiness == "premarket_deadline" else "date_range", "attempt_count": count, "readiness": readiness}
+            return out
         if result.get("status") == "ok":
             result["attempt_count"] = attempts
             result["readiness"] = "canary_recovered" if attempts > 1 else "canary_ready"
