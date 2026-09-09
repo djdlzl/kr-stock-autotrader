@@ -117,6 +117,44 @@ def test_snapshot_classifies_oauth_cache_failure_without_secret_leak():
     assert "token" not in str(result).lower()
 
 
+def test_premarket_canary_retries_transient_provider_failure_before_fanout(monkeypatch):
+    from kr_stock_autotrader.market_data import build_premarket_snapshot_with_retry
+    as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
+    calls = []
+    def provider(symbol, *_):
+        calls.append(symbol)
+        if len(calls) == 1:
+            raise RuntimeError("HTTP 503 credential-value-must-not-leak")
+        return official_snapshot()
+    result = build_premarket_snapshot_with_retry(
+        "005930", as_of, provider, now=lambda: datetime(2026, 9, 2, 8, 1, tzinfo=KST), sleep=lambda _: None)
+    assert result["status"] == "ok"
+    assert result["attempt_count"] == 2
+    assert result["readiness"] == "canary_recovered"
+    assert calls == ["005930", "005930", "229200"]
+
+
+def test_premarket_canary_persistent_failure_fails_closed_with_safe_category():
+    from kr_stock_autotrader.market_data import build_premarket_snapshot_with_retry
+    as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
+    result = build_premarket_snapshot_with_retry(
+        "005930", as_of, lambda *_: (_ for _ in ()).throw(RuntimeError("HTTP 503 secret")),
+        now=lambda: datetime(2026, 9, 2, 8, 1, tzinfo=KST), sleep=lambda _: None, max_attempts=2)
+    assert result["status"] == "unavailable"
+    assert result["diagnostic"] == {"category": "http", "attempt_count": 2, "readiness": "persistent_failure"}
+    assert "secret" not in str(result)
+
+
+def test_premarket_canary_timeout_fails_closed_before_open():
+    from kr_stock_autotrader.market_data import build_premarket_snapshot_with_retry
+    as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
+    result = build_premarket_snapshot_with_retry(
+        "005930", as_of, lambda *_: (_ for _ in ()).throw(RuntimeError("provider down")),
+        now=lambda: datetime(2026, 9, 2, 9, tzinfo=KST), sleep=lambda _: None)
+    assert result["status"] == "unavailable"
+    assert result["diagnostic"] == {"category": "provider", "attempt_count": 0, "readiness": "premarket_deadline"}
+
+
 def test_same_day_bar_is_a_fail_closed_provider_error():
     from kr_stock_autotrader.market_data import build_premarket_snapshot
     as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
@@ -124,6 +162,18 @@ def test_same_day_bar_is_a_fail_closed_provider_error():
     result = build_premarket_snapshot("005930", as_of, lambda *_: official_snapshot(rows))
     assert result["status"] == "unavailable"
     assert result["reason"] == "daily_bars_unavailable_or_invalid"
+    assert result["diagnostic"] == {"category": "date_range"}
+
+
+def test_duplicate_and_future_daily_bars_are_structured_fail_closed_diagnostics():
+    from kr_stock_autotrader.market_data import build_premarket_snapshot
+    as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
+    duplicate = [dict(row) for row in history()]
+    duplicate[1]["stck_bsop_date"] = duplicate[0]["stck_bsop_date"]
+    for rows in (duplicate, [bar(as_of.date() + timedelta(days=1), 130)] + history()):
+        result = build_premarket_snapshot("005930", as_of, lambda *_: official_snapshot(rows))
+        assert result["status"] == "unavailable"
+        assert result["diagnostic"] == {"category": "date_range"}
 
 
 @pytest.mark.parametrize("missing_from", ["stock", "benchmark"])

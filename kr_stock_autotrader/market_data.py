@@ -10,6 +10,7 @@ fail closed.
 from __future__ import annotations
 import math
 import os
+import time as clock
 from datetime import datetime, time, timedelta
 from typing import Callable
 from .domain import KRX_REGULAR_OPEN, KST, is_krx_business_date, now_kst, parse_kst, previous_krx_business_dates
@@ -25,6 +26,8 @@ RETURN_HORIZON_SESSIONS = 20
 MIN_SHORT_TERM_SESSIONS = 2
 SHORT_TERM_RISE_SESSIONS = 2
 KST_CASH_CLOSE = time(15, 30)
+PREMARKET_MAX_ATTEMPTS = 3
+PREMARKET_RETRY_SECONDS = 2.0
 
 
 def _number(value: object, *, positive: bool = False) -> float:
@@ -110,11 +113,38 @@ def _known_at(day) -> datetime:
     return datetime.combine(day, KST_CASH_CLOSE, tzinfo=KST)
 
 
-def _unavailable(symbol: str, reason: str, retrieved: datetime | None = None) -> dict:
-    out = {"symbol": symbol, "status": "unavailable", "source": "KIS", "environment": "production", "reason": reason}
+def _unavailable(symbol: str, reason: str, retrieved: datetime | None = None, *, category: str = "provider") -> dict:
+    out: dict[str, object] = {"symbol": symbol, "status": "unavailable", "source": "KIS", "environment": "production", "reason": reason}
     if retrieved:
         out["retrieved_at"] = retrieved.isoformat()
+    # This is an allowlisted operational category, never exception text, payload,
+    # header, token, or credential material.
+    out["diagnostic"] = {"category": category}
     return out
+
+
+def _diagnostic_category(exc: Exception) -> str:
+    """Map failure boundaries to a secret-free, finite operational vocabulary."""
+    if isinstance(exc, KISOAuthCacheError):
+        return "auth"
+    message = str(exc).lower()
+    if "http" in message or "timeout" in message:
+        return "http"
+    if "rt_cd" in message or "msg_cd" in message:
+        return "kis_rt_cd_msg_cd"
+    if "listed" in message or "shares" in message:
+        return "listed_shares"
+    if "bar" in message and ("count" in message or "insufficient" in message):
+        return "bar_count"
+    if "date" in message or "business" in message or "same-day" in message or "future" in message:
+        return "date_range"
+    if "align" in message:
+        return "alignment"
+    if "contract" in message or "shape" in message or "malformed" in message:
+        return "output_shape"
+    if "number" in message or "validation" in message:
+        return "local_validation"
+    return "provider"
 
 
 def _current_premarket_retrieval(retrieved: datetime, requested_as_of: datetime) -> bool:
@@ -192,10 +222,43 @@ def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Calla
     except KISOAuthCacheError:
         # A cache failure is not missing/invalid daily bars.  Its public shape
         # remains secret-free and unavailable.
-        return _unavailable(symbol, "kis_oauth_cache_unavailable", retrieved)
-    except Exception:
-        # Provider/OAuth/HTTP/malformed responses are all intentionally collapsed.
-        return _unavailable(symbol, "daily_bars_unavailable_or_invalid", retrieved)
+        return _unavailable(symbol, "kis_oauth_cache_unavailable", retrieved, category="auth")
+    except Exception as exc:
+        # Provider/OAuth/HTTP/malformed responses remain fail-closed, but their
+        # public diagnostic is a finite secret-free category rather than text.
+        return _unavailable(symbol, "daily_bars_unavailable_or_invalid", retrieved, category=_diagnostic_category(exc))
+
+
+def build_premarket_snapshot_with_retry(symbol: str, as_of: datetime, daily_snapshot: Callable[..., object], announcement_at: str | None = None, *, now: Callable[[], datetime] = now_kst, sleep: Callable[[float], None] = clock.sleep, max_attempts: int = PREMARKET_MAX_ATTEMPTS) -> dict:
+    """Bounded stock+benchmark readiness canary for the 08:00 scheduler.
+
+    Each attempt calls the stock first; only a successful stock canary permits
+    the benchmark call inside ``build_premarket_snapshot``.  It never retries
+    after 09:00 KST and never turns an unavailable observation into data.
+    """
+    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
+        raise ValueError("invalid premarket attempt budget")
+    attempts = 0
+    last: dict | None = None
+    while attempts < max_attempts:
+        current = now()
+        if current.tzinfo is None or (current.astimezone(KST).date() == as_of.astimezone(KST).date() and current.astimezone(KST).time() >= KRX_REGULAR_OPEN):
+            out = _unavailable(symbol, "premarket_readiness_deadline", current, category="provider")
+            out["diagnostic"] = {"category": "provider", "attempt_count": attempts, "readiness": "premarket_deadline"}
+            return out
+        attempts += 1
+        result = build_premarket_snapshot(symbol, as_of, daily_snapshot, announcement_at)
+        if result.get("status") == "ok":
+            result["attempt_count"] = attempts
+            result["readiness"] = "canary_recovered" if attempts > 1 else "canary_ready"
+            return result
+        last = result
+        if attempts < max_attempts:
+            sleep(PREMARKET_RETRY_SECONDS)
+    assert last is not None
+    category = last.get("diagnostic", {}).get("category", "provider")
+    last["diagnostic"] = {"category": category, "attempt_count": attempts, "readiness": "persistent_failure"}
+    return last
 
 
 def _threshold(name: str) -> float:

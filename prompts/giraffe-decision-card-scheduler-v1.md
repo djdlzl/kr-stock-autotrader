@@ -34,6 +34,7 @@
 - `collected_at`이 과거 날짜인 미처리 evidence는 자동으로 섞지 않는다. 별도 복구 run에서만 처리한다.
 - 같은 evidence version, filter lineage, prompt version/hash로 이미 카드가 있으면 재생성하지 않는다.
 - 처리 대상이 0건이면 두 API readback 정상 여부를 확인한 뒤 `done`, count=0으로 종료한다.
+- `scheduler-start`가 기존 terminal run을 `idempotent=true`로 반환하면 그 run의 stored count/detail을 readback하고 즉시 종료한다. 기존 `started` run은 같은 `run_key`로 재개하되, 마지막에는 반드시 terminal `scheduler-finish`를 한 번 호출한다; `started` residue를 남기지 않는다.
 
 ## scheduler 날짜 축 문서화
 
@@ -54,6 +55,13 @@
 - 숫자 단위, 부호, 분모, 기준일을 filter 입력의 출처 메모와 함께 보존한다.
 
 ## 08:00 snapshot → filter → card 실행 연결
+
+### KIS premarket readiness / bounded retry
+
+- fanout 전에 one stock + benchmark canary를 수행한다. `market-snapshot`은 stock first, then benchmark only after the stock canary succeeds; KIS requests retain the process-wide 100,000,000 ns minimum request-start spacing.
+- transient canary failure may retry at most 3 total attempts with a fixed bounded delay. Do not retry at or after 09:00 KST. Persistent failure or deadline produces only unavailable filter inputs and non-buy hold cards; it never creates invented bars, zero values, or PASS cards.
+- Store terminal scheduler `detail` with `attempt_count`, `eligible_count`, `completed_count`, `failure_reasons` (counts keyed only by diagnostic category), and `readiness`. The permitted secret-free categories are `provider`, `auth`, `http`, `kis_rt_cd_msg_cd`, `output_shape`, `listed_shares`, `bar_count`, `date_range`, `alignment`, and `local_validation`.
+- Do not store exception text, HTTP bodies, headers, OAuth tokens, application keys/secrets, account values, or any credential value in scheduler detail, snapshots, cards, or reports.
 
 각 eligible evidence마다 `announcement_at`를 포함해 아래 순서로 실제 API/CLI를 호출한다. snapshot의 `filter_inputs` 전체 객체를 그대로 사용하고 숫자/관측가능성/임계값 필드를 임의 변경하지 않는다. `evidence 필드만 merge`한다. 즉 evidence에서 확인된 `source`, `announcement_at`, `economic_terms` 객체 전체(있다면 `expected_price_inputs`를 drop/rename/stringify하지 않고 보존), 중복/상충 여부만 안전하게 merge한다.
 

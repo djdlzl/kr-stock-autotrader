@@ -195,3 +195,17 @@ def test_scheduler_start_is_idempotent_and_missing_finish_is_404(monkeypatch, tm
     assert client.post("/api/internal/scheduler-runs/missing/finish",json={"status":"done"},headers=headers).status_code==404
     done=client.post("/api/internal/scheduler-runs/0800-2026-08-31/finish",json={"status":"done","count":2,"detail":{"skipped":1}},headers=headers)
     assert done.status_code==200 and done.json()["count"]==2
+
+
+def test_scheduler_finish_is_idempotent_and_preserves_premarket_counts(monkeypatch, tmp_path):
+    monkeypatch.setenv("INTERNAL_API_KEY", "test-key")
+    monkeypatch.setattr(dbmod, "DATABASE_PATH", str(tmp_path / "scheduler-finish.db"))
+    from app import app
+    client=TestClient(app); headers={"X-Internal-API-Key":"test-key"}
+    client.post("/api/internal/scheduler-runs/card-2026-09-02-0800-kst/start",json={"kind":"card"},headers=headers)
+    detail={"attempt_count":2,"eligible_count":3,"completed_count":3,"failure_reasons":{"http":1},"readiness":"canary_recovered"}
+    first=client.post("/api/internal/scheduler-runs/card-2026-09-02-0800-kst/finish",json={"status":"done","count":3,"detail":detail},headers=headers)
+    assert first.status_code == 200 and first.json()["idempotent"] is False
+    duplicate=client.post("/api/internal/scheduler-runs/card-2026-09-02-0800-kst/finish",json={"status":"error","count":0,"detail":{}},headers=headers)
+    assert duplicate.status_code == 200
+    assert duplicate.json() == {"run_key":"card-2026-09-02-0800-kst","status":"done","count":3,"detail":detail,"idempotent":True}
