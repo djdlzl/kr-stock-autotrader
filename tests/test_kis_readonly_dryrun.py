@@ -84,6 +84,55 @@ def test_allowlisted_request_start_throttle_serializes_concurrent_clients(monkey
     starts = sorted(transport.starts)
     assert starts == pytest.approx([100.0, 100.1, 100.2, 100.3])
 
+
+@pytest.mark.parametrize(
+    ("request_order", "expected_starts"),
+    [
+        ("subclass_then_base", [100.0, 100.1]),
+        ("base_then_subclass_then_base", [100.0, 100.1, 100.2]),
+    ],
+)
+def test_request_start_throttle_is_shared_across_base_and_subclass_clients(
+    monkeypatch, request_order, expected_starts
+):
+    """Inherited clients cannot fork the process-local request-start timeline."""
+    import kr_stock_autotrader.kis_readonly as kis
+
+    clock = [100.0]
+    monkeypatch.setattr(kis.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        kis.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+    monkeypatch.setattr(KISReadOnlyClient, "_last_request_started", None)
+
+    class InheritedKISReadOnlyClient(KISReadOnlyClient):
+        pass
+
+    class TimestampedTransport:
+        def __init__(self):
+            self.starts = []
+
+        def request(self, method, url, **kwargs):
+            self.starts.append(clock[0])
+            return Response({})
+
+    transport = TimestampedTransport()
+    base = KISReadOnlyClient("key", "value", transport=transport)
+    inherited = InheritedKISReadOnlyClient("key", "value", transport=transport)
+    clients = (
+        (inherited, base)
+        if request_order == "subclass_then_base"
+        else (base, inherited, base)
+    )
+
+    for client in clients:
+        client._request("GET", QUOTE_PATH)
+
+    assert transport.starts == pytest.approx(expected_starts)
+
+
 def test_kis_allowlist_pinned_host_and_safe_actual_projection(monkeypatch):
     t=FakeTransport(); k=KISReadOnlyClient('app-secret-key','app-secret-value',base_url=PRODUCTION_BASE_URL+'/',transport=t)
     q=k.current_price('005930')

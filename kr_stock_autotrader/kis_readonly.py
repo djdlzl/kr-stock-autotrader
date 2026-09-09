@@ -118,14 +118,14 @@ class KISReadOnlyClient:
     def _request(self, method: str, path: str, **kwargs):
         if (method, path) not in {("POST", OAUTH_PATH), ("GET", QUOTE_PATH), ("GET", ORDERBOOK_PATH), ("GET", DAILY_CHART_PATH), ("GET", INTRADAY_MINUTE_PATH)}:
             raise ValueError("non-allowlisted KIS request")
-        # The lock is process-local and spans the actual transport start so a
-        # preempted caller cannot be overtaken after reserving its time slot.
-        with self._request_start_lock:
-            if self._last_request_started is not None:
-                deadline = self._last_request_started + REQUEST_START_INTERVAL_SECONDS
+        # The base-class state is process-local and spans the actual transport
+        # start, so inherited clients cannot fork the request-start timeline.
+        with KISReadOnlyClient._request_start_lock:
+            if KISReadOnlyClient._last_request_started is not None:
+                deadline = KISReadOnlyClient._last_request_started + REQUEST_START_INTERVAL_SECONDS
                 while (remaining := deadline - time.monotonic()) > 0:
                     time.sleep(remaining)
-            self.__class__._last_request_started = time.monotonic()
+            KISReadOnlyClient._last_request_started = time.monotonic()
             return self._transport.request(method, self._base_url + path, **kwargs)
 
     def _clear_token(self) -> None:
