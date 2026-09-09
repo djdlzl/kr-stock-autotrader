@@ -28,6 +28,8 @@ SHORT_TERM_RISE_SESSIONS = 2
 KST_CASH_CLOSE = time(15, 30)
 PREMARKET_MAX_ATTEMPTS = 3
 PREMARKET_RETRY_SECONDS = 2.0
+PREMARKET_RETRY_START = time(8)
+PREMARKET_RETRY_START_END = time(8, 10)
 
 
 def _number(value: object, *, positive: bool = False) -> float:
@@ -167,6 +169,19 @@ class _PremarketProviderDeadline(Exception):
         self.current = current
 
 
+def _initial_premarket_retry_start_is_valid(as_of: object, current: object) -> bool:
+    """Allow a retry run to begin only in its scheduled 08:00 KST window."""
+    if not isinstance(as_of, datetime) or as_of.tzinfo is None or not isinstance(current, datetime) or current.tzinfo is None:
+        return False
+    scheduled = as_of.astimezone(KST)
+    started = current.astimezone(KST)
+    return (
+        scheduled.date() == started.date()
+        and PREMARKET_RETRY_START <= scheduled.time() < PREMARKET_RETRY_START_END
+        and PREMARKET_RETRY_START <= started.time() < PREMARKET_RETRY_START_END
+    )
+
+
 def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Callable[..., object], announcement_at: str | None = None, *, before_provider_call: Callable[[], None] | None = None) -> dict:
     """Build a 20-session, aligned snapshot from completed sessions only."""
     retrieved = now_kst()
@@ -248,11 +263,12 @@ def build_premarket_snapshot(symbol: str, as_of: datetime, daily_snapshot: Calla
 
 
 def build_premarket_snapshot_with_retry(symbol: str, as_of: datetime, daily_snapshot: Callable[..., object], announcement_at: str | None = None, *, now: Callable[[], datetime] | None = None, sleep: Callable[[float], None] = clock.sleep, max_attempts: int = PREMARKET_MAX_ATTEMPTS) -> dict:
-    """Bounded 08:00-only readiness retry with a pre-call KST cutoff.
+    """Bounded 08:00 readiness retry with an initial-start window and cutoff.
 
-    The gate runs immediately before each provider invocation, including the
-    benchmark call after a successful stock response. No provider call starts
-    at or after 09:00 KST, or on a date other than the scheduled ``as_of`` date.
+    A run and its ``as_of`` must both begin on the same KST date during
+    [08:00:00, 08:10:00). Once started, the gate runs immediately before each
+    provider invocation, including the benchmark call after a successful stock
+    response. No provider call starts at or after 09:00 KST.
     """
     if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
         raise ValueError("invalid premarket attempt budget")
@@ -261,6 +277,25 @@ def build_premarket_snapshot_with_retry(symbol: str, as_of: datetime, daily_snap
         current = now()
         out = _unavailable(symbol, "premarket_readiness_deadline", current, category="provider")
         out["diagnostic"] = {"category": "date_range", "attempt_count": 0, "readiness": "invalid_as_of"}
+        return out
+    initial_current = now()
+    if not _initial_premarket_retry_start_is_valid(as_of, initial_current):
+        deadline_passed = (
+            isinstance(initial_current, datetime)
+            and initial_current.tzinfo is not None
+            and initial_current.astimezone(KST).time() >= KRX_REGULAR_OPEN
+        )
+        readiness = "premarket_deadline" if deadline_passed else "invalid_as_of"
+        out = _unavailable(
+            symbol, "premarket_readiness_deadline",
+            initial_current if isinstance(initial_current, datetime) else None,
+            category="provider" if deadline_passed else "date_range",
+        )
+        out["diagnostic"] = {
+            "category": "provider" if deadline_passed else "date_range",
+            "attempt_count": 0,
+            "readiness": readiness,
+        }
         return out
     attempts = 0
     last: dict | None = None

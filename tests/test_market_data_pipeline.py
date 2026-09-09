@@ -149,7 +149,11 @@ def test_premarket_cutoff_is_checked_before_benchmark_call_after_stock_returns()
     from kr_stock_autotrader.market_data import build_premarket_snapshot_with_retry
     as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
     calls = []
-    clock = iter((datetime(2026, 9, 2, 8, 59, 59, tzinfo=KST), datetime(2026, 9, 2, 9, tzinfo=KST)))
+    clock = iter((
+        datetime(2026, 9, 2, 8, 1, tzinfo=KST),
+        datetime(2026, 9, 2, 8, 59, 59, tzinfo=KST),
+        datetime(2026, 9, 2, 9, tzinfo=KST),
+    ))
     def provider(symbol, *_):
         calls.append(symbol)
         return official_snapshot()
@@ -194,6 +198,66 @@ def test_cross_date_or_naive_as_of_never_starts_provider_requests():
         assert calls == []
         assert result["diagnostic"]["attempt_count"] == 0
         assert result["diagnostic"]["readiness"] == "invalid_as_of"
+
+
+@pytest.mark.parametrize("current", [
+    datetime(2026, 9, 2, 7, 59, 59, tzinfo=KST),
+    datetime(2026, 9, 2, 8, 10, tzinfo=KST),
+    datetime(2026, 9, 2, 8, 30, tzinfo=KST),
+    datetime(2026, 9, 3, 8, 1, tzinfo=KST),
+])
+def test_premarket_retry_initial_start_window_rejects_outside_window_without_provider_calls(current):
+    from kr_stock_autotrader.market_data import build_premarket_snapshot_with_retry
+    calls = []
+    result = build_premarket_snapshot_with_retry(
+        "005930", datetime(2026, 9, 2, 8, tzinfo=KST),
+        lambda *args: calls.append(args), now=lambda: current, sleep=lambda _: None)
+    assert calls == []
+    assert result["status"] == "unavailable"
+    assert result["diagnostic"] == {"category": "date_range", "attempt_count": 0, "readiness": "invalid_as_of"}
+
+
+def test_premarket_retry_initial_start_window_includes_0800_and_excludes_0810():
+    from kr_stock_autotrader.market_data import build_premarket_snapshot_with_retry
+    for current, expected_calls in (
+        (datetime(2026, 9, 2, 8, 0, tzinfo=KST), 2),
+        (datetime(2026, 9, 2, 8, 9, 59, 999999, tzinfo=KST), 2),
+        (datetime(2026, 9, 2, 8, 10, tzinfo=KST), 0),
+    ):
+        calls = []
+        result = build_premarket_snapshot_with_retry(
+            "005930", datetime(2026, 9, 2, 8, tzinfo=KST),
+            lambda symbol, *_: calls.append(symbol) or official_snapshot(),
+            now=lambda: current, sleep=lambda _: None)
+        assert len(calls) == expected_calls
+        assert result["status"] == ("ok" if expected_calls else "unavailable")
+
+
+def test_premarket_retry_rejects_out_of_window_as_of_without_provider_calls():
+    from kr_stock_autotrader.market_data import build_premarket_snapshot_with_retry
+    calls = []
+    result = build_premarket_snapshot_with_retry(
+        "005930", datetime(2026, 9, 2, 8, 30, tzinfo=KST),
+        lambda *args: calls.append(args), now=lambda: datetime(2026, 9, 2, 8, 1, tzinfo=KST), sleep=lambda _: None)
+    assert calls == []
+    assert result["diagnostic"] == {"category": "date_range", "attempt_count": 0, "readiness": "invalid_as_of"}
+
+
+def test_premarket_retry_api_rejects_0830_without_provider_calls(monkeypatch):
+    from fastapi.testclient import TestClient
+    from kr_stock_autotrader import api, market_data
+    calls = []
+    monkeypatch.setenv("INTERNAL_API_KEY", "test-key")
+    monkeypatch.setattr(market_data, "now_kst", lambda: datetime(2026, 9, 2, 8, 30, tzinfo=KST))
+    monkeypatch.setattr(api.app.state, "kis_daily_snapshot_provider", lambda *args: calls.append(args) or official_snapshot(), raising=False)
+    response = TestClient(api.app).post(
+        "/api/internal/market-snapshots/005930", headers={"X-Internal-API-Key": "test-key"},
+        json={"as_of": "2026-09-02T08:00:00+09:00", "premarket_retry": True})
+    assert calls == []
+    assert response.status_code == 200
+    assert response.json()["snapshot"]["status"] == "unavailable"
+    assert response.json()["snapshot"]["diagnostic"] == {
+        "category": "date_range", "attempt_count": 0, "readiness": "invalid_as_of"}
 
 
 @pytest.mark.parametrize("stock", [
