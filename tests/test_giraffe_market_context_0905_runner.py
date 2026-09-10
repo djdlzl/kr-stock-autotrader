@@ -128,6 +128,35 @@ def test_success_uses_authoritative_cards_and_exact_readbacks(runner, env_file, 
     ]
 
 
+def test_exact_authoritative_empty_cards_terminalize_done_zero_with_readback(runner, env_file, monkeypatch, capsys):
+    aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
+    calls = install_network(monkeypatch, runner, ids=(), latest_payloads=[
+        card_latest(()), {"run_key": aggregate_key, "status": "done", "detail": {"count": 0}},
+    ])
+
+    assert runner.main(["--source-topic", "telegram:mac:7923", "--env-file", str(env_file)], now=now()) == 0
+    assert capsys.readouterr().out.strip() == "시장맥락 완료 count=0"
+    assert [(method, path) for method, path, _, _ in calls if "/cards/" in path or "/market-context-runs/" in path] == []
+    finishes = [payload for method, path, payload, _ in calls if method == "POST" and path.endswith("/finish")]
+    assert finishes == [{"status": "done", "count": 0, "detail": {"cards": {"ids": []}, "as_of": "2026-09-09T09:05:00+09:00"}}]
+    assert calls[-1][1] == "/api/internal/scheduler-runs/latest?kind=market_context&date=2026-09-09"
+
+
+@pytest.mark.parametrize("run,reason", [
+    ({}, "authoritative_card_ids_missing"),
+    ({"detail": {"detail": {"cards": {}}}}, "authoritative_card_ids_missing"),
+    ({"detail": {"detail": {"cards": {"ids": "[]"}}}}, "authoritative_card_ids_invalid"),
+    ({"detail": {"detail": {"cards": {"ids": None}}}}, "authoritative_card_ids_invalid"),
+    ({"detail": {"detail": {"cards": {"ids": [101, "202"]}}}}, "authoritative_card_ids_invalid"),
+    ({"detail": {"detail": {"cards": {"ids": [0]}}}}, "authoritative_card_ids_invalid"),
+    ({"detail": {"detail": {"cards": {"ids": [-1]}}}}, "authoritative_card_ids_invalid"),
+    ({"detail": {"detail": {"cards": {"ids": [101, 101]}}}}, "authoritative_card_ids_duplicate"),
+])
+def test_card_authority_rejects_absent_or_malformed_contract(runner, run, reason):
+    with pytest.raises(runner.RunFailure, match=reason):
+        runner.card_ids(run)
+
+
 @pytest.mark.parametrize("status", ["HOLD_MISSING_INPUT", "HOLD_INVALID_INPUT", "COMPUTED"])
 def test_expected_price_terminal_statuses_complete_with_the_existing_two_card_calls(runner, env_file, monkeypatch, capsys, status):
     aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"

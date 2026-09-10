@@ -110,11 +110,14 @@ def api(env: Dict[str, str], method: str, path: str, payload: Dict[str, Any] | N
 
 
 def card_ids(run: Dict[str, Any]) -> list[int]:
+    """Accept only the exact scheduler-owned card list, including its empty no-op."""
     try:
         ids = run["detail"]["detail"]["cards"]["ids"]
     except (KeyError, TypeError):
         raise RunFailure("cards", "authoritative_card_ids_missing")
-    if not isinstance(ids, list) or not ids or any(type(item) is not int or item <= 0 for item in ids):
+    if not isinstance(ids, list):
+        raise RunFailure("cards", "authoritative_card_ids_invalid")
+    if any(type(item) is not int or item <= 0 for item in ids):
         raise RunFailure("cards", "authoritative_card_ids_invalid")
     if len(set(ids)) != len(ids):
         raise RunFailure("cards", "authoritative_card_ids_duplicate")

@@ -85,6 +85,30 @@ def test_release0_renderer_uses_the_real_detail_trust_projection_and_fails_close
     assert json.loads(output) == ["GOOD", None, None, None]
 
 
+def test_release0_renderer_glow_requires_exact_label_to_match_correspondence():
+    html = authenticated_app_html()
+    script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+    scenario = re.search(r"function trustedScenario.*?(?=function scenarioLabel)", script, re.S).group(0)
+
+    def payload(label, match):
+        return {"event_scenarios": [{
+            "tracking_state": "ACTIVE",
+            "trust": {"freshness": "FRESH", "context_readiness": "READY", "status": "READY"},
+            "current": {"active_scenario_label": label, "market_context_status": "VERIFIED", "match": match},
+            "scenarios": [{"label": "GOOD"}, {"label": "BASE"}, {"label": "BAD"}],
+        }]}
+
+    cases = [
+        payload("GOOD", "GOOD_MATCH"), payload("BASE", "BASE_MATCH"), payload("BAD", "BAD_MATCH"),
+        payload("GOOD", "BASE_MATCH"), payload("GOOD", "BAD_MATCH"),
+        payload("BASE", "GOOD_MATCH"), payload("BASE", "BAD_MATCH"),
+        payload("BAD", "GOOD_MATCH"), payload("BAD", "BASE_MATCH"),
+    ]
+    node = scenario + "\nconst cases=" + json.dumps(cases) + ";console.log(JSON.stringify(cases.map(trustedScenario)));"
+    output = subprocess.check_output(["node", "-e", node], text=True, env=os.environ).strip()
+    assert json.loads(output) == ["GOOD", "BASE", "BAD", None, None, None, None, None, None]
+
+
 def test_release0_detail_api_projects_trust_for_a_real_verified_match(monkeypatch, tmp_path):
     from kr_stock_autotrader import db as dbmod
     from kr_stock_autotrader.domain import parse_kst
