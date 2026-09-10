@@ -64,6 +64,34 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(result["duplicates"], [])
         self.assertEqual(result["material_candidate_count"], 113)
 
+    def test_stock_cancellation_filings_are_material_candidates(self):
+        records = {
+            "20260909800465": "삼표시멘트 주식소각결정",
+            "20260909900188": "아이퀘스트 주식소각",
+            "20260909900999": "정기공시",
+        }
+        rows = "".join(
+            "<tr><td><a onclick=\"openReportViewer('%s'); return false;\">%s</a></td>"
+            "<td>%s</td></tr>" % (receipt, title, receipt)
+            for receipt, title in records.items()
+        )
+        document = (
+            '<input id="totalCnt" value="3">'
+            '<div class="pageInfo">[1/1] [총 3건]</div>'
+            f"<table>{rows}</table>"
+        )
+
+        result = self.manifest.collect_manifest("20260909", lambda _date, _page: document)
+
+        self.assertEqual(
+            [record["rcp_no"] for record in result["material_candidate_records"]],
+            ["20260909800465", "20260909900188"],
+        )
+        self.assertNotIn(
+            "20260909900999",
+            [record["rcp_no"] for record in result["material_candidate_records"]],
+        )
+
     def test_incomplete_duplicate_case_fails_closed(self):
         docs = {
             1: dart_page(1, 2, 3, ["20260901000001", "20260901000002"]),
