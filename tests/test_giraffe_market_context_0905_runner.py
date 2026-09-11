@@ -53,6 +53,7 @@ def install_network(monkeypatch, runner, *, ids=(101, 202), missing_key=None, fa
                     expected_status_by_card=None, expected_override=None, fail_finish=False):
     calls = []
     as_of_by_key = {}
+    finished_payload = {}
     starts = starts if starts is not None else []
     latest_payloads = list(latest_payloads or [])
 
@@ -63,7 +64,10 @@ def install_network(monkeypatch, runner, *, ids=(101, 202), missing_key=None, fa
         calls.append((method, path, payload, dict(request.header_items())))
         if path.startswith("/api/internal/scheduler-runs/latest?"):
             if latest_payloads:
-                return Response(latest_payloads.pop(0))
+                latest = latest_payloads.pop(0)
+                if latest.get("status") == "done" and latest.get("detail") == {"count": len(ids)}:
+                    latest["detail"] = finished_payload.copy()
+                return Response(latest)
             return Response(card_latest(ids))
         if path.endswith("/start"):
             starts.append(payload)
@@ -71,14 +75,14 @@ def install_network(monkeypatch, runner, *, ids=(101, 202), missing_key=None, fa
         if "/cards/" in path and path.endswith("/market-context"):
             assert isinstance(payload, dict)
             card_id = int(path.split("/")[4])
-            as_of_by_key[payload["run_key"]] = payload["as_of"]
             if card_id == failed_card:
                 from urllib.error import HTTPError
                 raise HTTPError(request.full_url, 409, "blocked", None, None)
+            as_of_by_key[payload["run_key"]] = payload["as_of"]
             return Response({"run_key": payload["run_key"]})
         if "/market-context-runs/" in path:
             key = path.rsplit("/", 1)[1]
-            if key == missing_key:
+            if key == missing_key or key not in as_of_by_key:
                 from urllib.error import HTTPError
                 raise HTTPError(request.full_url, 404, "missing", None, None)
             card_id = int(key.rsplit("-", 1)[1])
@@ -96,6 +100,7 @@ def install_network(monkeypatch, runner, *, ids=(101, 202), missing_key=None, fa
             if fail_finish:
                 from urllib.error import HTTPError
                 raise HTTPError(request.full_url, 503, "unavailable", None, None)
+            finished_payload.update(payload)
             return Response({"status": payload["status"]})
         raise AssertionError(path)
 
@@ -118,14 +123,18 @@ def test_success_uses_authoritative_cards_and_exact_readbacks(runner, env_file, 
     ]
     assert [path for _, path, _, _ in calls if "/market-context-runs/" in path] == [
         "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-101",
+        "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-101",
+        "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-202",
         "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-202",
     ]
     assert calls[-2][2]["status"] == "done"
     assert calls[-1][1] == "/api/internal/scheduler-runs/latest?kind=market_context&date=2026-09-09"
     card_steps = [(method, path) for method, path, _, _ in calls if "/cards/" in path or "/market-context-runs/" in path]
     assert card_steps == [
+        ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-101"),
         ("POST", "/api/internal/cards/101/market-context"),
         ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-101"),
+        ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-202"),
         ("POST", "/api/internal/cards/202/market-context"),
         ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-202"),
     ]
@@ -199,7 +208,7 @@ def test_card_authority_rejects_absent_or_malformed_contract(runner, run, reason
 
 
 @pytest.mark.parametrize("status", ["HOLD_MISSING_INPUT", "HOLD_INVALID_INPUT", "COMPUTED"])
-def test_expected_price_terminal_statuses_complete_with_the_existing_two_card_calls(runner, env_file, monkeypatch, capsys, status):
+def test_expected_price_terminal_statuses_complete_with_preflight_and_readback(runner, env_file, monkeypatch, capsys, status):
     aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
     calls = install_network(monkeypatch, runner, ids=(101,), expected_status=status, latest_payloads=[
         card_latest((101,)), {"run_key": aggregate_key, "status": "done", "detail": {"count": 1}},
@@ -207,12 +216,13 @@ def test_expected_price_terminal_statuses_complete_with_the_existing_two_card_ca
     assert runner.main(["--source-topic", "telegram:mac:7923", "--env-file", str(env_file)], now=now()) == 0
     assert capsys.readouterr().out.strip() == "시장맥락 완료 count=1"
     assert [(method, path) for method, path, _, _ in calls if "/cards/" in path or "/market-context-runs/" in path] == [
+        ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-101"),
         ("POST", "/api/internal/cards/101/market-context"),
         ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-101"),
     ]
 
 
-def test_mixed_computed_and_hold_expected_prices_complete_with_no_extra_card_calls(runner, env_file, monkeypatch, capsys):
+def test_mixed_computed_and_hold_expected_prices_complete_with_preflight_and_readback(runner, env_file, monkeypatch, capsys):
     aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
     calls = install_network(monkeypatch, runner, expected_status_by_card={101: "COMPUTED", 202: "HOLD_MISSING_INPUT"}, latest_payloads=[
         card_latest(), {"run_key": aggregate_key, "status": "done", "detail": {"count": 2}},
@@ -220,8 +230,10 @@ def test_mixed_computed_and_hold_expected_prices_complete_with_no_extra_card_cal
     assert runner.main(["--source-topic", "telegram:mac:7923", "--env-file", str(env_file)], now=now()) == 0
     assert capsys.readouterr().out.strip() == "시장맥락 완료 count=2"
     assert [(method, path) for method, path, _, _ in calls if "/cards/" in path or "/market-context-runs/" in path] == [
+        ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-101"),
         ("POST", "/api/internal/cards/101/market-context"),
         ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-101"),
+        ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-202"),
         ("POST", "/api/internal/cards/202/market-context"),
         ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-202"),
     ]
@@ -240,6 +252,7 @@ def test_expected_price_failure_or_lineage_mismatch_terminalizes_aggregate(runne
     assert "card_101_expected_price_mismatch" in capsys.readouterr().out
     assert calls[-2][2]["status"] == "error"
     assert [(method, path) for method, path, _, _ in calls if "/cards/" in path or "/market-context-runs/" in path] == [
+        ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-101"),
         ("POST", "/api/internal/cards/101/market-context"),
         ("GET", "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-101"),
     ]
@@ -433,7 +446,7 @@ def test_monotonic_done_needs_fresh_readback_or_never_leaves_started(runner, mon
             latest_calls.append(path)
             if "kind=card" in path:
                 return Response(card_latest((101,)))
-            return Response({"run_key": key, "status": aggregate["status"], "detail": {"count": 1}})
+            return Response({"run_key": key, "status": aggregate["status"], "detail": {"count": 1, "detail": {"cards": {"ids": [101], "observation_as_of": {"101": "2026-09-09T09:05:53+09:00"}}}}})
         if path.endswith("/start"):
             aggregate["status"] = "started"
             return Response({"run_key": key, "kind": "market_context", "status": "started"})
@@ -477,7 +490,7 @@ def test_monotonic_slot_accounting_success_has_fresh_done_readback(runner, monke
             if "kind=card" in path:
                 return Response(card_latest((101,)))
             market_latest.append(aggregate["status"])
-            return Response({"run_key": key, "status": aggregate["status"], "detail": {"count": 1}})
+            return Response({"run_key": key, "status": aggregate["status"], "detail": {"count": 1, "detail": {"cards": {"ids": [101], "observation_as_of": {"101": "2026-09-09T09:05:53+09:00"}}}}})
         if path.endswith("/start"):
             aggregate["status"] = "started"
             return Response({"run_key": key, "kind": "market_context", "status": "started"})

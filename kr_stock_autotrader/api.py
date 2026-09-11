@@ -231,6 +231,11 @@ def _valid_kis_retrieved_at(value: object) -> str | None:
     return value if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
 
 
+def _server_now_kst() -> datetime:
+    """Authoritative server clock; tests may inject app.state.now_kst."""
+    return getattr(app.state, "now_kst", now_kst)()
+
+
 def _kis_timestamp_pair_is_current(retrieved_at: str, quote_known_at: str) -> bool:
     """Accept only coherent, current network-observation timestamps.
 
@@ -1060,6 +1065,8 @@ async def internal_card_expected_price(card_id: int, request: Request, _: None =
         except (ValidationError, ValueError):
             raise HTTPException(422, "invalid expected price request")
         as_of = parse_kst(data.as_of)
+        if as_of > _server_now_kst():
+            raise HTTPException(409, "as_of must not be in the future")
         if not is_krx_business_date(as_of.date()) or as_of.time() < time(9, 5) or as_of.time() >= time(9, 25):
             raise HTTPException(409, "expected price outside operational window")
         card = db.execute("SELECT * FROM decision_cards WHERE id=?", (card_id,)).fetchone()
@@ -1113,6 +1120,8 @@ async def internal_card_market_context(card_id: int, request: Request, _: None =
         ):
             raise HTTPException(409, "market context requires current 08:00 lineage")
         as_of = parse_kst(data.as_of)
+        if as_of > _server_now_kst():
+            raise HTTPException(409, "as_of must not be in the future")
         if not is_krx_business_date(as_of.date()) or as_of.time() < time(9, 5) or as_of.time() >= time(9, 25):
             raise HTTPException(409, "market context outside operational window")
         benchmark_symbol, previous_close = resolve_intraday_lineage_context(card=dict(card), evidence=evidence, filter_result=filter_result)
@@ -1243,7 +1252,13 @@ async def scheduler_finish(run_key: str, request: Request, _: None = Depends(req
         existing=db.execute("SELECT kind FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
         if not existing: raise HTTPException(404,'scheduler run not found')
         finished = _safe_premarket_scheduler_finish(data) if _is_premarket_card_run(run_key, existing['kind']) else data
-        db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=?",(finished['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(finished),run_key)); db.commit(); return {'run_key':run_key,'status':finished['status'],'count':finished.get('count',0),'detail':finished.get('detail',{})}
+        # The predicate is atomic: a concurrent retry cannot overwrite done.
+        updated = db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=? AND NOT (kind='market_context' AND status='done')",(finished['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(finished),run_key))
+        if updated.rowcount == 0:
+            persisted = db.execute("SELECT detail FROM scheduler_runs WHERE run_key=?", (run_key,)).fetchone()
+            finished = __import__('json').loads(persisted['detail'])
+        db.commit()
+        return {'run_key':run_key,'status':finished['status'],'count':finished.get('count',0),'detail':finished.get('detail',{})}
     finally: db.close()
 
 @app.get('/api/internal/scheduler-runs/latest')

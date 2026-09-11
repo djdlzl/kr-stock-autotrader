@@ -161,6 +161,29 @@ def expected_price_readback_matches(readback: Dict[str, Any], *, market_context_
     )
 
 
+def validate_child(readback: Dict[str, Any], *, key: str, card_id: int, date: str,
+                   as_of: str | None = None) -> str:
+    persisted = readback.get("requested_as_of")
+    try:
+        observed = datetime.fromisoformat(persisted)
+        if observed.utcoffset() != KST.utcoffset(observed):
+            raise ValueError("not KST")
+        observation_as_of(observed, date=date)
+    except (TypeError, ValueError):
+        raise RunFailure("readback", "card_%s_mismatch" % card_id)
+    if (readback.get("run_key") != key or readback.get("card_id") != card_id
+            or readback.get("source_topic") != API_SOURCE_TOPIC
+            or (as_of is not None and persisted != as_of)
+            or any(type(readback.get(field)) is not int or readback[field] <= 0
+                   for field in ("evidence_id", "filter_id"))):
+        raise RunFailure("readback", "card_%s_mismatch" % card_id)
+    if not expected_price_readback_matches(
+        readback, market_context_key=key, card_id=card_id, requested_as_of=persisted,
+    ):
+        raise RunFailure("expected_price", "card_%s_expected_price_mismatch" % card_id)
+    return persisted
+
+
 def failure_report(stage: str, count: int, reasons: Iterable[str]) -> str:
     compact = ",".join(str(reason) for reason in reasons if reason) or "unknown"
     return "시장맥락 오류 stage=%s count=%s reasons=%s" % (stage, count, compact)
@@ -172,10 +195,15 @@ def scheduler_latest(env: Dict[str, str], *, kind: str, date: str, budget: Reque
                budget=budget, reserve_slots=reserve_slots)
 
 
-def terminal_readback_matches(latest: Dict[str, Any], *, aggregate_key: str, status: str, count: int) -> bool:
+def terminal_readback_matches(latest: Dict[str, Any], *, aggregate_key: str, status: str, count: int,
+                              ids: list[int] | None = None, observations: dict[str, str] | None = None) -> bool:
     detail = latest.get("detail")
     return (latest.get("run_key") == aggregate_key and latest.get("status") == status
-            and isinstance(detail, dict) and detail.get("count") == count)
+            and isinstance(detail, dict) and detail.get("count") == count
+            and (status != "done" or (
+                ids is not None and observations is not None
+                and isinstance(detail.get("detail"), dict)
+                and detail["detail"].get("cards") == {"ids": ids, "observation_as_of": observations})))
 
 
 def observation_as_of(current: datetime, *, date: str) -> str:
@@ -291,19 +319,34 @@ def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight:
     for card_id in ids:
         key = card_run_key(date, card_id)
         try:
-            as_of = observation_as_of(wall_clock() if wall_clock is not None else current, date=date)
-            api(env, "POST", "/api/internal/cards/%s/market-context" % card_id,
-                {"run_key": key, "as_of": as_of}, budget=budget, reserve_slots=2)
-            readback = api(env, "GET", "/api/internal/market-context-runs/%s" % key,
-                           budget=budget, reserve_slots=2)
-            if (readback.get("run_key") != key or readback.get("card_id") != card_id
-                    or readback.get("requested_as_of") != as_of
-                    or readback.get("source_topic") != API_SOURCE_TOPIC):
+            child_path = "/api/internal/market-context-runs/%s" % key
+            existing = None
+            try:
+                existing = api(env, "GET", child_path, budget=budget, reserve_slots=2)
+            except RunFailure as exc:
+                if exc.stage != "api" or exc.reason != "http_404":
+                    raise
+            if existing is not None:
+                as_of = validate_child(existing, key=key, card_id=card_id, date=date)
+            else:
+                as_of = observation_as_of(wall_clock() if wall_clock is not None else current, date=date)
+            post_failure = None
+            try:
+                api(env, "POST", "/api/internal/cards/%s/market-context" % card_id,
+                    {"run_key": key, "as_of": as_of}, budget=budget, reserve_slots=3)
+            except RunFailure as exc:
+                if exc.stage != "api" or exc.reason not in {"request_failed", "invalid_response", "http_409"}:
+                    raise
+                post_failure = exc
+            try:
+                readback = api(env, "GET", child_path, budget=budget, reserve_slots=2)
+            except RunFailure:
+                if post_failure is not None:
+                    raise post_failure
+                raise
+            validate_child(readback, key=key, card_id=card_id, date=date, as_of=as_of)
+            if existing is not None and any(readback[field] != existing[field] for field in ("evidence_id", "filter_id")):
                 raise RunFailure("readback", "card_%s_mismatch" % card_id)
-            if not expected_price_readback_matches(
-                readback, market_context_key=key, card_id=card_id, requested_as_of=as_of,
-            ):
-                raise RunFailure("expected_price", "card_%s_expected_price_mismatch" % card_id)
             verified += 1
             card_as_of[str(card_id)] = as_of
         except RunFailure as exc:
@@ -320,7 +363,8 @@ def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight:
              "detail": {"cards": {"ids": ids, "observation_as_of": card_as_of}}},
             budget=budget, reserve_slots=1)
         fresh = scheduler_latest(env, kind="market_context", date=date, budget=budget)
-        if not terminal_readback_matches(fresh, aggregate_key=aggregate_key, status="done", count=verified):
+        if not terminal_readback_matches(fresh, aggregate_key=aggregate_key, status="done", count=verified,
+                                         ids=ids, observations=card_as_of):
             raise RunFailure("aggregate", "aggregate_done_readback_mismatch", verified)
     except RunFailure as exc:
         raise_after_error_terminalization(env, aggregate_key=aggregate_key, date=date, failure=exc, budget=budget)
