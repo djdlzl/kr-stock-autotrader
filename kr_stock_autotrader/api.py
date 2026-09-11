@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, StrictInt, ValidationError, field_validat
 from .auth import csrf_origin_ok, current_user, hash_password, issue_session, verify_password
 from .config import COOKIE_SECURE, LIVE_TRADING, SIGNUP_ENABLED
 from .db import connect
-from .domain import Quote, is_krx_business_date, market_open, parse_kst, now_kst
+from .domain import KST, Quote, is_krx_business_date, market_open, parse_kst, now_kst
 from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, current_filter_head, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML, PROTOTYPE_HTML
@@ -966,7 +966,13 @@ async def internal_market_snapshot(symbol: str, request: Request, _: None = Depe
     """Scheduler-only pre-market snapshot; returns safe data plus ready filter inputs."""
     try:
         data = await request.json()
-        as_of = parse_kst(data["as_of"])
+        raw_as_of = data["as_of"]
+        if not isinstance(raw_as_of, str) or "T" not in raw_as_of:
+            raise ValueError("as_of must include a time")
+        parsed_as_of = datetime.fromisoformat(raw_as_of)
+        if parsed_as_of.tzinfo is None:
+            raise ValueError("as_of must include an offset")
+        as_of = parsed_as_of.astimezone(KST)
     except (KeyError, TypeError, ValueError):
         raise HTTPException(422, "as_of must be KST ISO-8601")
     provider = getattr(app.state, "kis_daily_snapshot_provider", None)

@@ -21,6 +21,7 @@
 ## 실행 시작과 대상 고정
 
 - KST 실행일 `YYYY-MM-DD`와 `run_key=card-YYYY-MM-DD-0800-kst`를 만든다.
+- market snapshot의 `as_of`에는 날짜만 보내지 않는다. 반드시 `YYYY-MM-DDT08:00:00+09:00`처럼 KST timezone이 포함된 시각을 쓰며, 08:00 이상 08:10 미만이어야 한다. 날짜-only 값은 KST 자정으로 해석되어 premarket retry를 시작하지 못한다.
 - 이 KST 실행일이 scheduler run date이자 operation run date다. summary/detail/readback에서 날짜 축을 혼동하지 않는다.
 - `python -m kr_stock_autotrader.cli scheduler-start "$run_key" card`를 호출한다.
 - **처리 전에** `python -m kr_stock_autotrader.cli scheduler-latest research --date YYYY-MM-DD`로 같은 KST 실행일의 same-day latest `research` run을 조회한다.
@@ -47,6 +48,7 @@
 
 - evidence 발표·수집·known-at 이후, filter `known_at`과 `as_of` 이전에 확인된 정보만 사용한다.
 - 08:00 이후 장중 가격·거래량·공시 수정·결과를 사용하지 않는다.
+- material evidence의 `newness="correction"`은 DART/원문 사건이 정정되었다는 source-level 분류다. 이것만으로 deterministic filter의 successor/correction이 되지 않는다. 해당 evidence에 아직 filter head가 없으면 `parent_filter_id` 없이 첫 filter를 만든다. 기존 동일 evidence/filter identity의 원시 입력을 재평가할 때만 현재 head filter ID를 `parent_filter_id`로 보내 append-only successor를 만든다.
 - 정상 snapshot은 `evidence.known_at <= filter.known_at <= filter.as_of` 및 `market_data_known_at <= filter.known_at <= filter.as_of`를 각각 반드시 지킨다. unavailable snapshot은 market observation을 주장하지 않고 `market_data_attempted_at <= filter.known_at <= filter.as_of`만 사용한다. evidence와 시장 timestamp의 상대적 순서는 요구하지 않는다.
 - KIS market cap uses `output1.hts_avls`, a network-retrieval summary rather than a prior-close bar. The requested 08:00 `as_of` selects the current KST business date and its prior-KRX-business-date daily-bar cutoff; it does **not** require a network request to finish by 08:00:00. A normal snapshot must be retrieved on that KST date strictly before the 09:00 regular open. Its `market_data_known_at` is the actual retrieval timestamp (even though daily-bar provenance is the latest completed 15:30 close): use that timestamp for both final filter `known_at` and `as_of`, so evidence/market data are each `<= filter.known_at <= filter.as_of`. Historical-date or post-open retrieval is unavailable; never replay or backdate it.
 - 시각은 모두 timezone이 포함된 KST ISO-8601로 기록한다.

@@ -86,5 +86,30 @@ def test_local_workflow_successor_card_readback_and_no_orders(client):
 
 def test_prompt_preserves_v2_and_successor_contract():
     p=Path(__file__).parents[1]/"prompts/giraffe-decision-card-scheduler-v1.md"; text=p.read_text()
-    for field in ("filter_inputs","short_term_excess_return_pct","short_term_window","short_term_provenance","parent_filter_id","현재 head filter ID","evidence 필드만 merge"): assert field in text
+    for field in ("filter_inputs","short_term_excess_return_pct","short_term_window","short_term_provenance","parent_filter_id","현재 head filter ID","evidence 필드만 merge", "YYYY-MM-DDT08:00:00+09:00", "08:10 미만", "source-level 분류", "첫 filter를 만든다"): assert field in text
     assert "`id``" not in text
+
+
+def test_0800_snapshot_rejects_malformed_as_of_before_provider_call(client):
+    c, _ = client
+    calls = []
+    c.app.state.kis_daily_snapshot_provider = lambda *_: calls.append(True)
+
+    response = c.post(
+        "/api/internal/market-snapshots/005930", headers=INTERNAL,
+        json={"as_of": "2026-09-04"},
+    )
+
+    assert response.status_code == 422
+    assert calls == []
+
+
+def test_source_correction_starts_its_own_filter_lineage(client):
+    c, _ = client
+    source_correction = evidence("source-correction") | {"newness": "correction"}
+    saved = c.post("/api/internal/evidence", headers=INTERNAL, json=source_correction)
+    assert saved.status_code == 200
+    assert saved.json()["newness"] == "correction"
+    first_filter = post_f(c, saved.json()["id"], incomplete())
+    assert first_filter.status_code == 200
+    assert first_filter.json()["parent_filter_id"] is None
