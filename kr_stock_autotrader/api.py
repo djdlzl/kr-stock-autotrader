@@ -970,8 +970,8 @@ async def internal_market_snapshot(symbol: str, request: Request, _: None = Depe
         if not isinstance(raw_as_of, str) or "T" not in raw_as_of:
             raise ValueError("as_of must include a time")
         parsed_as_of = datetime.fromisoformat(raw_as_of)
-        if parsed_as_of.tzinfo is None:
-            raise ValueError("as_of must include an offset")
+        if parsed_as_of.tzinfo is None or parsed_as_of.utcoffset() != timedelta(hours=9):
+            raise ValueError("as_of must include a +09:00 offset")
         as_of = parsed_as_of.astimezone(KST)
     except (KeyError, TypeError, ValueError):
         raise HTTPException(422, "as_of must be KST ISO-8601")

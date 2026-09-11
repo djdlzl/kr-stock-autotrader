@@ -87,21 +87,38 @@ def test_local_workflow_successor_card_readback_and_no_orders(client):
 def test_prompt_preserves_v2_and_successor_contract():
     p=Path(__file__).parents[1]/"prompts/giraffe-decision-card-scheduler-v1.md"; text=p.read_text()
     for field in ("filter_inputs","short_term_excess_return_pct","short_term_window","short_term_provenance","parent_filter_id","현재 head filter ID","evidence 필드만 merge", "YYYY-MM-DDT08:00:00+09:00", "08:10 미만", "source-level 분류", "첫 filter를 만든다"): assert field in text
+    assert 'source `newness="correction"` evidence에 이 exact identity의 head가 없으면 filter-head/successor 경로를 사용하지 않고 `parent_filter_id` 필드를 생략한 root filter를 직접 실행한다.' in text
     assert "`id``" not in text
 
 
-def test_0800_snapshot_rejects_malformed_as_of_before_provider_call(client):
+@pytest.mark.parametrize("as_of", ["2026-09-04T08:00:00Z", "2026-09-04T08:00:00+08:00"])
+def test_0800_snapshot_rejects_non_kst_offset_before_provider_call(client, as_of):
     c, _ = client
     calls = []
     c.app.state.kis_daily_snapshot_provider = lambda *_: calls.append(True)
 
     response = c.post(
         "/api/internal/market-snapshots/005930", headers=INTERNAL,
-        json={"as_of": "2026-09-04"},
+        json={"as_of": as_of},
     )
 
     assert response.status_code == 422
     assert calls == []
+
+
+def test_0800_snapshot_kst_offset_reaches_provider_readiness_path(client):
+    c, _ = client
+    calls = []
+    c.app.state.kis_daily_snapshot_provider = lambda *args: calls.append(args) or {"bad": "response"}
+
+    response = c.post(
+        "/api/internal/market-snapshots/005930", headers=INTERNAL,
+        json={"as_of": "2026-09-04T08:00:00+09:00"},
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert response.json()["snapshot"]["status"] == "unavailable"
 
 
 def test_source_correction_starts_its_own_filter_lineage(client):
