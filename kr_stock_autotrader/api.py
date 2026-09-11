@@ -1060,7 +1060,7 @@ async def internal_card_expected_price(card_id: int, request: Request, _: None =
         except (ValidationError, ValueError):
             raise HTTPException(422, "invalid expected price request")
         as_of = parse_kst(data.as_of)
-        if not is_krx_business_date(as_of.date()) or as_of.time() < time(9, 5) or as_of.time() >= time(9, 6):
+        if not is_krx_business_date(as_of.date()) or as_of.time() < time(9, 5) or as_of.time() >= time(9, 25):
             raise HTTPException(409, "expected price outside operational window")
         card = db.execute("SELECT * FROM decision_cards WHERE id=?", (card_id,)).fetchone()
         if not card:
@@ -1113,7 +1113,7 @@ async def internal_card_market_context(card_id: int, request: Request, _: None =
         ):
             raise HTTPException(409, "market context requires current 08:00 lineage")
         as_of = parse_kst(data.as_of)
-        if not is_krx_business_date(as_of.date()) or as_of.time() < time(9, 5) or as_of.time() >= time(9, 6):
+        if not is_krx_business_date(as_of.date()) or as_of.time() < time(9, 5) or as_of.time() >= time(9, 25):
             raise HTTPException(409, "market context outside operational window")
         benchmark_symbol, previous_close = resolve_intraday_lineage_context(card=dict(card), evidence=evidence, filter_result=filter_result)
         signature = _result_signature(card["id"], evidence["id"], filter_result["id"], data.run_key, data.as_of, INTRADAY_SOURCE_TOPIC)
@@ -1138,7 +1138,7 @@ async def internal_card_market_context(card_id: int, request: Request, _: None =
             if not isinstance(value, str):
                 return False
             retrieved = parse_kst(value)
-            return retrieved.date() != as_of.date() or retrieved.time() < time(9, 5) or retrieved.time() >= time(9, 6)
+            return retrieved.date() != as_of.date() or retrieved.time() < time(9, 5) or retrieved.time() >= time(9, 25)
 
         if _retrieval_out_of_window(orderbook.get("retrieved_at") if isinstance(orderbook, dict) else None):
             raise HTTPException(409, "market context outside operational window")
@@ -1164,9 +1164,11 @@ async def internal_card_market_context(card_id: int, request: Request, _: None =
                 known_candidates.append(parse_kst(candidate))
             except (TypeError, ValueError):
                 continue
-        known_at = max(known_candidates).isoformat() if known_candidates else as_of.isoformat()
-        result["known_at"] = known_at
-        result["retrieved_at"] = known_at
+        # A successful provider receipt is retained exactly; unavailable paths
+        # retain the requested observation time required by the run contract.
+        latest_receipt = max(known_candidates).isoformat() if known_candidates else as_of.isoformat()
+        result["known_at"] = latest_receipt
+        result["retrieved_at"] = latest_receipt
         market_context = persist_intraday_market_context_run(
             db,
             run_key=data.run_key,

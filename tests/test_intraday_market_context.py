@@ -341,16 +341,18 @@ def test_0905_market_context_operational_window_boundaries_and_late_retrieval(mo
     def orderbook_factory(retrieved_at):
         return lambda symbol: {"status": "ok", "symbol": symbol, "last_price": 70000.0, "best_bid": 70000.0, "best_ask": 70000.0, "top_bid_qty": 10.0, "top_ask_qty": 10.0, "quote_known_at": retrieved_at.isoformat(), "retrieved_at": retrieved_at.isoformat(), "timestamp_source": "network_retrieved_at", "source": "KIS", "environment": "production", "status": "ok"}
 
-    accepted_at = datetime(2026, 9, 7, 9, 5, tzinfo=KST)
+    accepted_at = datetime(2026, 9, 7, 9, 24, 59, 999999, tzinfo=KST)
     app.state.kis_orderbook_provider = orderbook_factory(accepted_at)
     app.state.kis_intraday_minute_provider = provider_factory(accepted_at)
     accepted = client.post(f"/api/internal/cards/{saved['id']}/market-context", headers={"X-Internal-API-Key": "market-context-key"}, json={"run_key": "market-context-window-ok", "as_of": accepted_at.isoformat()})
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["market_context_status"] == "MARKET_CONTEXT_HOLD"
+    assert accepted.json()["requested_as_of"] == accepted_at.isoformat()
+    assert {item["retrieved_at"] for item in accepted.json()["observations"]} == {accepted_at.isoformat()}
 
     for as_of, label in (
         ("2026-09-07T09:04:59+09:00", "backdated"),
-        ("2026-09-07T09:06:00+09:00", "future"),
+        ("2026-09-07T09:25:00+09:00", "future"),
         ("2026-09-06T09:05:00+09:00", "nonbusiness"),
     ):
         response = client.post(

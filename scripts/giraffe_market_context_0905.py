@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Narrow 09:05 KST market-context cron runner; it has no trading operations."""
+"""09:05-started KST market-context runner; it has no trading operations."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, time as clock_time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, NoReturn
 from urllib.error import HTTPError, URLError
@@ -24,6 +24,8 @@ PROMPT_SHA256 = "f7a1c1f16e168577222295af43aa05ca5ceaa6a7fc3d20b6a116b222e6fc3a7
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "giraffe-market-context-scheduler-v1.md"
 MIN_REQUEST_BUDGET_SECONDS = 1.0
 MAX_REQUEST_TIMEOUT_SECONDS = 20.0
+OBSERVATION_WINDOW_START = clock_time(9, 5)
+OBSERVATION_WINDOW_END = clock_time(9, 25)
 
 
 class RunFailure(Exception):
@@ -33,7 +35,7 @@ class RunFailure(Exception):
 
 
 class RequestBudget:
-    """Monotonic budget that prevents starting a request too close to 09:06."""
+    """Monotonic budget that prevents starting a request too close to 09:25."""
 
     def __init__(self, *, deadline: float, monotonic: Callable[[], float] = time.monotonic,
                  minimum_seconds: float = MIN_REQUEST_BUDGET_SECONDS):
@@ -176,6 +178,15 @@ def terminal_readback_matches(latest: Dict[str, Any], *, aggregate_key: str, sta
             and isinstance(detail, dict) and detail.get("count") == count)
 
 
+def observation_as_of(current: datetime, *, date: str) -> str:
+    """Use the dispatch wall clock, never a scheduled timestamp, for a card."""
+    observed = current.astimezone(KST)
+    if (observed.date().isoformat() != date or observed.time() < OBSERVATION_WINDOW_START
+            or observed.time() >= OBSERVATION_WINDOW_END):
+        raise RunFailure("window", "observation_outside_0905_0925_kst_window")
+    return observed.isoformat()
+
+
 def finish_error(env: Dict[str, str], aggregate_key: str, date: str, count: int, stage: str,
                  reasons: list[str], budget: RequestBudget) -> str | None:
     try:
@@ -233,19 +244,21 @@ def recover_ambiguous_start(env: Dict[str, str], *, aggregate_key: str, date: st
 
 
 def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight: bool,
-            monotonic: Callable[[], float] = time.monotonic) -> str:
+            monotonic: Callable[[], float] = time.monotonic,
+            wall_clock: Callable[[], datetime] | None = None) -> str:
     if source_topic != SOURCE_TOPIC:
         raise RunFailure("topic", "source_topic_not_allowed")
     check_prompt()
     current = now.astimezone(KST)
     if preflight:
         return "시장맥락 사전점검 완료"
+    # Cron is intentionally launched in its scheduled 09:05 minute. The
+    # longer window is for cards already in that run, not for late reruns.
     if not (current.hour == 9 and current.minute == 5):
         raise RunFailure("window", "outside_0905_kst_window")
 
     date = current.date().isoformat()
-    as_of = date + "T09:05:00+09:00"
-    hard_deadline = current.replace(hour=9, minute=6, second=0, microsecond=0)
+    hard_deadline = current.replace(hour=9, minute=25, second=0, microsecond=0)
     budget = RequestBudget(
         deadline=monotonic() + max(0.0, (hard_deadline - current).total_seconds()),
         monotonic=monotonic,
@@ -274,9 +287,11 @@ def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight:
         )
 
     verified, reasons = 0, []
+    card_as_of: dict[str, str] = {}
     for card_id in ids:
         key = card_run_key(date, card_id)
         try:
+            as_of = observation_as_of(wall_clock() if wall_clock is not None else current, date=date)
             api(env, "POST", "/api/internal/cards/%s/market-context" % card_id,
                 {"run_key": key, "as_of": as_of}, budget=budget, reserve_slots=2)
             readback = api(env, "GET", "/api/internal/market-context-runs/%s" % key,
@@ -290,6 +305,7 @@ def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight:
             ):
                 raise RunFailure("expected_price", "card_%s_expected_price_mismatch" % card_id)
             verified += 1
+            card_as_of[str(card_id)] = as_of
         except RunFailure as exc:
             reasons.append(exc.reason)
 
@@ -300,7 +316,8 @@ def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight:
         )
     try:
         api(env, "POST", "/api/internal/scheduler-runs/%s/finish" % aggregate_key,
-            {"status": "done", "count": verified, "detail": {"cards": {"ids": ids}, "as_of": as_of}},
+            {"status": "done", "count": verified,
+             "detail": {"cards": {"ids": ids, "observation_as_of": card_as_of}}},
             budget=budget, reserve_slots=1)
         fresh = scheduler_latest(env, kind="market_context", date=date, budget=budget)
         if not terminal_readback_matches(fresh, aggregate_key=aggregate_key, status="done", count=verified):
@@ -433,7 +450,12 @@ def main(argv: list[str] | None = None, *, now: datetime | None = None) -> int:
         return 0 if report["status"] == "done" else 1
     try:
         env = load_env(args.env_file)
-        report = execute(env=env, now=current, source_topic=args.source_topic, preflight=args.preflight)
+        # Production card timestamps are sampled at each dispatch; an explicit
+        # `now` is a deterministic test clock and intentionally stays fixed.
+        report = execute(
+            env=env, now=current, source_topic=args.source_topic, preflight=args.preflight,
+            wall_clock=(lambda: current) if now is not None else (lambda: datetime.now(KST)),
+        )
     except RunFailure as exc:
         print(failure_report(exc.stage, exc.count, [exc.reason]))
         return 1

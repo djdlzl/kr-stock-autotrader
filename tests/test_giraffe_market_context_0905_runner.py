@@ -52,6 +52,7 @@ def install_network(monkeypatch, runner, *, ids=(101, 202), missing_key=None, fa
                     latest_payloads=None, readback_source_topic="mac:7923", expected_status="HOLD_MISSING_INPUT",
                     expected_status_by_card=None, expected_override=None, fail_finish=False):
     calls = []
+    as_of_by_key = {}
     starts = starts if starts is not None else []
     latest_payloads = list(latest_payloads or [])
 
@@ -68,7 +69,9 @@ def install_network(monkeypatch, runner, *, ids=(101, 202), missing_key=None, fa
             starts.append(payload)
             return Response({"run_key": path.split("/")[-2], "kind": "market_context", "status": "done" if len(starts) > 1 else "started", "idempotent": len(starts) > 1})
         if "/cards/" in path and path.endswith("/market-context"):
+            assert isinstance(payload, dict)
             card_id = int(path.split("/")[4])
+            as_of_by_key[payload["run_key"]] = payload["as_of"]
             if card_id == failed_card:
                 from urllib.error import HTTPError
                 raise HTTPError(request.full_url, 409, "blocked", None, None)
@@ -82,12 +85,12 @@ def install_network(monkeypatch, runner, *, ids=(101, 202), missing_key=None, fa
             status = (expected_status_by_card or {}).get(card_id, expected_status)
             expected = expected_override if expected_override is not None else {
                 "run_key": key + "-expected-price", "card_id": card_id, "evidence_id": 10 + card_id,
-                "filter_id": 20 + card_id, "requested_as_of": "2026-09-09T09:05:00+09:00",
+                "filter_id": 20 + card_id, "requested_as_of": as_of_by_key[key],
                 "source_topic": "mac:7923", "status": status,
                 "result": {"status": status},
             }
             return Response({"run_key": key, "card_id": card_id, "evidence_id": 10 + card_id,
-                             "filter_id": 20 + card_id, "requested_as_of": "2026-09-09T09:05:00+09:00",
+                             "filter_id": 20 + card_id, "requested_as_of": as_of_by_key[key],
                              "source_topic": readback_source_topic, "expected_price": expected})
         if path.endswith("/finish"):
             if fail_finish:
@@ -110,8 +113,8 @@ def test_success_uses_authoritative_cards_and_exact_readbacks(runner, env_file, 
     assert capsys.readouterr().out.strip() == "시장맥락 완료 count=2"
     posted = [(path, payload) for method, path, payload, _ in calls if method == "POST" and "/cards/" in path]
     assert posted == [
-        ("/api/internal/cards/101/market-context", {"run_key": "market-context-2026-09-09-0905-kst-topic7923-card-101", "as_of": "2026-09-09T09:05:00+09:00"}),
-        ("/api/internal/cards/202/market-context", {"run_key": "market-context-2026-09-09-0905-kst-topic7923-card-202", "as_of": "2026-09-09T09:05:00+09:00"}),
+        ("/api/internal/cards/101/market-context", {"run_key": "market-context-2026-09-09-0905-kst-topic7923-card-101", "as_of": "2026-09-09T09:05:17+09:00"}),
+        ("/api/internal/cards/202/market-context", {"run_key": "market-context-2026-09-09-0905-kst-topic7923-card-202", "as_of": "2026-09-09T09:05:17+09:00"}),
     ]
     assert [path for _, path, _, _ in calls if "/market-context-runs/" in path] == [
         "/api/internal/market-context-runs/market-context-2026-09-09-0905-kst-topic7923-card-101",
@@ -128,6 +131,44 @@ def test_success_uses_authoritative_cards_and_exact_readbacks(runner, env_file, 
     ]
 
 
+def test_cards_use_injected_actual_dispatch_times_and_aggregate_replays_them(runner, monkeypatch):
+    aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
+    calls = install_network(monkeypatch, runner, latest_payloads=[
+        card_latest(), {"run_key": aggregate_key, "status": "done", "detail": {"count": 2}},
+    ])
+    observations = iter((
+        datetime.fromisoformat("2026-09-09T09:05:17.123456+09:00"),
+        datetime.fromisoformat("2026-09-09T09:24:59.999999+09:00"),
+    ))
+    assert runner.execute(
+        env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=now(),
+        source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: 0.0,
+        wall_clock=lambda: next(observations),
+    ) == "시장맥락 완료 count=2"
+    posted = [payload for method, path, payload, _ in calls if method == "POST" and "/cards/" in path]
+    assert [payload["as_of"] for payload in posted] == [
+        "2026-09-09T09:05:17.123456+09:00", "2026-09-09T09:24:59.999999+09:00",
+    ]
+    finish = [payload for method, path, payload, _ in calls if method == "POST" and path.endswith("/finish")][-1]
+    assert finish["detail"]["cards"]["observation_as_of"] == {
+        "101": "2026-09-09T09:05:17.123456+09:00", "202": "2026-09-09T09:24:59.999999+09:00",
+    }
+
+
+def test_late_card_dispatch_at_0925_terminalizes_without_posting_card(runner, monkeypatch):
+    aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
+    calls = install_network(monkeypatch, runner, ids=(101,), latest_payloads=[
+        card_latest((101,)), {"run_key": aggregate_key, "status": "error", "detail": {"count": 0}},
+    ])
+    with pytest.raises(runner.RunFailure, match="observation_outside_0905_0925_kst_window"):
+        runner.execute(
+            env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=now(),
+            source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: 0.0,
+            wall_clock=lambda: datetime.fromisoformat("2026-09-09T09:25:00+09:00"),
+        )
+    assert not [path for method, path, _, _ in calls if method == "POST" and "/cards/" in path]
+
+
 def test_exact_authoritative_empty_cards_terminalize_done_zero_with_readback(runner, env_file, monkeypatch, capsys):
     aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
     calls = install_network(monkeypatch, runner, ids=(), latest_payloads=[
@@ -138,7 +179,7 @@ def test_exact_authoritative_empty_cards_terminalize_done_zero_with_readback(run
     assert capsys.readouterr().out.strip() == "시장맥락 완료 count=0"
     assert [(method, path) for method, path, _, _ in calls if "/cards/" in path or "/market-context-runs/" in path] == []
     finishes = [payload for method, path, payload, _ in calls if method == "POST" and path.endswith("/finish")]
-    assert finishes == [{"status": "done", "count": 0, "detail": {"cards": {"ids": []}, "as_of": "2026-09-09T09:05:00+09:00"}}]
+    assert finishes == [{"status": "done", "count": 0, "detail": {"cards": {"ids": [], "observation_as_of": {}}}}]
     assert calls[-1][1] == "/api/internal/scheduler-runs/latest?kind=market_context&date=2026-09-09"
 
 
@@ -190,7 +231,7 @@ def test_expected_price_failure_or_lineage_mismatch_terminalizes_aggregate(runne
     aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
     calls = install_network(monkeypatch, runner, ids=(101,), expected_override={
         "run_key": "wrong", "card_id": 101, "evidence_id": 111, "filter_id": 121,
-        "requested_as_of": "2026-09-09T09:05:00+09:00", "source_topic": "mac:7923",
+        "requested_as_of": "2026-09-09T09:05:53+09:00", "source_topic": "mac:7923",
         "status": "CALCULATION_ERROR", "result": {"status": "CALCULATION_ERROR"},
     }, latest_payloads=[
         card_latest((101,)), {"run_key": aggregate_key, "status": "error", "detail": {"count": 0}},
@@ -299,13 +340,14 @@ def test_request_budget_reserves_finish_and_readback_slots(runner, monkeypatch):
     ]
 
 
-def test_execute_does_not_start_network_when_0906_deadline_budget_is_insufficient(runner, monkeypatch):
+def test_execute_does_not_start_network_when_0925_deadline_budget_is_insufficient(runner, monkeypatch):
     calls = []
     monkeypatch.setattr(runner, "urlopen", lambda *args, **kwargs: calls.append((args, kwargs)))
+    clock = iter((0.0, 1140.5))
     near_boundary = datetime.fromisoformat("2026-09-09T09:05:59.500000+09:00")
     with pytest.raises(runner.RunFailure, match="deadline_insufficient"):
         runner.execute(env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=near_boundary,
-                       source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: 100.0)
+                       source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: next(clock))
     assert calls == []
 
 
@@ -361,7 +403,7 @@ def test_monotonic_mid_card_exhaustion_verifies_aggregate_error(runner, monkeypa
             return Response({"run_key": key, "status": aggregate["status"], "detail": {"count": 0}})
         if path.endswith("/start"):
             aggregate["status"] = "started"
-            clock[0] = 4.0  # Only error finish + fresh latest remain.
+            clock[0] = 1144.0  # Only error finish + fresh latest remain.
             return Response({"run_key": key, "kind": "market_context", "status": "started"})
         if path.endswith("/finish"):
             aggregate["status"] = payload["status"]
@@ -400,14 +442,14 @@ def test_monotonic_done_needs_fresh_readback_or_never_leaves_started(runner, mon
         if "/market-context-runs/" in path:
             return Response({"run_key": path.rsplit("/", 1)[1], "card_id": 101,
                              "evidence_id": 111, "filter_id": 121,
-                             "requested_as_of": "2026-09-09T09:05:00+09:00", "source_topic": "mac:7923",
+                             "requested_as_of": "2026-09-09T09:05:53+09:00", "source_topic": "mac:7923",
                              "expected_price": {"run_key": path.rsplit("/", 1)[1] + "-expected-price", "card_id": 101,
-                                                "evidence_id": 111, "filter_id": 121, "requested_as_of": "2026-09-09T09:05:00+09:00",
+                                                "evidence_id": 111, "filter_id": 121, "requested_as_of": "2026-09-09T09:05:53+09:00",
                                                 "source_topic": "mac:7923", "status": "HOLD_MISSING_INPUT",
                                                 "result": {"status": "HOLD_MISSING_INPUT"}}})
         if path.endswith("/finish"):
             aggregate["status"] = payload["status"]
-            clock[0] = 7.0  # Done was sent; its fresh readback has no slot.
+            clock[0] = 1147.0  # Done was sent; its fresh readback has no slot.
             return Response({"status": payload["status"]})
         pytest.fail(path)
 
@@ -444,9 +486,9 @@ def test_monotonic_slot_accounting_success_has_fresh_done_readback(runner, monke
         if "/market-context-runs/" in path:
             return Response({"run_key": path.rsplit("/", 1)[1], "card_id": 101,
                              "evidence_id": 111, "filter_id": 121,
-                             "requested_as_of": "2026-09-09T09:05:00+09:00", "source_topic": "mac:7923",
+                             "requested_as_of": "2026-09-09T09:05:53+09:00", "source_topic": "mac:7923",
                              "expected_price": {"run_key": path.rsplit("/", 1)[1] + "-expected-price", "card_id": 101,
-                                                "evidence_id": 111, "filter_id": 121, "requested_as_of": "2026-09-09T09:05:00+09:00",
+                                                "evidence_id": 111, "filter_id": 121, "requested_as_of": "2026-09-09T09:05:53+09:00",
                                                 "source_topic": "mac:7923", "status": "HOLD_MISSING_INPUT",
                                                 "result": {"status": "HOLD_MISSING_INPUT"}}})
         if path.endswith("/finish"):
@@ -499,10 +541,11 @@ def test_monotonic_reserve_refuses_before_aggregate_start(runner, monkeypatch):
     """The prerequisite lookup leaves start ambiguity recovery slots intact."""
     calls = []
     monkeypatch.setattr(runner, "urlopen", lambda *args, **kwargs: calls.append(args))
+    clock = iter((0.0, 1145.0))
     near = datetime.fromisoformat("2026-09-09T09:05:55+09:00")
     with pytest.raises(runner.RunFailure, match="deadline_insufficient"):
         runner.execute(env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=near,
-                       source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: 100.0)
+                       source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: next(clock))
     assert calls == []
 
 

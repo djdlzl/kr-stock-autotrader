@@ -33,6 +33,10 @@ def test_expected_price_persists_readbacks_is_idempotent_and_is_visible(monkeypa
     api_response = client.post(f"/api/internal/cards/{saved['id']}/expected-price", json={"run_key":"expected-price-api-card-1", "as_of":AS_OF}, headers={"X-Internal-API-Key":"expected-price-key"})
     assert api_response.status_code == 200
     assert api_response.json()["result"]["calculated_value"] == 20_900
+    late_window = client.post(f"/api/internal/cards/{saved['id']}/expected-price", json={"run_key":"expected-price-api-card-late", "as_of":"2026-09-07T09:24:59.999999+09:00"}, headers={"X-Internal-API-Key":"expected-price-key"})
+    assert late_window.status_code == 200
+    closed_window = client.post(f"/api/internal/cards/{saved['id']}/expected-price", json={"run_key":"expected-price-api-card-closed", "as_of":"2026-09-07T09:25:00+09:00"}, headers={"X-Internal-API-Key":"expected-price-key"})
+    assert closed_window.status_code == 409
     readback = client.get("/api/internal/expected-price-runs/expected-price-api-card-1", headers={"X-Internal-API-Key":"expected-price-key"})
     assert readback.status_code == 200 and readback.json()["status"] == "COMPUTED"
     db.execute("INSERT INTO users(email,password) VALUES('expected@test.com','x')")
