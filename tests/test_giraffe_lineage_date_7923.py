@@ -91,8 +91,8 @@ def test_prompt_preserves_v2_and_successor_contract():
     assert "`id``" not in text
 
 
-@pytest.mark.parametrize("as_of", ["2026-09-04T08:00:00Z", "2026-09-04T08:00:00+08:00"])
-def test_0800_snapshot_rejects_non_kst_offset_before_provider_call(client, as_of):
+@pytest.mark.parametrize("as_of", ["2026-09-04", "2026-09-04T08:00:00Z", "2026-09-04T08:00:00+08:00"])
+def test_0800_snapshot_rejects_invalid_as_of_before_provider_call(client, as_of):
     c, _ = client
     calls = []
     c.app.state.kis_daily_snapshot_provider = lambda *_: calls.append(True)
