@@ -9,7 +9,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -21,7 +21,10 @@ VIEWDOC_RE = re.compile(r"viewDoc\(\s*['\"](?P<rcp>\d{14})['\"]\s*,\s*['\"](?P<d
 META_CHARSET_RE = re.compile(r"<meta[^>]+charset\s*=\s*['\"]?\s*([\w.-]+)", re.I)
 META_HTTP_EQUIV_RE = re.compile(r"<meta[^>]+content\s*=\s*['\"][^'\"]*charset\s*=\s*([\w.-]+)", re.I)
 TAG_RE = re.compile(r"<[^>]+>")
-SENSITIVE_HEADER_PARTS = ("authorization", "cookie", "token", "secret", "api-key")
+KST = ZoneInfo("Asia/Seoul")
+MAX_CAPTURE_AGE = timedelta(hours=72)
+MAX_FUTURE_CAPTURE_SKEW = timedelta(minutes=5)
+ALLOWED_RESPONSE_HEADER_NAMES = frozenset({"content-type", "content-length"})
 
 class SourceError(RuntimeError):
     def __init__(self, code: str, message: str):
@@ -78,9 +81,30 @@ def validate_viewer(text: str, canonical_url: str, final_url: str, rcp_no: str) 
     return visible
 
 
-def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
-    return {str(key).lower(): ("[REDACTED]" if any(part in str(key).lower() for part in SENSITIVE_HEADER_PARTS) else str(value))
-            for key, value in headers.items()}
+def _provenance_headers(headers: dict[str, str], content_type: str | None, raw_length: int) -> dict[str, str]:
+    """Persist only receipt fields that can be checked against the stored body."""
+    projection: dict[str, str] = {}
+    if content_type is not None:
+        projection["content-type"] = content_type
+    content_length = next((str(value) for key, value in headers.items() if str(key).lower() == "content-length"), None)
+    if content_length is not None:
+        if not content_length.isascii() or not content_length.isdecimal() or int(content_length) != raw_length:
+            raise SourceError("SOURCE_FETCH_ERROR", "invalid content-length receipt")
+        projection["content-length"] = content_length
+    return projection
+
+
+def _valid_provenance_headers(headers: object, content_type: object, raw_length: int) -> bool:
+    if not isinstance(headers, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in headers.items()):
+        return False
+    if set(headers) - ALLOWED_RESPONSE_HEADER_NAMES:
+        return False
+    if content_type is not None and (not isinstance(content_type, str) or headers.get("content-type") != content_type):
+        return False
+    if content_type is None and "content-type" in headers:
+        return False
+    content_length = headers.get("content-length")
+    return content_length is None or (content_length.isascii() and content_length.isdecimal() and int(content_length) == raw_length)
 
 
 def _fetch(url: str, timeout: float = 30.0) -> tuple[bytes, str | None, str, dict[str, str], int]:
@@ -97,9 +121,9 @@ def _fetch_result(result: tuple) -> tuple[bytes, str | None, str, dict[str, str]
     headers = result[3] if len(result) > 3 else {}
     status = result[4] if len(result) > 4 else 200
     if (not isinstance(raw, bytes) or not isinstance(content_type, (str, type(None))) or not isinstance(final_url, str)
-            or not isinstance(headers, dict) or not isinstance(status, int) or isinstance(status, bool) or not 200 <= status < 300):
+            or not isinstance(headers, dict) or not isinstance(status, int) or isinstance(status, bool) or status != 200):
         raise SourceError("SOURCE_FETCH_ERROR", "invalid fetch response")
-    return raw, content_type, final_url, _sanitize_headers(headers), status
+    return raw, content_type, final_url, headers, status
 
 
 def source_packet(rcp_no: str, fetch: Callable[[str], tuple] = _fetch) -> dict:
@@ -107,6 +131,8 @@ def source_packet(rcp_no: str, fetch: Callable[[str], tuple] = _fetch) -> dict:
     main_url = "https://dart.fss.or.kr/dsaf001/main.do?" + urllib.parse.urlencode({"rcpNo": rcp_no})
     try:
         main_raw, main_type, main_final, main_headers, main_status = _fetch_result(fetch(main_url))
+        if main_final != main_url:
+            raise SourceError("SOURCE_FETCH_ERROR", "main URL canonical identity mismatch")
         main_html, main_charset = strict_decode(main_raw, main_type)
         canonical = canonical_viewer_url(main_html, rcp_no)
         raw, content_type, final_url, viewer_headers, viewer_status = _fetch_result(fetch(canonical))
@@ -114,7 +140,7 @@ def source_packet(rcp_no: str, fetch: Callable[[str], tuple] = _fetch) -> dict:
         visible = validate_viewer(document, canonical, final_url, rcp_no)
     except SourceError: raise
     except Exception as exc: raise SourceError("SOURCE_FETCH_ERROR", str(exc)) from exc
-    return {"schema_version":"giraffe-dart-source-packet-v2","rcp_no":rcp_no,"source_date":rcp_no[:8],"main_url":main_url,"main_final_url":main_final,"main_content_type":main_type,"main_charset":main_charset,"main_response_headers":main_headers,"main_response_status":main_status,"main_raw_sha256":hashlib.sha256(main_raw).hexdigest(),"main_raw_bytes":len(main_raw),"canonical_viewer_url":canonical,"final_url":final_url,"content_type":content_type,"response_headers":viewer_headers,"response_status":viewer_status,"retrieved_at_kst":datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),"charset":charset,"raw_sha256":hashlib.sha256(raw).hexdigest(),"raw_bytes":len(raw),"text_sha256":hashlib.sha256(document.encode("utf-8")).hexdigest(),"text_chars":len(document),"visible_chars":len(visible),"source_valid":True,"text":document,"_raw":raw,"_main_raw":main_raw}
+    return {"schema_version":"giraffe-dart-source-packet-v2","rcp_no":rcp_no,"source_date":rcp_no[:8],"main_url":main_url,"main_final_url":main_final,"main_content_type":main_type,"main_charset":main_charset,"main_response_headers":_provenance_headers(main_headers, main_type, len(main_raw)),"main_response_status":main_status,"main_raw_sha256":hashlib.sha256(main_raw).hexdigest(),"main_raw_bytes":len(main_raw),"canonical_viewer_url":canonical,"final_url":final_url,"content_type":content_type,"response_headers":_provenance_headers(viewer_headers, content_type, len(raw)),"response_status":viewer_status,"retrieved_at_kst":datetime.now(KST).isoformat(),"charset":charset,"raw_sha256":hashlib.sha256(raw).hexdigest(),"raw_bytes":len(raw),"text_sha256":hashlib.sha256(document.encode("utf-8")).hexdigest(),"text_chars":len(document),"visible_chars":len(visible),"source_valid":True,"text":document,"_raw":raw,"_main_raw":main_raw}
 
 
 def write_packet(packet: dict, directory: Path) -> Path:
@@ -139,27 +165,22 @@ def write_packet(packet: dict, directory: Path) -> Path:
     return meta_path
 
 
-def _stored_content_type(metadata: dict, header_name: str, fallback_name: str) -> str | None:
-    headers = metadata.get(header_name)
-    if not isinstance(headers, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in headers.items()):
-        raise ValueError("invalid stored headers")
-    header_value = headers.get("content-type")
-    fallback = metadata.get(fallback_name)
-    if header_value is not None and not isinstance(header_value, str): raise ValueError("invalid content type")
-    if fallback is not None and not isinstance(fallback, str): raise ValueError("invalid content type")
-    return header_value if header_value is not None else fallback
-
-
-def _is_aware_iso_kst(value: object) -> bool:
+def _capture_time_is_fresh(value: object, now: datetime) -> bool:
     if not isinstance(value, str): return False
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
         return False
-    return parsed.tzinfo is not None and parsed.utcoffset() is not None and parsed.utcoffset().total_seconds() == 9 * 60 * 60
+    offset = parsed.utcoffset()
+    if parsed.tzinfo is None or offset is None or offset.total_seconds() != 9 * 60 * 60:
+        return False
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    age = now.astimezone(KST) - parsed.astimezone(KST)
+    return -MAX_FUTURE_CAPTURE_SKEW <= age <= MAX_CAPTURE_AGE
 
 
-def completed_packet(path: Path, rcp_no: str) -> dict | None:
+def completed_packet(path: Path, rcp_no: str, *, now: datetime | None = None) -> dict | None:
     """Resume only a packet re-derived from its raw DART responses, never metadata alone."""
     try:
         if not re.fullmatch(r"\d{14}", rcp_no) or path.is_symlink() or path.name != f"{rcp_no}.json" or path.parent.is_symlink() or path.parent.name != rcp_no[:8]: return None
@@ -171,22 +192,25 @@ def completed_packet(path: Path, rcp_no: str) -> dict | None:
                 or metadata.get("source_date") != rcp_no[:8] or metadata.get("source_valid") is not True
                 or metadata.get("raw_path") != str(raw_path) or metadata.get("text_path") != str(text_path) or metadata.get("main_raw_path") != str(main_raw_path)
                 or metadata.get("main_url") != "https://dart.fss.or.kr/dsaf001/main.do?" + urllib.parse.urlencode({"rcpNo": rcp_no})
-                or not _is_aware_iso_kst(metadata.get("retrieved_at_kst"))): return None
+                or metadata.get("main_final_url") != metadata.get("main_url")
+                or not _capture_time_is_fresh(metadata.get("retrieved_at_kst"), now or datetime.now(KST))): return None
         paths = (raw_path, text_path, main_raw_path)
         if any(item.is_symlink() or item.resolve(strict=True).parent != directory for item in paths): return None
         raw = raw_path.read_bytes(); text = text_path.read_text(encoding="utf-8"); main_raw = main_raw_path.read_bytes()
         if (hashlib.sha256(raw).hexdigest() != metadata["raw_sha256"] or len(raw) != metadata["raw_bytes"] or hashlib.sha256(text.encode("utf-8")).hexdigest() != metadata["text_sha256"]
                 or hashlib.sha256(main_raw).hexdigest() != metadata["main_raw_sha256"] or len(main_raw) != metadata["main_raw_bytes"]): return None
-        main_type = _stored_content_type(metadata, "main_response_headers", "main_content_type")
-        viewer_type = _stored_content_type(metadata, "response_headers", "content_type")
+        main_type = metadata.get("main_content_type")
+        viewer_type = metadata.get("content_type")
+        if (not isinstance(main_type, (str, type(None))) or not isinstance(viewer_type, (str, type(None)))
+                or not _valid_provenance_headers(metadata.get("main_response_headers"), main_type, len(main_raw))
+                or not _valid_provenance_headers(metadata.get("response_headers"), viewer_type, len(raw))): return None
         main_text, main_charset = strict_decode(main_raw, main_type)
         document, charset = strict_decode(raw, viewer_type)
         canonical = canonical_viewer_url(main_text, rcp_no)
         visible = validate_viewer(document, canonical, metadata["final_url"], rcp_no)
         if (metadata.get("main_charset") != main_charset or metadata.get("charset") != charset or metadata.get("canonical_viewer_url") != canonical
                 or document != text or len(document) != metadata["text_chars"] or len(visible) != metadata["visible_chars"]
-                or not isinstance(metadata.get("main_response_status"), int) or isinstance(metadata["main_response_status"], bool) or not 200 <= metadata["main_response_status"] < 300
-                or not isinstance(metadata.get("response_status"), int) or isinstance(metadata["response_status"], bool) or not 200 <= metadata["response_status"] < 300): return None
+                or metadata.get("main_response_status") != 200 or metadata.get("response_status") != 200): return None
         return metadata
     except (OSError, KeyError, TypeError, ValueError, SourceError, json.JSONDecodeError):
         return None

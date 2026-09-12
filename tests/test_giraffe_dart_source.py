@@ -2,6 +2,8 @@ import importlib.util
 import json
 import pathlib
 import sys
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -58,18 +60,29 @@ def test_missing_dcm_and_wrong_final_url_fail_closed():
         source.validate_viewer("valid document body with enough content", "https://dart.fss.or.kr/report/viewer.do?rcpNo=20260911800823", "https://evil.example/viewer", "20260911800823")
 
 
-def test_packet_keeps_main_raw_and_redacts_sensitive_headers():
+def test_packet_keeps_main_raw_and_only_verifiable_header_projection():
     rcp = "20260911800823"
     viewer = b"<html><meta charset='utf-8'><body>safe document body with enough content</body></html>"
     packet = source.source_packet(rcp, fetch_from({
-        "main.do": (main_page(rcp), "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp, {"Set-Cookie": "secret", "X-Trace": "trace"}, 200),
-        "viewer.do": (viewer, "text/html; charset=utf-8", "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML", {"Authorization": "secret", "X-Api-Key": "secret", "Content-Type": "text/html"}, 200),
+        "main.do": (main_page(rcp), "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp, {"Set-Cookie": "secret", "X-Trace": "trace", "Content-Length": str(len(main_page(rcp)))}, 200),
+        "viewer.do": (viewer, "text/html; charset=utf-8", "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML", {"Authorization": "secret", "X-Api-Key": "secret", "Content-Type": "text/html", "Content-Length": str(len(viewer))}, 200),
     }))
     assert packet["main_raw_sha256"] and packet["main_raw_bytes"] == len(main_page(rcp))
     assert packet["main_response_status"] == packet["response_status"] == 200
-    assert packet["main_response_headers"]["set-cookie"] == "[REDACTED]"
-    assert packet["response_headers"]["authorization"] == "[REDACTED]"
-    assert packet["response_headers"]["x-api-key"] == "[REDACTED]"
+    assert packet["main_response_headers"] == {"content-type": "text/html; charset=utf-8", "content-length": str(len(main_page(rcp)))}
+    assert packet["response_headers"] == {"content-type": "text/html; charset=utf-8", "content-length": str(len(viewer))}
+
+
+def test_main_redirect_and_bad_content_length_fail_closed():
+    rcp = "20260911800823"
+    viewer = b"<html><meta charset='utf-8'><body>safe document body with enough content</body></html>"
+    with pytest.raises(source.SourceError, match="main URL canonical identity mismatch"):
+        source.source_packet(rcp, fetch_from({"main.do": (main_page(rcp), "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp + "&redirect=1")}))
+    with pytest.raises(source.SourceError, match="invalid content-length receipt"):
+        source.source_packet(rcp, fetch_from({
+            "main.do": (main_page(rcp), "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp),
+            "viewer.do": (viewer, "text/html; charset=utf-8", "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML", {"content-length": "1"}),
+        }))
 
 
 def test_checkpoint_rejects_cross_directory_symlink_and_corrupt_siblings(tmp_path):
@@ -105,11 +118,34 @@ def test_checkpoint_rederives_semantics_and_rejects_resealed_tampering(tmp_path)
     metadata = json.loads(checkpoint.read_text()); metadata["text_sha256"] = __import__("hashlib").sha256(viewer_text.read_bytes()).hexdigest(); metadata["text_chars"] = len(viewer_text.read_text()); checkpoint.write_text(json.dumps(metadata), encoding="utf-8")
     assert source.completed_packet(checkpoint, rcp) is None
     viewer_text.write_text(packet["text"], encoding="utf-8"); checkpoint.write_bytes(original)
+    reseal(lambda m: m.update(main_final_url="https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp + "&extra=1"))
     reseal(lambda m: m.update(final_url="https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=x"))
+    reseal(lambda m: m["response_headers"].update({"x-unverifiable": "forged"}))
+    reseal(lambda m: m["main_response_headers"].update({"x-unverifiable": "forged"}))
     reseal(lambda m: m["response_headers"].update({"content-type": "text/html; charset=cp949"}))
+    reseal(lambda m: m["response_headers"].update({"content-length": "999"}))
+    reseal(lambda m: m.update(response_status=201))
+    reseal(lambda m: m.update(retrieved_at_kst="2999-01-01T00:00:00+09:00"))
+    reseal(lambda m: m.update(retrieved_at_kst="2000-01-01T00:00:00+09:00"))
     reseal(lambda m: m.update(retrieved_at_kst="2026-09-11T07:00:00"))
     reseal(lambda m: m.update(source_date="20200101"))
     reseal(lambda m: m.update(main_raw_sha256="0" * 64))
     escaped = tmp_path / "escaped.raw"; escaped.write_bytes((packet_dir / f"{rcp}.viewer.raw").read_bytes())
     (packet_dir / f"{rcp}.viewer.raw").unlink(); (packet_dir / f"{rcp}.viewer.raw").symlink_to(escaped)
     assert source.completed_packet(checkpoint, rcp) is None
+
+
+def test_checkpoint_freshness_has_deterministic_kst_bounds(tmp_path):
+    rcp = "20260911800823"
+    viewer = b"<html><meta charset='utf-8'><body>valid document body with enough content</body></html>"
+    packet = source.source_packet(rcp, fetch_from({
+        "main.do": (main_page(rcp), "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp),
+        "viewer.do": (viewer, "text/html; charset=utf-8", "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML"),
+    }))
+    checkpoint = source.write_packet(packet, tmp_path / rcp[:8])
+    now = datetime(2026, 9, 12, 7, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+    metadata = json.loads(checkpoint.read_text())
+    for captured, accepted in ((now - timedelta(hours=72), True), (now - timedelta(hours=72, seconds=1), False), (now + timedelta(minutes=5), True), (now + timedelta(minutes=5, seconds=1), False)):
+        metadata["retrieved_at_kst"] = captured.isoformat()
+        checkpoint.write_text(json.dumps(metadata), encoding="utf-8")
+        assert (source.completed_packet(checkpoint, rcp, now=now) is not None) is accepted
