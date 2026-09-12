@@ -1,6 +1,7 @@
 """FastAPI boundary for Giraffe's paper-only trading planner."""
 import json
 import math
+import os
 import sqlite3
 import re
 import threading
@@ -432,6 +433,14 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
+def _research_packet_root() -> Path:
+    """Return the packet path identity; this API never reads packet files."""
+    configured = os.getenv("GIRAFFE_RESEARCH_PACKET_ROOT")
+    if configured:
+        return Path(configured)
+    return Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
+
+
 def _research_commitment(run_key: str, contract: object) -> dict:
     """Validate the deterministic prehook contract before it becomes immutable state."""
     if not isinstance(contract, dict): raise HTTPException(422, "research control commitment required")
@@ -442,7 +451,7 @@ def _research_commitment(run_key: str, contract: object) -> dict:
     try: run_date = datetime.strptime(run_key.removeprefix("research-").removesuffix("-0700-kst"), "%Y-%m-%d")
     except ValueError: raise HTTPException(422, "invalid research run key")
     expected_dates = [(run_date - timedelta(days=1)).strftime("%Y%m%d"), run_date.strftime("%Y%m%d")]
-    packet_root = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
+    packet_root = _research_packet_root()
     if (not isinstance(expected, list) or expected != sorted(expected) or len(expected) != len(set(expected))
             or any(not isinstance(rcp, str) or not re.fullmatch(r"\d{14}", rcp) for rcp in expected)
             or contract["control_count"] != len(expected) or contract["source_valid"] is not True

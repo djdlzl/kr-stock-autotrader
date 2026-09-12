@@ -18,6 +18,7 @@ THRESHOLDS = {
     "GIRAFFE_MAX_SHORT_TERM_EXCESS_RISE_PCT": "10",
     "GIRAFFE_MAX_PRE_RETURN_PCT": "30",
 }
+PRODUCTION_PACKET_ROOT = "/Users/jaewoo/.hermes/runs/giraffe-7923/dart-source-packets"
 REQUIRED_RUNTIME_ENV = {
     "SESSION_SECRET": "test-session-secret-that-is-at-least-thirty-two-bytes-long",
     "INTERNAL_API_KEY": "test-internal-api-key",
@@ -52,6 +53,7 @@ def test_production_compose_renders_all_mandatory_giraffe_thresholds():
     assert {name: environment.get(name) for name in THRESHOLDS} == THRESHOLDS
     assert environment["LIVE_TRADING"] == "false"
     assert environment["RESEARCH_CONTROL_KEY"] == REQUIRED_RUNTIME_ENV["RESEARCH_CONTROL_KEY"]
+    assert environment["GIRAFFE_RESEARCH_PACKET_ROOT"] == PRODUCTION_PACKET_ROOT
 
 
 def test_production_compose_requires_research_control_key():

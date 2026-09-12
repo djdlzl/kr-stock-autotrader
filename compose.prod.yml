@@ -14,6 +14,7 @@ services:
       KR_HOLIDAYS: ${KR_HOLIDAYS:-}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:?INTERNAL_API_KEY is required}
       RESEARCH_CONTROL_KEY: ${RESEARCH_CONTROL_KEY:?RESEARCH_CONTROL_KEY is required}
+      GIRAFFE_RESEARCH_PACKET_ROOT: /Users/jaewoo/.hermes/runs/giraffe-7923/dart-source-packets
       LIVE_TRADING: "false"
       KIS_APP_KEY: ${KIS_APP_KEY:?KIS_APP_KEY is required}
       KIS_APP_SECRET: ${KIS_APP_SECRET:?KIS_APP_SECRET is required}

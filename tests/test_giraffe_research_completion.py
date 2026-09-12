@@ -11,6 +11,7 @@ os.environ.setdefault("RESEARCH_CONTROL_KEY", "test-control-key")
 os.environ.setdefault("SESSION_SECRET", "test-session-secret-that-is-at-least-thirty-two-bytes-long")
 from fastapi.testclient import TestClient
 from app import app
+from kr_stock_autotrader import api as api_module
 
 HEADERS = {"X-Internal-API-Key": os.environ["INTERNAL_API_KEY"]}
 CONTROL_HEADERS = {"X-Research-Control-Key": os.environ["RESEARCH_CONTROL_KEY"]}
@@ -20,10 +21,10 @@ def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
 
 
-def commitment(run_key, receipts):
+def commitment(run_key, receipts, source_root=None):
     run_date = datetime.strptime(run_key.removeprefix("research-").removesuffix("-0700-kst"), "%Y-%m-%d")
     dates = [(run_date - timedelta(days=1)).strftime("%Y%m%d"), run_date.strftime("%Y%m%d")]
-    source_root = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
+    source_root = source_root or Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
     sources = [{
         "rcp_no": rcp_no,
         "date": rcp_no[:8],
@@ -115,3 +116,17 @@ def test_registration_does_not_depend_on_caller_contract_path():
     client = TestClient(app); key = "research-2026-09-15-0700-kst"
     contract, _ = commitment(key, [])
     assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 200
+
+
+def test_registration_uses_explicit_packet_root_when_container_home_differs(monkeypatch):
+    client = TestClient(app); key = "research-2026-09-16-0700-kst"
+    host_packet_root = Path("/Users/jaewoo/.hermes/runs/giraffe-7923/dart-source-packets")
+    contract, _ = commitment(key, ["20260916000001"], source_root=host_packet_root)
+    monkeypatch.setenv("GIRAFFE_RESEARCH_PACKET_ROOT", str(host_packet_root))
+    monkeypatch.setattr(api_module.Path, "home", classmethod(lambda cls: (_ for _ in ()).throw(AssertionError("configured root must not use HOME"))))
+    response = client.post(
+        f"/api/internal/research-runs/{key}/register",
+        json={"control_contract": contract},
+        headers=CONTROL_HEADERS,
+    )
+    assert response.status_code == 200
