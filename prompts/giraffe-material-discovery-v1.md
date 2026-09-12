@@ -34,7 +34,7 @@ Giraffe는 paper-only이고 `LIVE_TRADING=False`다. 이 작업은 주문·자�
 - 각 후보별 receipt에는 `rcp_no`, 검토 결과(`SAVED|REJECTED|INSUFFICIENT_EVIDENCE|ERROR`), 해당 시 material ID 또는 탈락/오류 사유를 기록한다. `reviewed receipt count`와 제어 목록 count를 최종 보고에 포함한다.
 
 - KST 실행일 `YYYY-MM-DD`와 `run_key=research-YYYY-MM-DD-0700-kst`를 만든다.
-- `python -m kr_stock_autotrader.cli scheduler-start "$run_key" research`를 호출한다.
+- prehook의 `control_contract`, `control_contract_path`, `control_contract_sha256`를 그대로 사용해 `python -m kr_stock_autotrader.cli scheduler-start "$run_key" research --control-contract "$CONTROL_CONTRACT_JSON" --control-contract-path "$CONTROL_CONTRACT_PATH" --control-contract-sha256 "$CONTROL_CONTRACT_SHA256"`를 호출한다. API는 로컬 파일을 읽지 않으므로 path 존재를 검증했다고 주장하지 않는다; canonical JSON SHA와 immutable start commitment의 정확한 일치만 검증한다.
 - 같은 `run_key`가 이미 완료됐다면 중복 실행으로 새 evidence를 만들지 말고 기존 결과를 readback한다.
 - 주말 또는 공식 KRX 휴장일이어도 기업 공시는 발생할 수 있으므로 조사는 수행한다. 다만 휴장 여부를 기록하고, 08:00 카드/주문 시각을 거래 신호로 해석하지 않는다.
 

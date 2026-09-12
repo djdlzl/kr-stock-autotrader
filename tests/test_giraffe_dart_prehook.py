@@ -106,12 +106,12 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                 "declared_total": 1, "declared_pages": 1, "pages_collected": 1,
                 "page_counts": [1], "unique_receipts": 1,
                 "material_candidate_count": 1,
-                "material_candidate_records": [{"rcp_no": "20260901000001", "row_text": "단일판매ㆍ공급계약체결"}],
+                "material_candidate_records": [{"rcp_no": date + "000001", "row_text": "단일판매ㆍ공급계약체결"}],
                 "complete": True, "date": date,
             }
 
         packet = {"rcp_no": "20260901000001", "text": "valid source"}
-        with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), patch.object(self.gate, "collect_manifest", fake_collect), patch.object(self.gate, "fetch_with_retry", return_value=packet), patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "2026-08-31,20260901"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
+        with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), patch.object(self.gate, "collect_manifest", fake_collect), patch.object(self.gate, "fetch_with_retry", side_effect=lambda rcp: {"rcp_no": rcp, "text": "valid source"}), patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "2026-08-31,20260901"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(self.gate.main(), 0)
         result = json.loads(output.getvalue())
         self.assertEqual(result["gate"], "GIRAFFE_DART_GATE_V1")

@@ -28,30 +28,30 @@ def fetch_from(mapping):
 def test_cp949_and_ms949_packets_are_strictly_decoded(charset):
     rcp = "20260911800823"
     viewer = "<html><meta charset='%s'><body>삼성전자 공급계약 체결 공시 본문입니다.</body></html>" % charset
-    packet = source.source_packet(rcp, fetch_from({"main.do": (main_page(rcp), "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp), "viewer.do": (viewer.encode(charset), "text/html; charset=" + charset, "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485")}))
+    packet = source.source_packet(rcp, fetch_from({"main.do": (main_page(rcp), "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp), "viewer.do": (viewer.encode(charset), "text/html; charset=" + charset, "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML")}))
     assert packet["source_valid"] is True and packet["charset"].lower() == charset
 
 
 def test_utf8_and_meta_fallback_are_valid():
     rcp = "20260911800823"
     viewer = "<html><meta charset='utf-8'><body>UTF8 DART disclosure body is long enough.</body></html>"
-    packet = source.source_packet(rcp, fetch_from({"main.do": (main_page(rcp), None, "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp), "viewer.do": (viewer.encode(), None, "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485")}))
+    packet = source.source_packet(rcp, fetch_from({"main.do": (main_page(rcp), None, "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp), "viewer.do": (viewer.encode(), None, "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML")}))
     assert packet["charset"] == "utf-8"
 
 @pytest.mark.parametrize("viewer,content_type,code", [
-    (b"<html><body>\xff\xfe\xff</body></html>", "text/html; charset=utf-8", "DECODE"),
-    ("<html><meta charset='utf-8'><body>占쏙옙 document body longer enough</body></html>".encode(), None, "DECODE"),
-    (b"<html><meta charset='utf-8'><body>login please now with enough body</body></html>", None, "EXTRACT"),
+    (b"<html><body>\xff\xfe\xff</body></html>", "text/html; charset=utf-8", "SOURCE_DECODE_ERROR"),
+    ("<html><meta charset='utf-8'><body>占쏙옙 document body longer enough</body></html>".encode(), None, "SOURCE_DECODE_ERROR"),
+    (b"<html><meta charset='utf-8'><body>login please now with enough body</body></html>", None, "SOURCE_EXTRACT_ERROR"),
 ])
 def test_wrong_charset_mojibake_and_login_are_typed_failures(viewer, content_type, code):
     rcp = "20260911800823"
     with pytest.raises(source.SourceError) as exc:
-        source.source_packet(rcp, fetch_from({"main.do": (main_page(rcp), "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp), "viewer.do": (viewer, content_type, "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485")}))
+        source.source_packet(rcp, fetch_from({"main.do": (main_page(rcp), "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp), "viewer.do": (viewer, content_type, "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML")}))
     assert exc.value.code == code
 
 
 def test_missing_dcm_and_wrong_final_url_fail_closed():
-    with pytest.raises(source.SourceError, match="EXTRACT"):
+    with pytest.raises(source.SourceError, match="SOURCE_EXTRACT_ERROR"):
         source.canonical_viewer_url("<html></html>", "20260911800823")
-    with pytest.raises(source.SourceError, match="SOURCE_FETCH"):
+    with pytest.raises(source.SourceError, match="SOURCE_FETCH_ERROR"):
         source.validate_viewer("valid document body with enough content", "https://dart.fss.or.kr/report/viewer.do?rcpNo=20260911800823", "https://evil.example/viewer", "20260911800823")

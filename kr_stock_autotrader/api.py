@@ -422,30 +422,58 @@ def _is_research_run(run_key: str, kind: object) -> bool:
     return kind == "research" and _RESEARCH_RUN_KEY.fullmatch(run_key) is not None
 
 
-def _safe_research_scheduler_finish(data: object) -> dict:
-    """Accept DONE only with an exact, source-valid 07:00 completion receipt."""
-    if not isinstance(data, dict) or data.get("status") not in {"done", "error"}:
-        raise HTTPException(422, "invalid research scheduler finish")
-    count = _nonnegative_int(data.get("count", 0))
-    if count is None or not isinstance(data.get("detail"), dict):
-        raise HTTPException(422, "invalid research scheduler detail")
-    if data["status"] == "error":
-        return {"status": "error", "count": count, "detail": data["detail"]}
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _sha256(value: object) -> str:
+    import hashlib
+    return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _research_commitment(run_key: str, data: object) -> dict:
+    """Validate an agent-supplied commitment without claiming this API read its file."""
+    if not isinstance(data, dict): raise HTTPException(422, "research control commitment required")
+    contract, path, digest = data.get("control_contract"), data.get("control_contract_path"), data.get("control_contract_sha256")
+    required = {"schema_version", "run_key", "dates", "source_valid", "expected_rcp_nos", "control_count", "sources"}
+    if (not isinstance(contract, dict) or set(contract) != required or contract.get("schema_version") != "giraffe-research-control-v1"
+            or contract.get("run_key") != run_key or not isinstance(path, str) or not path or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest) or digest != _sha256(contract)):
+        raise HTTPException(422, "invalid research control commitment")
+    expected, dates, sources = contract["expected_rcp_nos"], contract["dates"], contract["sources"]
+    if (not isinstance(expected, list) or expected != sorted(expected) or len(expected) != len(set(expected))
+            or any(not isinstance(rcp, str) or not re.fullmatch(r"\d{14}", rcp) for rcp in expected)
+            or contract["control_count"] != len(expected) or contract["source_valid"] is not True
+            or not isinstance(dates, list) or not dates or any(not isinstance(d, str) or not re.fullmatch(r"\d{8}", d) for d in dates)
+            or not isinstance(sources, list) or len(sources) != len(expected)):
+        raise HTTPException(422, "invalid research control set")
+    source_ids = []
+    for source in sources:
+        if not isinstance(source, dict) or set(source) != {"rcp_no", "date", "packet_path", "packet_sha256"} or source.get("rcp_no") not in expected or source.get("date") not in dates or not isinstance(source.get("packet_path"), str) or not source["packet_path"] or not isinstance(source.get("packet_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", source["packet_sha256"]):
+            raise HTTPException(422, "invalid research source commitment")
+        source_ids.append(source["rcp_no"])
+    if source_ids != expected:
+        raise HTTPException(422, "research source commitment is not canonical")
+    return {"control_contract": contract, "control_contract_path": path, "control_contract_sha256": digest}
+
+
+def _safe_research_scheduler_finish(run_key: str, start_detail: object, data: object) -> dict:
+    """DONE requires the immutable start commitment and exact per-receipt census."""
+    if not isinstance(data, dict) or data.get("status") not in {"done", "error"} or not isinstance(start_detail, dict): raise HTTPException(422, "invalid research scheduler finish")
+    count = _nonnegative_int(data.get("count", 0)); commitment = start_detail.get("control_commitment")
+    if count is None or not isinstance(data.get("detail"), dict) or not isinstance(commitment, dict): raise HTTPException(422, "invalid research scheduler detail")
+    if data["status"] == "error": return {"status": "error", "count": count, "detail": data["detail"], "control_commitment": commitment}
     receipt = data["detail"].get("completion_receipt")
-    required = {"schema_version", "control_count", "source_valid", "reviewed_unique", "source_error", "store_error", "coverage_error", "rejected_after_evidence", "saved", "existing", "correction_stored"}
-    if not isinstance(receipt, dict) or receipt.get("schema_version") != "giraffe-research-completion-v1" or set(receipt) - (required | {"receipt_path", "receipt_sha256"}) or not required.issubset(receipt):
-        raise HTTPException(422, "invalid research completion receipt")
-    fields = {name: _nonnegative_int(receipt[name]) for name in required - {"schema_version"}}
-    if any(value is None for value in fields.values()):
-        raise HTTPException(422, "invalid research completion counters")
-    fields = {name: int(value) for name, value in fields.items()}
-    control = fields["control_count"]
+    required = {"schema_version", "run_key", "control_contract_sha256", "control_count", "source_valid", "reviewed_unique", "reviewed_rcp_nos", "source_error", "store_error", "coverage_error", "rejected_after_evidence", "saved", "existing", "correction_stored"}
+    if not isinstance(receipt, dict) or set(receipt) != required or receipt.get("schema_version") != "giraffe-research-completion-v1": raise HTTPException(422, "invalid research completion receipt")
+    fields = {name: _nonnegative_int(receipt[name]) for name in required - {"schema_version", "run_key", "control_contract_sha256", "reviewed_rcp_nos"}}
+    reviewed = receipt.get("reviewed_rcp_nos"); expected = commitment["control_contract"]["expected_rcp_nos"]
+    if (any(value is None for value in fields.values()) or receipt["run_key"] != run_key or receipt["control_contract_sha256"] != commitment["control_contract_sha256"]
+            or not isinstance(reviewed, list) or reviewed != expected or reviewed != sorted(reviewed) or len(reviewed) != len(set(reviewed))): raise HTTPException(422, "research completion does not match start commitment")
+    fields = {name: int(value) for name, value in fields.items()}; control = len(expected)
     terminal = sum(fields[name] for name in ("rejected_after_evidence", "saved", "existing", "correction_stored", "source_error", "store_error", "coverage_error"))
-    if fields["source_valid"] != control or fields["reviewed_unique"] != control or terminal != control or any(fields[name] for name in ("source_error", "store_error", "coverage_error")):
-        raise HTTPException(422, "research completion receipt is not done-safe")
-    if count != fields["saved"] + fields["correction_stored"]:
-        raise HTTPException(422, "research completion count mismatch")
-    return {"status": "done", "count": count, "detail": data["detail"]}
+    if (fields["control_count"] != control or fields["source_valid"] != control or fields["reviewed_unique"] != control or terminal != control or any(fields[name] for name in ("source_error", "store_error", "coverage_error")) or count != fields["saved"] + fields["correction_stored"]): raise HTTPException(422, "research completion receipt is not done-safe")
+    return {"status": "done", "count": count, "detail": data["detail"], "control_commitment": commitment}
 
 
 def _nonnegative_int(value: object) -> int | None:
@@ -1274,11 +1302,14 @@ async def internal_order_evaluate(plan_id: int, request: Request, _: None = Depe
 async def scheduler_start(run_key: str, request: Request, _: None = Depends(require_internal_api_key)):
     data=await request.json(); db=connect()
     try:
+        if not isinstance(data, dict) or not isinstance(data.get('kind'), str): raise HTTPException(422,'invalid scheduler start')
         existing=db.execute("SELECT kind,status FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
         if existing:
             if existing['kind'] != data['kind']: raise HTTPException(409,'run_key kind conflict')
             return {'run_key':run_key,'kind':existing['kind'],'status':existing['status'],'idempotent':True}
-        db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?, 'started',?,?)",(run_key,data['kind'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(data)))
+        detail = {'kind': data['kind']}
+        if _is_research_run(run_key, data['kind']): detail['control_commitment'] = _research_commitment(run_key, data)
+        db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?, 'started',?,?)",(run_key,data['kind'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),json.dumps(detail)))
         db.commit(); return {'run_key':run_key,'kind':data['kind'],'status':'started','idempotent':False}
     finally: db.close()
 
@@ -1286,15 +1317,13 @@ async def scheduler_start(run_key: str, request: Request, _: None = Depends(requ
 async def scheduler_finish(run_key: str, request: Request, _: None = Depends(require_internal_api_key)):
     data=await request.json(); db=connect()
     try:
-        existing=db.execute("SELECT kind FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
+        existing=db.execute("SELECT kind,detail FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
         if not existing: raise HTTPException(404,'scheduler run not found')
+        start_detail = json.loads(existing['detail'])
         finished = (_safe_premarket_scheduler_finish(data) if _is_premarket_card_run(run_key, existing['kind'])
-                    else _safe_research_scheduler_finish(data) if _is_research_run(run_key, existing['kind']) else data)
-        # The predicate is atomic: a concurrent retry cannot overwrite done.
-        updated = db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=? AND NOT ((kind='market_context' OR kind='research') AND status IN ('done','error'))",(finished['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(finished),run_key))
-        if updated.rowcount == 0:
-            persisted = db.execute("SELECT detail FROM scheduler_runs WHERE run_key=?", (run_key,)).fetchone()
-            finished = __import__('json').loads(persisted['detail'])
+                    else _safe_research_scheduler_finish(run_key, start_detail, data) if _is_research_run(run_key, existing['kind']) else data)
+        updated = db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=? AND NOT ((kind='market_context' OR kind='research') AND status IN ('done','error'))",(finished['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),json.dumps(finished),run_key))
+        if updated.rowcount == 0: finished = json.loads(db.execute("SELECT detail FROM scheduler_runs WHERE run_key=?", (run_key,)).fetchone()['detail'])
         db.commit()
         return {'run_key':run_key,'status':finished['status'],'count':finished.get('count',0),'detail':finished.get('detail',{})}
     finally: db.close()
@@ -1303,12 +1332,15 @@ async def scheduler_finish(run_key: str, request: Request, _: None = Depends(req
 def scheduler_latest(kind: str, date: str | None = None, _: None = Depends(require_internal_api_key)):
     db=connect()
     try:
-        query="SELECT * FROM scheduler_runs WHERE kind=?"; params=[kind]
-        if date:
-            query+=" AND (substr(started_at,1,10)=? OR run_key LIKE ?)"; params.extend([date,f"%{date}%"])
-        item=db.execute(query+" ORDER BY id DESC LIMIT 1",params).fetchone()
+        if kind == 'research' and date:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date): raise HTTPException(422,'invalid research date')
+            item=db.execute("SELECT * FROM scheduler_runs WHERE run_key=? AND kind='research'", (f'research-{date}-0700-kst',)).fetchone()
+        else:
+            query="SELECT * FROM scheduler_runs WHERE kind=?"; params=[kind]
+            if date: query+=" AND (substr(started_at,1,10)=? OR run_key LIKE ?)"; params.extend([date,f"%{date}%"])
+            item=db.execute(query+" ORDER BY id DESC LIMIT 1",params).fetchone()
         if not item: raise HTTPException(404,'scheduler run not found')
-        result=dict(item); result['detail']=__import__('json').loads(result['detail']); return result
+        result=dict(item); result['detail']=json.loads(result['detail']); return result
     finally: db.close()
 
 @app.get('/api/internal/cards')

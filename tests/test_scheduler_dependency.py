@@ -44,3 +44,19 @@ def test_0800_prompt_does_not_fabricate_observation_anchors_without_complete_mar
     prompt = (Path(__file__).parents[1] / "prompts/giraffe-decision-card-scheduler-v1.md").read_text()
     for marker in ("`post_close_market`", "`pre_event_low`", "`pre_event_close`", "`event_window_high`", "모두 있을 때만", "만들지 않는다"):
         assert marker in prompt
+
+
+def test_research_latest_ignores_newer_same_day_generic_run():
+    import os, tempfile
+    os.environ.setdefault("DATABASE_PATH", tempfile.mktemp(suffix=".db"))
+    os.environ.setdefault("INTERNAL_API_KEY", "test-key")
+    os.environ.setdefault("SESSION_SECRET", "test-session-secret-that-is-at-least-thirty-two-bytes-long")
+    from fastapi.testclient import TestClient
+    from app import app
+    headers = {"X-Internal-API-Key": os.environ["INTERNAL_API_KEY"]}
+    client = TestClient(app)
+    generic = "research-2026-09-15-manual"
+    assert client.post(f"/api/internal/scheduler-runs/{generic}/start", json={"kind":"research"}, headers=headers).status_code == 200
+    assert client.post(f"/api/internal/scheduler-runs/{generic}/finish", json={"status":"done","count":0,"detail":{"legacy":True}}, headers=headers).status_code == 200
+    # No canonical validated 07:00 run exists, so the generic record cannot satisfy 08:00.
+    assert client.get("/api/internal/scheduler-runs/latest?kind=research&date=2026-09-15", headers=headers).status_code == 404
