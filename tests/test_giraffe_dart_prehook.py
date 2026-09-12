@@ -116,8 +116,9 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             return {"schema_version": "giraffe-dart-source-packet-v2", "rcp_no": rcp, "source_date": rcp[:8], "source_valid": True,
                     "raw_sha256": hashlib.sha256(raw).hexdigest(), "raw_bytes": len(raw), "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
                     "main_raw_sha256": hashlib.sha256(main_raw).hexdigest(), "main_raw_bytes": len(main_raw), "text": text, "_raw": raw, "_main_raw": main_raw}
-        with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), patch.object(self.gate, "collect_manifest", fake_collect), patch.object(self.gate, "fetch_with_retry", side_effect=fake_packet), patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "2026-08-31,20260901"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
+        with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), patch.object(self.gate, "CONTROL_ROOT", pathlib.Path(temp) / "controls"), patch.object(self.gate, "collect_manifest", fake_collect), patch.object(self.gate, "fetch_with_retry", side_effect=fake_packet), patch.object(self.gate, "register_research_run") as register, patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "2026-08-31,20260901"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(self.gate.main(), 0)
+        register.assert_called_once()
         result = json.loads(output.getvalue())
         self.assertEqual(result["gate"], "GIRAFFE_DART_GATE_V1")
         self.assertTrue(result["complete"])
@@ -146,6 +147,21 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertIn("giraffe-expected-price-input-v1", prompt)
         self.assertIn("official_derived", prompt)
         self.assertIn("HOLD_MISSING_INPUT", prompt)
+        wiring = (ROOT / "ops/giraffe-cron-wiring-update.md").read_text(encoding="utf-8")
+        cron_prompt = (ROOT / "ops/giraffe-cron-07-prompt.txt").read_text(encoding="utf-8")
+        self.assertIn("ff7955881377", wiring)
+        self.assertIn("8a223a4fa499", wiring)
+        self.assertIn("74afdadd5f0bccc551a9d5b4f2799a000044893fabe5e33a28ebbcdd73afa9c2", wiring)
+        self.assertIn("source_packet_paths", cron_prompt)
+        self.assertIn("control_contract", cron_prompt)
+        self.assertNotIn("material_candidate_records", cron_prompt)
+
+
+    def test_gate_fails_closed_when_deterministic_registration_fails(self):
+        with patch.object(self.gate, "register_research_run", side_effect=self.gate.ManifestError("registration failed")):
+            with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), patch.object(self.gate, "CONTROL_ROOT", pathlib.Path(temp) / "controls"), patch.object(self.gate, "collect_manifest", side_effect=self.gate.ManifestError("stop before registration")), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(self.gate.main(), 2)
+        self.assertFalse(json.loads(output.getvalue())["complete"])
 
 
 if __name__ == "__main__":

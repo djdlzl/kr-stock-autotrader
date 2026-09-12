@@ -22,6 +22,11 @@ def audit(db, actor, action, typ, ident, detail=""):
 def require_internal_api_key(x_internal_api_key: str|None=Header(None), x_internal_key: str|None=Header(None)):
     expected, supplied = os.getenv("INTERNAL_API_KEY", ""), x_internal_api_key or x_internal_key
     if not expected or not supplied or not hmac.compare_digest(supplied, expected): raise HTTPException(403, "internal authorization required")
+def require_research_control_key(x_research_control_key: str|None=Header(None)):
+    """Dedicated capability held by the deterministic prehook, never the LLM scheduler."""
+    expected = os.getenv("RESEARCH_CONTROL_KEY", "")
+    if not expected or not x_research_control_key or not hmac.compare_digest(x_research_control_key, expected):
+        raise HTTPException(403, "research control authorization required")
 def row(db, table, ident):
     found=db.execute(f"SELECT * FROM {table} WHERE id=?", (ident,)).fetchone()
     if not found: raise HTTPException(404, f"{table} not found")

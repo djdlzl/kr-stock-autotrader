@@ -7,6 +7,8 @@ import json
 import hashlib
 import os
 import sys
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -45,6 +47,24 @@ def control_contract(run_key: str, summaries: list[dict]) -> dict:
     return {"schema_version": "giraffe-research-control-v1", "run_key": run_key,
             "dates": [item["date"] for item in summaries], "source_valid": True,
             "expected_rcp_nos": receipts, "control_count": len(receipts), "sources": sources}
+
+
+
+def register_research_run(run_key: str, contract: dict) -> None:
+    """Register the immutable canonical run before any agent/LLM work begins."""
+    base, key = os.environ.get("GIRAFFE_URL", "").strip().rstrip("/"), os.environ.get("RESEARCH_CONTROL_KEY", "")
+    if not base or not key:
+        raise ManifestError("GIRAFFE_URL and RESEARCH_CONTROL_KEY are required for deterministic registration")
+    body = canonical_bytes({"control_contract": contract})
+    request = urllib.request.Request(base + "/api/internal/research-runs/" + run_key + "/register", data=body, method="POST", headers={"Content-Type": "application/json", "X-Research-Control-Key": key})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if response.status < 200 or response.status >= 300: raise ManifestError("deterministic research registration failed")
+            value = json.load(response)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as exc:
+        raise ManifestError("deterministic research registration failed") from exc
+    if not isinstance(value, dict) or value.get("run_key") != run_key or value.get("kind") != "research" or value.get("status") not in {"started", "done", "error"}:
+        raise ManifestError("deterministic research registration response invalid")
 
 
 def target_dates() -> list[str]:
@@ -106,6 +126,11 @@ def main() -> int:
     temp = contract_path.with_suffix(".tmp")
     temp.write_bytes(canonical_bytes(contract) + b"\n")
     temp.replace(contract_path)
+    try:
+        register_research_run(run_key, contract)
+    except ManifestError as exc:
+        print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": False, "error": str(exc)}, ensure_ascii=False))
+        return 2
     print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": True, "dates": summaries,
                       "control_contract": contract, "control_contract_path": str(contract_path),
                       "control_contract_sha256": digest}, ensure_ascii=False, sort_keys=True))

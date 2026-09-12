@@ -19,7 +19,7 @@ def main(argv=None):
     a=s.add_parser('evidence-invalidate');a.add_argument('evidence_id')
     a=s.add_parser('market-snapshot');a.add_argument('symbol');a.add_argument('as_of');a.add_argument('--announcement-at');a.add_argument('--premarket-retry', action='store_true')
     a=s.add_parser('market-context');a.add_argument('card_id');a.add_argument('run_key');a.add_argument('as_of')
-    a=s.add_parser('scheduler-start');a.add_argument('run_key');a.add_argument('kind');a.add_argument('--control-contract');a.add_argument('--control-contract-path');a.add_argument('--control-contract-sha256')
+    a=s.add_parser('scheduler-start');a.add_argument('run_key');a.add_argument('kind')
     a=s.add_parser('scheduler-finish');a.add_argument('run_key');a.add_argument('status');a.add_argument('--count',type=int,default=0);a.add_argument('--detail',default='{}')
     a=s.add_parser('scheduler-latest');a.add_argument('kind');a.add_argument('--date',required=True)
     x=p.parse_args(argv)
@@ -38,11 +38,7 @@ def main(argv=None):
     elif x.cmd=='card-request': out=call('POST','/api/internal/cards/generate',json.loads(x.json))
     elif x.cmd=='card-save-result': out=call('POST','/api/internal/cards/results',json.loads(x.json))
     elif x.cmd=='scheduler-start':
-        payload={'kind':x.kind}
-        if x.kind == 'research':
-            if not (x.control_contract and x.control_contract_path and x.control_contract_sha256): raise SystemExit('research scheduler-start requires control commitment')
-            payload.update(control_contract=json.loads(x.control_contract), control_contract_path=x.control_contract_path, control_contract_sha256=x.control_contract_sha256)
-        out=call('POST',f'/api/internal/scheduler-runs/{x.run_key}/start',payload)
+        out=call('POST',f'/api/internal/scheduler-runs/{x.run_key}/start',{'kind':x.kind})
     elif x.cmd=='scheduler-latest': out=call('GET','/api/internal/scheduler-runs/latest?'+urlencode({'kind':x.kind,'date':x.date}))
     elif x.cmd=='market-context': out=call('POST',f'/api/internal/cards/{x.card_id}/market-context',{'run_key':x.run_key,'as_of':x.as_of})
     else: out=call('POST',f'/api/internal/scheduler-runs/{x.run_key}/finish',{'status':x.status,'count':x.count,'detail':json.loads(x.detail)})

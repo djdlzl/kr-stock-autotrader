@@ -85,3 +85,31 @@ def test_checkpoint_rejects_cross_directory_symlink_and_corrupt_siblings(tmp_pat
     assert source.completed_packet(checkpoint, rcp) is None
     raw.unlink(); raw.symlink_to(packet_dir / f"{rcp}.viewer.txt")
     assert source.completed_packet(checkpoint, rcp) is None
+
+
+def test_checkpoint_rederives_semantics_and_rejects_resealed_tampering(tmp_path):
+    rcp = "20260911800823"
+    packet = source.source_packet(rcp, fetch_from({
+        "main.do": (main_page(rcp), "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp, {"content-type": "text/html; charset=utf-8"}, 200),
+        "viewer.do": (b"<html><meta charset='utf-8'><body>valid document body with enough content</body></html>", "text/html; charset=utf-8", "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML", {"content-type": "text/html; charset=utf-8"}, 200),
+    }))
+    packet_dir = tmp_path / rcp[:8]; checkpoint = source.write_packet(packet, packet_dir)
+    def reseal(change):
+        metadata = json.loads(checkpoint.read_text()); change(metadata)
+        checkpoint.write_text(json.dumps(metadata), encoding="utf-8")
+        assert source.completed_packet(checkpoint, rcp) is None
+        checkpoint.write_bytes(original)
+    original = checkpoint.read_bytes()
+    viewer_text = packet_dir / f"{rcp}.viewer.txt"
+    viewer_text.write_text("<html><body>resealed but unrelated source body long enough</body></html>", encoding="utf-8")
+    metadata = json.loads(checkpoint.read_text()); metadata["text_sha256"] = __import__("hashlib").sha256(viewer_text.read_bytes()).hexdigest(); metadata["text_chars"] = len(viewer_text.read_text()); checkpoint.write_text(json.dumps(metadata), encoding="utf-8")
+    assert source.completed_packet(checkpoint, rcp) is None
+    viewer_text.write_text(packet["text"], encoding="utf-8"); checkpoint.write_bytes(original)
+    reseal(lambda m: m.update(final_url="https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=x"))
+    reseal(lambda m: m["response_headers"].update({"content-type": "text/html; charset=cp949"}))
+    reseal(lambda m: m.update(retrieved_at_kst="2026-09-11T07:00:00"))
+    reseal(lambda m: m.update(source_date="20200101"))
+    reseal(lambda m: m.update(main_raw_sha256="0" * 64))
+    escaped = tmp_path / "escaped.raw"; escaped.write_bytes((packet_dir / f"{rcp}.viewer.raw").read_bytes())
+    (packet_dir / f"{rcp}.viewer.raw").unlink(); (packet_dir / f"{rcp}.viewer.raw").symlink_to(escaped)
+    assert source.completed_packet(checkpoint, rcp) is None

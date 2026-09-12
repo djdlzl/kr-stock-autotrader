@@ -114,7 +114,7 @@ def source_packet(rcp_no: str, fetch: Callable[[str], tuple] = _fetch) -> dict:
         visible = validate_viewer(document, canonical, final_url, rcp_no)
     except SourceError: raise
     except Exception as exc: raise SourceError("SOURCE_FETCH_ERROR", str(exc)) from exc
-    return {"schema_version":"giraffe-dart-source-packet-v2","rcp_no":rcp_no,"source_date":rcp_no[:8],"main_url":main_url,"main_final_url":main_final,"main_charset":main_charset,"main_response_headers":main_headers,"main_response_status":main_status,"main_raw_sha256":hashlib.sha256(main_raw).hexdigest(),"main_raw_bytes":len(main_raw),"canonical_viewer_url":canonical,"final_url":final_url,"content_type":content_type,"response_headers":viewer_headers,"response_status":viewer_status,"retrieved_at_kst":datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),"charset":charset,"raw_sha256":hashlib.sha256(raw).hexdigest(),"raw_bytes":len(raw),"text_sha256":hashlib.sha256(document.encode("utf-8")).hexdigest(),"text_chars":len(document),"visible_chars":len(visible),"source_valid":True,"text":document,"_raw":raw,"_main_raw":main_raw}
+    return {"schema_version":"giraffe-dart-source-packet-v2","rcp_no":rcp_no,"source_date":rcp_no[:8],"main_url":main_url,"main_final_url":main_final,"main_content_type":main_type,"main_charset":main_charset,"main_response_headers":main_headers,"main_response_status":main_status,"main_raw_sha256":hashlib.sha256(main_raw).hexdigest(),"main_raw_bytes":len(main_raw),"canonical_viewer_url":canonical,"final_url":final_url,"content_type":content_type,"response_headers":viewer_headers,"response_status":viewer_status,"retrieved_at_kst":datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),"charset":charset,"raw_sha256":hashlib.sha256(raw).hexdigest(),"raw_bytes":len(raw),"text_sha256":hashlib.sha256(document.encode("utf-8")).hexdigest(),"text_chars":len(document),"visible_chars":len(visible),"source_valid":True,"text":document,"_raw":raw,"_main_raw":main_raw}
 
 
 def write_packet(packet: dict, directory: Path) -> Path:
@@ -139,25 +139,56 @@ def write_packet(packet: dict, directory: Path) -> Path:
     return meta_path
 
 
+def _stored_content_type(metadata: dict, header_name: str, fallback_name: str) -> str | None:
+    headers = metadata.get(header_name)
+    if not isinstance(headers, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in headers.items()):
+        raise ValueError("invalid stored headers")
+    header_value = headers.get("content-type")
+    fallback = metadata.get(fallback_name)
+    if header_value is not None and not isinstance(header_value, str): raise ValueError("invalid content type")
+    if fallback is not None and not isinstance(fallback, str): raise ValueError("invalid content type")
+    return header_value if header_value is not None else fallback
+
+
+def _is_aware_iso_kst(value: object) -> bool:
+    if not isinstance(value, str): return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None and parsed.utcoffset().total_seconds() == 9 * 60 * 60
+
+
 def completed_packet(path: Path, rcp_no: str) -> dict | None:
-    """A durable per-receipt resume checkpoint; corrupt/incomplete data is refetched."""
+    """Resume only a packet re-derived from its raw DART responses, never metadata alone."""
     try:
         if not re.fullmatch(r"\d{14}", rcp_no) or path.is_symlink() or path.name != f"{rcp_no}.json" or path.parent.is_symlink() or path.parent.name != rcp_no[:8]: return None
         directory = path.parent.resolve(strict=True)
         metadata = json.loads(path.read_text(encoding="utf-8"))
         raw_path, text_path, main_raw_path = (directory / f"{rcp_no}.viewer.raw", directory / f"{rcp_no}.viewer.txt", directory / f"{rcp_no}.main.raw")
-        if (metadata.get("schema_version") != "giraffe-dart-source-packet-v2" or metadata.get("rcp_no") != rcp_no or metadata.get("source_date") != rcp_no[:8]
-                or not metadata.get("source_valid") or metadata.get("raw_path") != str(raw_path) or metadata.get("text_path") != str(text_path) or metadata.get("main_raw_path") != str(main_raw_path)):
-            return None
+        required = {"schema_version", "rcp_no", "source_date", "main_url", "main_final_url", "main_content_type", "main_charset", "main_response_headers", "main_response_status", "main_raw_sha256", "main_raw_bytes", "canonical_viewer_url", "final_url", "content_type", "response_headers", "response_status", "retrieved_at_kst", "charset", "raw_sha256", "raw_bytes", "text_sha256", "text_chars", "visible_chars", "source_valid", "raw_path", "text_path", "main_raw_path"}
+        if (not isinstance(metadata, dict) or set(metadata) != required or metadata.get("schema_version") != "giraffe-dart-source-packet-v2" or metadata.get("rcp_no") != rcp_no
+                or metadata.get("source_date") != rcp_no[:8] or metadata.get("source_valid") is not True
+                or metadata.get("raw_path") != str(raw_path) or metadata.get("text_path") != str(text_path) or metadata.get("main_raw_path") != str(main_raw_path)
+                or metadata.get("main_url") != "https://dart.fss.or.kr/dsaf001/main.do?" + urllib.parse.urlencode({"rcpNo": rcp_no})
+                or not _is_aware_iso_kst(metadata.get("retrieved_at_kst"))): return None
         paths = (raw_path, text_path, main_raw_path)
         if any(item.is_symlink() or item.resolve(strict=True).parent != directory for item in paths): return None
         raw = raw_path.read_bytes(); text = text_path.read_text(encoding="utf-8"); main_raw = main_raw_path.read_bytes()
-        if (hashlib.sha256(raw).hexdigest() != metadata["raw_sha256"] or len(raw) != metadata["raw_bytes"]
-                or hashlib.sha256(text.encode("utf-8")).hexdigest() != metadata["text_sha256"]
-                or hashlib.sha256(main_raw).hexdigest() != metadata["main_raw_sha256"] or len(main_raw) != metadata["main_raw_bytes"]):
-            return None
+        if (hashlib.sha256(raw).hexdigest() != metadata["raw_sha256"] or len(raw) != metadata["raw_bytes"] or hashlib.sha256(text.encode("utf-8")).hexdigest() != metadata["text_sha256"]
+                or hashlib.sha256(main_raw).hexdigest() != metadata["main_raw_sha256"] or len(main_raw) != metadata["main_raw_bytes"]): return None
+        main_type = _stored_content_type(metadata, "main_response_headers", "main_content_type")
+        viewer_type = _stored_content_type(metadata, "response_headers", "content_type")
+        main_text, main_charset = strict_decode(main_raw, main_type)
+        document, charset = strict_decode(raw, viewer_type)
+        canonical = canonical_viewer_url(main_text, rcp_no)
+        visible = validate_viewer(document, canonical, metadata["final_url"], rcp_no)
+        if (metadata.get("main_charset") != main_charset or metadata.get("charset") != charset or metadata.get("canonical_viewer_url") != canonical
+                or document != text or len(document) != metadata["text_chars"] or len(visible) != metadata["visible_chars"]
+                or not isinstance(metadata.get("main_response_status"), int) or isinstance(metadata["main_response_status"], bool) or not 200 <= metadata["main_response_status"] < 300
+                or not isinstance(metadata.get("response_status"), int) or isinstance(metadata["response_status"], bool) or not 200 <= metadata["response_status"] < 300): return None
         return metadata
-    except (OSError, KeyError, TypeError, ValueError):
+    except (OSError, KeyError, TypeError, ValueError, SourceError, json.JSONDecodeError):
         return None
 
 

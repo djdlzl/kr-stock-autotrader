@@ -18,7 +18,7 @@ from .auth import csrf_origin_ok, current_user, hash_password, issue_session, ve
 from .config import COOKIE_SECURE, LIVE_TRADING, SIGNUP_ENABLED
 from .db import connect
 from .domain import KST, Quote, is_krx_business_date, market_open, parse_kst, now_kst
-from .decision_cards import (require_internal_api_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, current_filter_head, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
+from .decision_cards import (require_internal_api_key, require_research_control_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, current_filter_head, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML, PROTOTYPE_HTML
 from .kis_readonly import KISReadOnlyClient
@@ -432,40 +432,38 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
-def _research_commitment(run_key: str, data: object) -> dict:
-    """Validate an agent-supplied commitment without claiming this API read its file."""
-    if not isinstance(data, dict): raise HTTPException(422, "research control commitment required")
-    contract, path, digest = data.get("control_contract"), data.get("control_contract_path"), data.get("control_contract_sha256")
+def _research_commitment(run_key: str, contract: object) -> dict:
+    """Validate the deterministic prehook contract before it becomes immutable state."""
+    if not isinstance(contract, dict): raise HTTPException(422, "research control commitment required")
     required = {"schema_version", "run_key", "dates", "source_valid", "expected_rcp_nos", "control_count", "sources"}
-    if (not isinstance(contract, dict) or set(contract) != required or contract.get("schema_version") != "giraffe-research-control-v1"
-            or contract.get("run_key") != run_key or not isinstance(path, str) or not path or not isinstance(digest, str)
-            or not re.fullmatch(r"[0-9a-f]{64}", digest) or digest != _sha256(contract)):
-        raise HTTPException(422, "invalid research control commitment")
+    if (set(contract) != required or contract.get("schema_version") != "giraffe-research-control-v1"
+            or contract.get("run_key") != run_key): raise HTTPException(422, "invalid research control commitment")
     expected, dates, sources = contract["expected_rcp_nos"], contract["dates"], contract["sources"]
-    run_date = datetime.strptime(run_key.removeprefix("research-").removesuffix("-0700-kst"), "%Y-%m-%d")
+    try: run_date = datetime.strptime(run_key.removeprefix("research-").removesuffix("-0700-kst"), "%Y-%m-%d")
+    except ValueError: raise HTTPException(422, "invalid research run key")
     expected_dates = [(run_date - timedelta(days=1)).strftime("%Y%m%d"), run_date.strftime("%Y%m%d")]
     packet_root = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
-    contract_root = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-control-contracts"
     if (not isinstance(expected, list) or expected != sorted(expected) or len(expected) != len(set(expected))
             or any(not isinstance(rcp, str) or not re.fullmatch(r"\d{14}", rcp) for rcp in expected)
             or contract["control_count"] != len(expected) or contract["source_valid"] is not True
-            or dates != expected_dates
-            or not isinstance(sources, list) or len(sources) != len(expected)):
+            or dates != expected_dates or not isinstance(sources, list) or len(sources) != len(expected)):
         raise HTTPException(422, "invalid research control set")
     source_ids = []
     for source in sources:
         rcp_no = source.get("rcp_no") if isinstance(source, dict) else None
-        rcp_text = rcp_no if isinstance(rcp_no, str) else ""
-        expected_packet_path = str(packet_root / rcp_text[:8] / f"{rcp_text}.json") if re.fullmatch(r"\d{14}", rcp_text) else None
+        expected_packet_path = str(packet_root / rcp_no[:8] / f"{rcp_no}.json") if isinstance(rcp_no, str) and re.fullmatch(r"\d{14}", rcp_no) else None
         if (not isinstance(source, dict) or set(source) != {"rcp_no", "date", "packet_path", "packet_sha256"}
-                or rcp_text not in expected or source.get("date") != rcp_text[:8] or source["date"] not in expected_dates
+                or rcp_no not in expected or source.get("date") != rcp_no[:8] or source["date"] not in expected_dates
                 or source.get("packet_path") != expected_packet_path or not isinstance(source.get("packet_sha256"), str)
                 or not re.fullmatch(r"[0-9a-f]{64}", source["packet_sha256"])):
             raise HTTPException(422, "invalid research source commitment")
-        source_ids.append(source["rcp_no"])
-    if source_ids != expected or path != str(contract_root / f"{run_key}.json"):
-        raise HTTPException(422, "research source commitment is not canonical")
-    return {"control_contract": contract, "control_contract_path": path, "control_contract_sha256": digest}
+        source_ids.append(rcp_no)
+    if source_ids != expected: raise HTTPException(422, "research source commitment is not canonical")
+    return {"control_contract": contract, "control_contract_sha256": _sha256(contract)}
+
+
+def _registered_research_detail(run_key: str, contract: object) -> dict:
+    return {"kind": "research", "control_commitment": _research_commitment(run_key, contract)}
 
 
 def _safe_research_scheduler_finish(run_key: str, start_detail: object, data: object) -> dict:
@@ -1309,20 +1307,42 @@ async def internal_order_evaluate(plan_id: int, request: Request, _: None = Depe
     try:return evaluate_order_plan(db,plan_id,await request.json())
     finally:db.close()
 
+@app.post('/api/internal/research-runs/{run_key}/register')
+async def register_research_run(run_key: str, request: Request, _: None = Depends(require_research_control_key)):
+    """The prehook-only authority creates canonical research runs."""
+    data = await request.json(); db = connect()
+    try:
+        if not _is_research_run(run_key, 'research') or not isinstance(data, dict) or set(data) != {'control_contract'}:
+            raise HTTPException(422, 'invalid deterministic research registration')
+        detail = _registered_research_detail(run_key, data['control_contract'])
+        existing = db.execute("SELECT kind,status,detail FROM scheduler_runs WHERE run_key=?", (run_key,)).fetchone()
+        if existing:
+            if existing['kind'] != 'research': raise HTTPException(409, 'run_key kind conflict')
+            if json.loads(existing['detail']).get('control_commitment') != detail['control_commitment']:
+                raise HTTPException(409, 'research control commitment conflict')
+            return {'run_key': run_key, 'kind': 'research', 'status': existing['status'], 'idempotent': True}
+        db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?, 'started',?,?)", (run_key, 'research', __import__('kr_stock_autotrader.decision_cards', fromlist=['now']).now(), json.dumps(detail)))
+        db.commit(); return {'run_key': run_key, 'kind': 'research', 'status': 'started', 'idempotent': False}
+    finally: db.close()
+
+
 @app.post('/api/internal/scheduler-runs/{run_key}/start')
 async def scheduler_start(run_key: str, request: Request, _: None = Depends(require_internal_api_key)):
     data=await request.json(); db=connect()
     try:
         if not isinstance(data, dict) or not isinstance(data.get('kind'), str): raise HTTPException(422,'invalid scheduler start')
         existing=db.execute("SELECT kind,status FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
+        if _is_research_run(run_key, data['kind']):
+            if set(data) != {'kind'}: raise HTTPException(422, 'canonical research start accepts no contract fields')
+            if not existing: raise HTTPException(404, 'canonical research run must be prehook-registered')
         if existing:
             if existing['kind'] != data['kind']: raise HTTPException(409,'run_key kind conflict')
             return {'run_key':run_key,'kind':existing['kind'],'status':existing['status'],'idempotent':True}
         detail = {'kind': data['kind']}
-        if _is_research_run(run_key, data['kind']): detail['control_commitment'] = _research_commitment(run_key, data)
         db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?, 'started',?,?)",(run_key,data['kind'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),json.dumps(detail)))
         db.commit(); return {'run_key':run_key,'kind':data['kind'],'status':'started','idempotent':False}
     finally: db.close()
+
 
 @app.post('/api/internal/scheduler-runs/{run_key}/finish')
 async def scheduler_finish(run_key: str, request: Request, _: None = Depends(require_internal_api_key)):

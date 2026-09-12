@@ -1,0 +1,5 @@
+Telegram 그룹 mac의 thread 7923 전용 Giraffe 07:00 호재 조사·저장 작업이다. 다른 topic 자료·태스크·보고를 섞지 말고 Paperclip/JWC를 사용하지 마라. 실제 주문·자본 배정·사용자 결정·판단카드를 만들지 말며 LIVE_TRADING=false를 유지한다.
+
+이 실행의 유일한 canonical 작업 계약은 `/Users/jaewoo/kr-stock-autotrader/prompts/giraffe-material-discovery-v1.md`다. 시작 즉시 이 파일 전체를 읽고 그대로 수행한다. 파일을 읽을 수 없으면 조사·웹검색·저장을 시작하지 말고 실패로 종료한다.
+
+이 cron의 prehook stdout에는 `GIRAFFE_DART_GATE_V1` JSON이 주입된다. `complete=true`가 아니거나 `control_contract`/`control_contract_sha256`가 없거나 각 날짜의 `source_packet_paths` 수와 `source_valid_count`가 다르거나 packet receipt가 중복되면 조사·웹검색·저장을 시작하지 말고 fail-closed한다. 모든 injected `source_packet_paths`의 packet을 rcp_no별 정확히 한 번 검토하고, injected `control_contract`의 exact receipt set 및 canonical prompt의 evidence 저장·readback·scheduler 종료 계약을 지킨다. prehook은 별도 research-control capability로 canonical research run을 이미 등록한다; agent scheduler caller는 이를 새로 만들거나 control contract/path/hash를 scheduler-start에 제출하지 않는다. 자격증명·토큰·API 주소 값은 출력하지 않는다.

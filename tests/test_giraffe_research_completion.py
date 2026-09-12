@@ -7,11 +7,13 @@ from pathlib import Path
 
 os.environ.setdefault("DATABASE_PATH", tempfile.mktemp(suffix=".db"))
 os.environ.setdefault("INTERNAL_API_KEY", "test-key")
+os.environ.setdefault("RESEARCH_CONTROL_KEY", "test-control-key")
 os.environ.setdefault("SESSION_SECRET", "test-session-secret-that-is-at-least-thirty-two-bytes-long")
 from fastapi.testclient import TestClient
 from app import app
 
 HEADERS = {"X-Internal-API-Key": os.environ["INTERNAL_API_KEY"]}
+CONTROL_HEADERS = {"X-Research-Control-Key": os.environ["RESEARCH_CONTROL_KEY"]}
 
 
 def canonical(value):
@@ -40,14 +42,17 @@ def commitment(run_key, receipts):
     return contract, hashlib.sha256(canonical(contract)).hexdigest()
 
 
-def start(client, key, receipts=()):
+def register(client, key, receipts=(), headers=CONTROL_HEADERS):
     contract, digest = commitment(key, receipts)
-    response = client.post(
-        f"/api/internal/scheduler-runs/{key}/start",
-        json={"kind": "research", "control_contract": contract,
-              "control_contract_path": str(Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-control-contracts" / f"{key}.json"),
-              "control_contract_sha256": digest}, headers=HEADERS)
+    response = client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=headers)
     assert response.status_code == 200
+    return contract, digest
+
+
+def start(client, key, receipts=()):
+    contract, digest = register(client, key, receipts)
+    response = client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research"}, headers=HEADERS)
+    assert response.status_code == 200 and response.json()["idempotent"] is True
     return contract, digest
 
 
@@ -92,28 +97,21 @@ def test_research_done_binds_exact_control_ids_contract_and_terminal_idempotence
     assert second.json()["status"] == "done"
 
 
-def test_research_start_rejects_unbound_or_noncanonical_commitments():
+def test_internal_scheduler_cannot_create_or_forge_canonical_research_runs():
     client = TestClient(app); key = "research-2026-09-14-0700-kst"
-    contract, digest = commitment(key, ["20260914000001"])
-    for payload in (
-        {"kind": "research"},
-        {"kind": "research", "control_contract": contract, "control_contract_path": "/trusted/x", "control_contract_sha256": "not-a-hash"},
-        {"kind": "research", "control_contract": {**contract, "control_count": 0}, "control_contract_path": "/trusted/x", "control_contract_sha256": digest},
-    ):
-        assert client.post(f"/api/internal/scheduler-runs/{key}/start", json=payload, headers=HEADERS).status_code == 422
+    assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research"}, headers=HEADERS).status_code == 404
+    contract, _ = commitment(key, ["20260914000001"])
+    assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research", "control_contract": contract}, headers=HEADERS).status_code == 422
+    assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=HEADERS).status_code == 403
+    assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers={"X-Research-Control-Key": "wrong"}).status_code == 403
+    _, digest = register(client, key, ["20260914000001"])
+    conflict, _ = commitment(key, ["20260914000002"])
+    assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": conflict}, headers=CONTROL_HEADERS).status_code == 409
+    valid = {"status": "done", "count": 0, "detail": {"completion_receipt": receipt(key, digest, ["20260914000001"])}}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=valid, headers=HEADERS).status_code == 200
 
 
-def test_cross_date_cross_run_and_path_escape_commitments_are_rejected():
-    client = TestClient(app); key = "research-2026-09-14-0700-kst"
-    contract, digest = commitment(key, ["20260914000001"])
-    exploit = {**contract, "dates": ["20200101"], "expected_rcp_nos": ["20200101000001"],
-               "sources": [{"rcp_no": "20200101000001", "date": "20200101", "packet_path": "/tmp/20200101000001.json", "packet_sha256": "a" * 64}], "control_count": 1}
-    payload = {"kind": "research", "control_contract": exploit,
-               "control_contract_path": "/tmp/cross-run.json", "control_contract_sha256": hashlib.sha256(canonical(exploit)).hexdigest()}
-    assert client.post(f"/api/internal/scheduler-runs/{key}/start", json=payload, headers=HEADERS).status_code == 422
-    wrong_date = {**contract, "sources": [{**contract["sources"][0], "date": "20260913"}]}
-    assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research", "control_contract": wrong_date,
-        "control_contract_path": str(Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-control-contracts" / f"{key}.json"), "control_contract_sha256": hashlib.sha256(canonical(wrong_date)).hexdigest()}, headers=HEADERS).status_code == 422
-    escaped = {**contract, "sources": [{**contract["sources"][0], "packet_path": "/tmp/20260914000001.json"}]}
-    assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research", "control_contract": escaped,
-        "control_contract_path": str(Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-control-contracts" / f"{key}.json"), "control_contract_sha256": hashlib.sha256(canonical(escaped)).hexdigest()}, headers=HEADERS).status_code == 422
+def test_registration_does_not_depend_on_caller_contract_path():
+    client = TestClient(app); key = "research-2026-09-15-0700-kst"
+    contract, _ = commitment(key, [])
+    assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 200
