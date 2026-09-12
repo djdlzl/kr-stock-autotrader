@@ -2,6 +2,8 @@ import hashlib
 import json
 import os
 import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
 
 os.environ.setdefault("DATABASE_PATH", tempfile.mktemp(suffix=".db"))
 os.environ.setdefault("INTERNAL_API_KEY", "test-key")
@@ -17,17 +19,19 @@ def canonical(value):
 
 
 def commitment(run_key, receipts):
-    date = run_key.removeprefix("research-").removesuffix("-0700-kst").replace("-", "")
+    run_date = datetime.strptime(run_key.removeprefix("research-").removesuffix("-0700-kst"), "%Y-%m-%d")
+    dates = [(run_date - timedelta(days=1)).strftime("%Y%m%d"), run_date.strftime("%Y%m%d")]
+    source_root = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
     sources = [{
         "rcp_no": rcp_no,
-        "date": date,
-        "packet_path": f"/trusted/{rcp_no}.json",
+        "date": rcp_no[:8],
+        "packet_path": str(source_root / rcp_no[:8] / f"{rcp_no}.json"),
         "packet_sha256": "a" * 64,
     } for rcp_no in sorted(receipts)]
     contract = {
         "schema_version": "giraffe-research-control-v1",
         "run_key": run_key,
-        "dates": [date],
+        "dates": dates,
         "source_valid": True,
         "expected_rcp_nos": sorted(receipts),
         "control_count": len(receipts),
@@ -41,7 +45,7 @@ def start(client, key, receipts=()):
     response = client.post(
         f"/api/internal/scheduler-runs/{key}/start",
         json={"kind": "research", "control_contract": contract,
-              "control_contract_path": "/trusted/nonempty.json",
+              "control_contract_path": str(Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-control-contracts" / f"{key}.json"),
               "control_contract_sha256": digest}, headers=HEADERS)
     assert response.status_code == 200
     return contract, digest
@@ -97,3 +101,19 @@ def test_research_start_rejects_unbound_or_noncanonical_commitments():
         {"kind": "research", "control_contract": {**contract, "control_count": 0}, "control_contract_path": "/trusted/x", "control_contract_sha256": digest},
     ):
         assert client.post(f"/api/internal/scheduler-runs/{key}/start", json=payload, headers=HEADERS).status_code == 422
+
+
+def test_cross_date_cross_run_and_path_escape_commitments_are_rejected():
+    client = TestClient(app); key = "research-2026-09-14-0700-kst"
+    contract, digest = commitment(key, ["20260914000001"])
+    exploit = {**contract, "dates": ["20200101"], "expected_rcp_nos": ["20200101000001"],
+               "sources": [{"rcp_no": "20200101000001", "date": "20200101", "packet_path": "/tmp/20200101000001.json", "packet_sha256": "a" * 64}], "control_count": 1}
+    payload = {"kind": "research", "control_contract": exploit,
+               "control_contract_path": "/tmp/cross-run.json", "control_contract_sha256": hashlib.sha256(canonical(exploit)).hexdigest()}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/start", json=payload, headers=HEADERS).status_code == 422
+    wrong_date = {**contract, "sources": [{**contract["sources"][0], "date": "20260913"}]}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research", "control_contract": wrong_date,
+        "control_contract_path": str(Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-control-contracts" / f"{key}.json"), "control_contract_sha256": hashlib.sha256(canonical(wrong_date)).hexdigest()}, headers=HEADERS).status_code == 422
+    escaped = {**contract, "sources": [{**contract["sources"][0], "packet_path": "/tmp/20260914000001.json"}]}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research", "control_contract": escaped,
+        "control_contract_path": str(Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-control-contracts" / f"{key}.json"), "control_contract_sha256": hashlib.sha256(canonical(escaped)).hexdigest()}, headers=HEADERS).status_code == 422

@@ -27,11 +27,16 @@ def canonical_bytes(value: object) -> bytes:
 
 def control_contract(run_key: str, summaries: list[dict]) -> dict:
     sources = []
+    allowed_dates = [item["date"] for item in summaries]
     for summary in summaries:
         for packet_path in summary["source_packet_paths"]:
             raw = Path(packet_path).read_bytes()
             metadata = json.loads(raw)
-            sources.append({"rcp_no": metadata["rcp_no"], "date": summary["date"], "packet_path": packet_path,
+            rcp_no = metadata.get("rcp_no")
+            source_date = metadata.get("source_date")
+            if not isinstance(rcp_no, str) or source_date != rcp_no[:8] or source_date not in allowed_dates:
+                raise ManifestError("DART source packet date does not match the control window")
+            sources.append({"rcp_no": rcp_no, "date": source_date, "packet_path": packet_path,
                             "packet_sha256": hashlib.sha256(raw).hexdigest()})
     sources.sort(key=lambda item: item["rcp_no"])
     receipts = [item["rcp_no"] for item in sources]

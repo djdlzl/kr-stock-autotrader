@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -110,8 +111,12 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                 "complete": True, "date": date,
             }
 
-        packet = {"rcp_no": "20260901000001", "text": "valid source"}
-        with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), patch.object(self.gate, "collect_manifest", fake_collect), patch.object(self.gate, "fetch_with_retry", side_effect=lambda rcp: {"rcp_no": rcp, "text": "valid source"}), patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "2026-08-31,20260901"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
+        def fake_packet(rcp):
+            raw, main_raw, text = b"viewer raw", b"main raw", "valid source"
+            return {"schema_version": "giraffe-dart-source-packet-v2", "rcp_no": rcp, "source_date": rcp[:8], "source_valid": True,
+                    "raw_sha256": hashlib.sha256(raw).hexdigest(), "raw_bytes": len(raw), "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                    "main_raw_sha256": hashlib.sha256(main_raw).hexdigest(), "main_raw_bytes": len(main_raw), "text": text, "_raw": raw, "_main_raw": main_raw}
+        with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), patch.object(self.gate, "collect_manifest", fake_collect), patch.object(self.gate, "fetch_with_retry", side_effect=fake_packet), patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "2026-08-31,20260901"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(self.gate.main(), 0)
         result = json.loads(output.getvalue())
         self.assertEqual(result["gate"], "GIRAFFE_DART_GATE_V1")

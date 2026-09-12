@@ -7,6 +7,7 @@ import threading
 import time as monotonic_time
 from contextlib import contextmanager
 from datetime import datetime, time, timedelta
+from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -441,18 +442,28 @@ def _research_commitment(run_key: str, data: object) -> dict:
             or not re.fullmatch(r"[0-9a-f]{64}", digest) or digest != _sha256(contract)):
         raise HTTPException(422, "invalid research control commitment")
     expected, dates, sources = contract["expected_rcp_nos"], contract["dates"], contract["sources"]
+    run_date = datetime.strptime(run_key.removeprefix("research-").removesuffix("-0700-kst"), "%Y-%m-%d")
+    expected_dates = [(run_date - timedelta(days=1)).strftime("%Y%m%d"), run_date.strftime("%Y%m%d")]
+    packet_root = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
+    contract_root = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-control-contracts"
     if (not isinstance(expected, list) or expected != sorted(expected) or len(expected) != len(set(expected))
             or any(not isinstance(rcp, str) or not re.fullmatch(r"\d{14}", rcp) for rcp in expected)
             or contract["control_count"] != len(expected) or contract["source_valid"] is not True
-            or not isinstance(dates, list) or not dates or any(not isinstance(d, str) or not re.fullmatch(r"\d{8}", d) for d in dates)
+            or dates != expected_dates
             or not isinstance(sources, list) or len(sources) != len(expected)):
         raise HTTPException(422, "invalid research control set")
     source_ids = []
     for source in sources:
-        if not isinstance(source, dict) or set(source) != {"rcp_no", "date", "packet_path", "packet_sha256"} or source.get("rcp_no") not in expected or source.get("date") not in dates or not isinstance(source.get("packet_path"), str) or not source["packet_path"] or not isinstance(source.get("packet_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", source["packet_sha256"]):
+        rcp_no = source.get("rcp_no") if isinstance(source, dict) else None
+        rcp_text = rcp_no if isinstance(rcp_no, str) else ""
+        expected_packet_path = str(packet_root / rcp_text[:8] / f"{rcp_text}.json") if re.fullmatch(r"\d{14}", rcp_text) else None
+        if (not isinstance(source, dict) or set(source) != {"rcp_no", "date", "packet_path", "packet_sha256"}
+                or rcp_text not in expected or source.get("date") != rcp_text[:8] or source["date"] not in expected_dates
+                or source.get("packet_path") != expected_packet_path or not isinstance(source.get("packet_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", source["packet_sha256"])):
             raise HTTPException(422, "invalid research source commitment")
         source_ids.append(source["rcp_no"])
-    if source_ids != expected:
+    if source_ids != expected or path != str(contract_root / f"{run_key}.json"):
         raise HTTPException(422, "research source commitment is not canonical")
     return {"control_contract": contract, "control_contract_path": path, "control_contract_sha256": digest}
 
