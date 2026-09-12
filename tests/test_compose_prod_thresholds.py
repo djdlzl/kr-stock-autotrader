@@ -21,6 +21,7 @@ THRESHOLDS = {
 REQUIRED_RUNTIME_ENV = {
     "SESSION_SECRET": "test-session-secret-that-is-at-least-thirty-two-bytes-long",
     "INTERNAL_API_KEY": "test-internal-api-key",
+    "RESEARCH_CONTROL_KEY": "test-research-control-key",
     "KIS_APP_KEY": "test-kis-app-key",
     "KIS_APP_SECRET": "test-kis-app-secret",
     "KIS_ACCOUNT_NO": "12345678",
@@ -50,6 +51,15 @@ def test_production_compose_renders_all_mandatory_giraffe_thresholds():
     environment = json.loads(result.stdout)["services"]["app"]["environment"]
     assert {name: environment.get(name) for name in THRESHOLDS} == THRESHOLDS
     assert environment["LIVE_TRADING"] == "false"
+    assert environment["RESEARCH_CONTROL_KEY"] == REQUIRED_RUNTIME_ENV["RESEARCH_CONTROL_KEY"]
+
+
+def test_production_compose_requires_research_control_key():
+    env = fixture_env()
+    env.pop("RESEARCH_CONTROL_KEY")
+    result = compose_config(env)
+    assert result.returncode != 0
+    assert "RESEARCH_CONTROL_KEY" in result.stderr
 
 
 @pytest.mark.parametrize("missing", THRESHOLDS)
