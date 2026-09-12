@@ -196,7 +196,10 @@ def completed_packet(path: Path, rcp_no: str, *, now: datetime | None = None) ->
                 or not _capture_time_is_fresh(metadata.get("retrieved_at_kst"), now or datetime.now(KST))): return None
         paths = (raw_path, text_path, main_raw_path)
         if any(item.is_symlink() or item.resolve(strict=True).parent != directory for item in paths): return None
-        raw = raw_path.read_bytes(); text = text_path.read_text(encoding="utf-8"); main_raw = main_raw_path.read_bytes()
+        # Preserve the exact decoded representation. Path.read_text() enables
+        # universal-newline translation, which changes authoritative CRLF
+        # source text and makes every valid Windows-newline checkpoint miss.
+        raw = raw_path.read_bytes(); text = text_path.read_bytes().decode("utf-8"); main_raw = main_raw_path.read_bytes()
         if (hashlib.sha256(raw).hexdigest() != metadata["raw_sha256"] or len(raw) != metadata["raw_bytes"] or hashlib.sha256(text.encode("utf-8")).hexdigest() != metadata["text_sha256"]
                 or hashlib.sha256(main_raw).hexdigest() != metadata["main_raw_sha256"] or len(main_raw) != metadata["main_raw_bytes"]): return None
         main_type = metadata.get("main_content_type")

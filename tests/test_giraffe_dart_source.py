@@ -135,6 +135,21 @@ def test_checkpoint_rederives_semantics_and_rejects_resealed_tampering(tmp_path)
     assert source.completed_packet(checkpoint, rcp) is None
 
 
+def test_checkpoint_resume_preserves_authoritative_crlf_text(tmp_path):
+    rcp = "20260911800823"
+    viewer = b"<html>\r\n<meta charset='utf-8'>\r\n<body>valid document body with enough content</body>\r\n</html>"
+    packet = source.source_packet(rcp, fetch_from({
+        "main.do": (main_page(rcp), "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp),
+        "viewer.do": (viewer, "text/html; charset=utf-8", "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML"),
+    }))
+    checkpoint = source.write_packet(packet, tmp_path / rcp[:8])
+
+    resumed = source.completed_packet(checkpoint, rcp)
+
+    assert resumed is not None
+    assert (tmp_path / rcp[:8] / f"{rcp}.viewer.txt").read_bytes().decode("utf-8") == packet["text"]
+
+
 def test_checkpoint_freshness_has_deterministic_kst_bounds(tmp_path):
     rcp = "20260911800823"
     viewer = b"<html><meta charset='utf-8'><body>valid document body with enough content</body></html>"
