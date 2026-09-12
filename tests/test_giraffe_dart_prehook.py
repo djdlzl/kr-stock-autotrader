@@ -110,15 +110,17 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                 "complete": True, "date": date,
             }
 
-        with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "collect_manifest", fake_collect), patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "2026-08-31,20260901"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
+        packet = {"rcp_no": "20260901000001", "text": "valid source"}
+        with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), patch.object(self.gate, "collect_manifest", fake_collect), patch.object(self.gate, "fetch_with_retry", return_value=packet), patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "2026-08-31,20260901"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(self.gate.main(), 0)
         result = json.loads(output.getvalue())
         self.assertEqual(result["gate"], "GIRAFFE_DART_GATE_V1")
         self.assertTrue(result["complete"])
         self.assertEqual([item["date"] for item in result["dates"]], ["20260831", "20260901"])
         for item in result["dates"]:
-            self.assertEqual(item["material_candidate_count"], len(item["material_candidate_records"]))
-            self.assertEqual(item["material_candidate_records"][0]["rcp_no"], "20260901000001")
+            self.assertEqual(item["material_candidate_count"], len(item["source_packet_paths"]))
+            self.assertEqual(item["source_valid_count"], 1)
+            self.assertEqual(item["source_error_count"], 0)
 
     def test_gate_fails_nonzero_when_manifest_is_incomplete(self):
         with patch.object(self.gate, "collect_manifest", side_effect=self.gate.ManifestError("incomplete DART manifest")), contextlib.redirect_stdout(io.StringIO()) as output:
@@ -131,7 +133,8 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         prompt = (ROOT / "prompts/giraffe-material-discovery-v1.md").read_text(encoding="utf-8")
         self.assertIn("GIRAFFE_DART_GATE_V1", prompt)
         self.assertIn("complete=true", prompt)
-        self.assertIn("material_candidate_records", prompt)
+        self.assertIn("source_packet_paths", prompt)
+        self.assertIn("completion_receipt", prompt)
         self.assertIn("정확히 한 번", prompt)
         self.assertIn("reviewed receipt", prompt)
         self.assertIn("scheduler-finish", prompt)

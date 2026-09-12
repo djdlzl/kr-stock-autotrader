@@ -13,8 +13,10 @@ from zoneinfo import ZoneInfo
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 from giraffe_dart_manifest import ManifestError, collect_manifest  # noqa: E402
+from giraffe_dart_source import SourceError, fetch_with_retry, write_packet  # noqa: E402
 
 OUTPUT_ROOT = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-manifests"
+SOURCE_ROOT = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
 
 
 def target_dates() -> list[str]:
@@ -36,6 +38,17 @@ def main() -> int:
             output = OUTPUT_ROOT / f"{date}.json"
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            packet_dir = SOURCE_ROOT / date
+            source_packets = []
+            source_errors = []
+            for candidate in manifest["material_candidate_records"]:
+                rcp_no = candidate["rcp_no"]
+                try:
+                    source_packets.append(str(write_packet(fetch_with_retry(rcp_no), packet_dir)))
+                except SourceError as exc:
+                    source_errors.append({"rcp_no": rcp_no, "code": exc.code, "error": str(exc)})
+            if source_errors:
+                raise ManifestError("DART source validity failed: " + json.dumps(source_errors, ensure_ascii=False))
             summaries.append({
                 "date": date,
                 "declared_total": manifest["declared_total"],
@@ -44,10 +57,9 @@ def main() -> int:
                 "page_counts": manifest["page_counts"],
                 "unique_receipts": manifest["unique_receipts"],
                 "material_candidate_count": manifest["material_candidate_count"],
-                # Cron injects this stdout into the agent prompt.  Include the
-                # complete control list directly: a count/path-only summary
-                # cannot enforce exact-once review.
-                "material_candidate_records": manifest["material_candidate_records"],
+                "source_packet_paths": source_packets,
+                "source_valid_count": len(source_packets),
+                "source_error_count": len(source_errors),
                 "complete": manifest["complete"],
                 "manifest_path": str(output),
             })

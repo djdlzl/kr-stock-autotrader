@@ -403,6 +403,7 @@ app = FastAPI(title="Giraffe — Paper Only")
 
 
 _PREMARKET_RUN_KEY = re.compile(r"^card-\d{4}-\d{2}-\d{2}-0800-kst$")
+_RESEARCH_RUN_KEY = re.compile(r"^research-\d{4}-\d{2}-\d{2}-0700-kst$")
 _PREMARKET_DIAGNOSTIC_CATEGORIES = frozenset({
     "provider", "auth", "http", "kis_rt_cd_msg_cd", "output_shape",
     "listed_shares", "bar_count", "date_range", "alignment", "local_validation",
@@ -415,6 +416,36 @@ _PREMARKET_STAGES = frozenset({"research_dependency", "market_snapshot", "filter
 
 def _is_premarket_card_run(run_key: str, kind: object) -> bool:
     return kind == "card" and _PREMARKET_RUN_KEY.fullmatch(run_key) is not None
+
+
+def _is_research_run(run_key: str, kind: object) -> bool:
+    return kind == "research" and _RESEARCH_RUN_KEY.fullmatch(run_key) is not None
+
+
+def _safe_research_scheduler_finish(data: object) -> dict:
+    """Accept DONE only with an exact, source-valid 07:00 completion receipt."""
+    if not isinstance(data, dict) or data.get("status") not in {"done", "error"}:
+        raise HTTPException(422, "invalid research scheduler finish")
+    count = _nonnegative_int(data.get("count", 0))
+    if count is None or not isinstance(data.get("detail"), dict):
+        raise HTTPException(422, "invalid research scheduler detail")
+    if data["status"] == "error":
+        return {"status": "error", "count": count, "detail": data["detail"]}
+    receipt = data["detail"].get("completion_receipt")
+    required = {"schema_version", "control_count", "source_valid", "reviewed_unique", "source_error", "store_error", "coverage_error", "rejected_after_evidence", "saved", "existing", "correction_stored"}
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != "giraffe-research-completion-v1" or set(receipt) - (required | {"receipt_path", "receipt_sha256"}) or not required.issubset(receipt):
+        raise HTTPException(422, "invalid research completion receipt")
+    fields = {name: _nonnegative_int(receipt[name]) for name in required - {"schema_version"}}
+    if any(value is None for value in fields.values()):
+        raise HTTPException(422, "invalid research completion counters")
+    fields = {name: int(value) for name, value in fields.items()}
+    control = fields["control_count"]
+    terminal = sum(fields[name] for name in ("rejected_after_evidence", "saved", "existing", "correction_stored", "source_error", "store_error", "coverage_error"))
+    if fields["source_valid"] != control or fields["reviewed_unique"] != control or terminal != control or any(fields[name] for name in ("source_error", "store_error", "coverage_error")):
+        raise HTTPException(422, "research completion receipt is not done-safe")
+    if count != fields["saved"] + fields["correction_stored"]:
+        raise HTTPException(422, "research completion count mismatch")
+    return {"status": "done", "count": count, "detail": data["detail"]}
 
 
 def _nonnegative_int(value: object) -> int | None:
@@ -1257,9 +1288,10 @@ async def scheduler_finish(run_key: str, request: Request, _: None = Depends(req
     try:
         existing=db.execute("SELECT kind FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
         if not existing: raise HTTPException(404,'scheduler run not found')
-        finished = _safe_premarket_scheduler_finish(data) if _is_premarket_card_run(run_key, existing['kind']) else data
+        finished = (_safe_premarket_scheduler_finish(data) if _is_premarket_card_run(run_key, existing['kind'])
+                    else _safe_research_scheduler_finish(data) if _is_research_run(run_key, existing['kind']) else data)
         # The predicate is atomic: a concurrent retry cannot overwrite done.
-        updated = db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=? AND NOT (kind='market_context' AND status='done')",(finished['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(finished),run_key))
+        updated = db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=? AND NOT ((kind='market_context' OR kind='research') AND status IN ('done','error'))",(finished['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),__import__('json').dumps(finished),run_key))
         if updated.rowcount == 0:
             persisted = db.execute("SELECT detail FROM scheduler_runs WHERE run_key=?", (run_key,)).fetchone()
             finished = __import__('json').loads(persisted['detail'])

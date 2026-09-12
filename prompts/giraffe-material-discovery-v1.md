@@ -28,7 +28,8 @@ Giraffe는 paper-only이고 `LIVE_TRADING=False`다. 이 작업은 주문·자�
 - 이 job은 먼저 repo-owned `giraffe_dart_manifest_gate.py` prehook의 stdout JSON을 주입받아야 한다. 정상 gate 식별자는 정확히 `GIRAFFE_DART_GATE_V1`이고 `complete=true`여야 한다.
 - gate가 없거나 JSON이 아니거나 `gate` 값이 다르거나 `complete!=true`이면 **조사·웹검색·저장 어느 것도 시작하지 않는다**. 이 경우 `scheduler-finish ... error`로 종료한다. 첫 페이지 DART 목록이나 일반 웹검색으로 대체하지 않는다.
 - gate는 전일+당일 KST DART manifest를 `/Users/jaewoo/.hermes/runs/giraffe-7923/dart-manifests/`에 남긴다. 각 date의 `declared_total`, `declared_pages`, `pages_collected`, `page_counts`, `unique_receipts`, `duplicates`, `material_candidate_count`, `complete`, `manifest_path`를 실행 receipt에 기록한다.
-- 각 complete manifest의 `material_candidate_records`가 DART 조사 제어 목록이다. 이 목록의 모든 `rcp_no`를 **정확히 한 번씩** 열어 원문을 검토하고, 일반 검색으로 이 목록을 건너뛰거나 중복 검토하지 않는다. 원문 접근 실패도 해당 receipt의 검토 결과로 기록한다.
+- 각 complete manifest의 `source_packet_paths`만이 DART 조사 제어 목록이다. packet 밖의 DART URL·검색 결과를 원문 근거로 쓰지 않는다. packet metadata의 `rcp_no`를 **정확히 한 번씩** 검토하고, path 수와 `source_valid_count`가 제어 수와 같아야 한다.
+- prehook의 `source_error_count>0`, 누락 packet, charset/source packet 검증 실패는 원문 접근 실패다. `INSUFFICIENT_EVIDENCE`로 분류하거나 `done`으로 끝내지 말고 `scheduler-finish ... error`로 끝낸다. `INSUFFICIENT_EVIDENCE`는 source-valid packet을 읽은 뒤 경제적 의미가 부족할 때만 쓴다.
 - 전일·당일 두 manifest를 합친 제어 목록에서 중복 receipt가 있으면 실패 처리한다. 검토 완료 receipt 수는 고유 제어 receipt 수와 정확히 일치해야 한다. 불일치·누락·중복 검토면 `scheduler-finish ... error`로 종료하며 저장 성공으로 보고하지 않는다.
 - 각 후보별 receipt에는 `rcp_no`, 검토 결과(`SAVED|REJECTED|INSUFFICIENT_EVIDENCE|ERROR`), 해당 시 material ID 또는 탈락/오류 사유를 기록한다. `reviewed receipt count`와 제어 목록 count를 최종 보고에 포함한다.
 
@@ -171,8 +172,9 @@ POST 성공만으로 완료라고 하지 않는다. 필수 evidence 일부가 �
 
 ## scheduler 종료
 
-- 모든 저장 대상이 `STORED`, `EXISTING`, `CORRECTION_STORED`이고 readback이 일치하면 `scheduler-finish ... done`.
-- 저장 대상이 0건이면서 조사·API readback이 정상이라면 `done`, count=0.
+- `done`에는 `detail.completion_receipt`로 `schema_version=giraffe-research-completion-v1`, `control_count`, `source_valid`, `reviewed_unique`, `source_error`, `store_error`, `coverage_error`, `rejected_after_evidence`, `saved`, `existing`, `correction_stored`를 모두 명시한다. terminal semantic counts의 합은 control_count와 같아야 한다.
+- 모든 저장 대상이 `STORED`, `EXISTING`, `CORRECTION_STORED`이고 readback이 일치하며 `source_error=store_error=coverage_error=0`일 때만 `scheduler-finish ... done`.
+- 진짜 빈 manifest(control_count=0)는 위 receipt의 모든 count=0으로만 `done`, count=0 가능하다. source-valid 후보가 하나라도 있으면 그 후보별 semantic terminal result 없이 done을 호출하지 않는다.
 - 하나라도 `STORE_UNVERIFIED` 또는 `STORE_FAILED`면 `scheduler-finish ... error`.
 - count는 신규 `STORED + CORRECTION_STORED` 건수만 사용한다.
 - detail에는 비밀값 없이 조사 수, schema 통과 수, 등급별 수, 각 저장 상태 수, material ID, 실패 단계, 휴장 여부를 기록한다.
