@@ -4,7 +4,9 @@ from datetime import datetime
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -15,12 +17,29 @@ ROOT = Path(__file__).parents[1]
 def _load_hermes_wake_parser():
     """Use the installed Hermes parser when present; retain its exact fallback contract."""
     scheduler_prompt = Path.home() / ".hermes" / "hermes-agent" / "cron" / "scheduler_prompt.py"
-    if scheduler_prompt.is_file():
-        spec = importlib.util.spec_from_file_location("installed_hermes_scheduler_prompt", scheduler_prompt)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module._parse_wake_gate
+    hermes_python = scheduler_prompt.parents[1] / "venv" / "bin" / "python"
+    if scheduler_prompt.is_file() and hermes_python.is_file():
+        hermes_root = scheduler_prompt.parents[1]
+
+        def installed_contract(script_output: str) -> bool:
+            code = (
+                "import json,sys; "
+                "from cron.scheduler_prompt import _parse_wake_gate; "
+                "print(json.dumps(_parse_wake_gate(sys.stdin.read())))"
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(hermes_root)
+            completed = subprocess.run(
+                [str(hermes_python), "-c", code],
+                input=script_output,
+                text=True,
+                capture_output=True,
+                check=True,
+                env=env,
+            )
+            return json.loads(completed.stdout)
+
+        return installed_contract
 
     def exact_contract(script_output: str) -> bool:
         lines = [line for line in script_output.splitlines() if line.strip()]
