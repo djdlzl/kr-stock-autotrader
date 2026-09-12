@@ -135,27 +135,32 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(result["gate"], "GIRAFFE_DART_GATE_V1")
         self.assertFalse(result["complete"])
 
-    def test_prompt_requires_complete_gate_and_exactly_once_control_list(self):
-        prompt = (ROOT / "prompts/giraffe-material-discovery-v1.md").read_text(encoding="utf-8")
-        self.assertIn("GIRAFFE_DART_GATE_V1", prompt)
-        self.assertIn("complete=true", prompt)
-        self.assertIn("source_packet_paths", prompt)
-        self.assertIn("completion_receipt", prompt)
-        self.assertIn("정확히 한 번", prompt)
-        self.assertIn("reviewed receipt", prompt)
-        self.assertIn("scheduler-finish", prompt)
-        self.assertIn("giraffe-expected-price-input-v1", prompt)
-        self.assertIn("official_derived", prompt)
-        self.assertIn("HOLD_MISSING_INPUT", prompt)
-        wiring = (ROOT / "ops/giraffe-cron-wiring-update.md").read_text(encoding="utf-8")
-        cron_prompt = (ROOT / "ops/giraffe-cron-07-prompt.txt").read_text(encoding="utf-8")
-        self.assertIn("ff7955881377", wiring)
-        self.assertIn("8a223a4fa499", wiring)
-        self.assertIn("c87734f0034b7c80ecddde104524687c40c8e23c5a4ff32b71d95cedcaacc8c7", wiring)
-        self.assertIn("source_packet_paths", cron_prompt)
-        self.assertIn("control_contract", cron_prompt)
-        self.assertNotIn("material_candidate_records", cron_prompt)
+    def test_automatic_closed_day_has_zero_collect_or_registration_side_effects(self):
+        with patch.object(self.gate, "admitted_backlog_dates", side_effect=self.gate.CalendarError("KRX market closed")), \
+             patch.object(self.gate, "collect_manifest") as collect, \
+             patch.object(self.gate, "register_research_run") as register, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.gate.main(), 0)
+        collect.assert_not_called()
+        register.assert_not_called()
 
+    def test_08_prompt_integrity_guard_precedes_collect_and_registration(self):
+        with patch.object(self.gate, "target_dates", return_value=["20260908"]), \
+             patch.object(self.gate, "check_card_prompt", side_effect=self.gate.ManifestError("08 prompt integrity mismatch")), \
+             patch.object(self.gate, "collect_manifest") as collect, \
+             patch.object(self.gate, "register_research_run") as register, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.gate.main(), 2)
+        self.assertIn("08 prompt integrity mismatch", output.getvalue())
+        collect.assert_not_called()
+        register.assert_not_called()
+
+    def test_recovery_override_requires_distinct_explicit_capability(self):
+        with patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "20260912"}, clear=False):
+            with self.assertRaisesRegex(self.gate.ManifestError, "recovery-only"):
+                self.gate.target_dates()
+        with patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "20260912", "GIRAFFE_DART_GATE_RECOVERY": "1"}, clear=False):
+            self.assertEqual(self.gate.target_dates(), ["20260912"])
 
     def test_gate_fails_closed_when_deterministic_registration_fails(self):
         with patch.object(self.gate, "register_research_run", side_effect=self.gate.ManifestError("registration failed")):

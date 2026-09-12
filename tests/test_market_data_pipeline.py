@@ -11,9 +11,11 @@ def bar(day, close, volume=10, value=1100):
 
 
 def history():
+    from kr_stock_autotrader.krx_calendar import is_krx_business_date
+
     day, out = datetime(2026, 9, 1).date(), []
     while len(out) < 30:
-        if day.weekday() < 5:
+        if is_krx_business_date(day):
             index = len(out)
             out.append(bar(day, 130 - index))
         day -= timedelta(days=1)
@@ -310,9 +312,10 @@ def test_missing_interior_required_business_session_fails_closed(missing_from):
 
 
 def test_required_business_sessions_skip_configured_holiday(monkeypatch):
-    from kr_stock_autotrader import domain
+    from kr_stock_autotrader import krx_calendar
     from kr_stock_autotrader.market_data import build_premarket_snapshot
-    monkeypatch.setattr(domain, "KR_HOLIDAYS", frozenset({"2026-08-18"}))
+    base = krx_calendar._calendar()
+    monkeypatch.setattr(krx_calendar, "_calendar", lambda: {2026: base[2026] | frozenset({datetime(2026, 8, 18).date()})})
     as_of = datetime(2026, 9, 2, 8, tzinfo=KST)
     rows = [row for row in history() if row["stck_bsop_date"] != "20260818"]
     result = build_premarket_snapshot("005930", as_of, lambda *_: official_snapshot(rows))

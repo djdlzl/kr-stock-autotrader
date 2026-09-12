@@ -325,8 +325,9 @@ def test_daily_snapshot_requests_previous_krx_business_date(as_of, expected_end)
 
 
 def test_daily_snapshot_skips_configured_krx_holiday_chain(monkeypatch):
-    from kr_stock_autotrader import domain
-    monkeypatch.setattr(domain, "KR_HOLIDAYS", frozenset({"2026-09-01", "2026-08-31"}))
+    from kr_stock_autotrader import krx_calendar
+    base = krx_calendar._calendar()
+    monkeypatch.setattr(krx_calendar, "_calendar", lambda: {2026: base[2026] | frozenset({datetime(2026, 9, 1).date(), datetime(2026, 8, 31).date()})})
     transport = FakeTransport([
         Response({'access_token':'x','expires_in':86400}),
         Response({'rt_cd':'0', 'output1': {'hts_avls': '6503'}, 'output2': []}),

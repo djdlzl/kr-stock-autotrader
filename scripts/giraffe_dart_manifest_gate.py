@@ -23,6 +23,18 @@ from kr_stock_autotrader.krx_calendar import CalendarError, admitted_backlog_dat
 OUTPUT_ROOT = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-manifests"
 SOURCE_ROOT = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
 CONTROL_ROOT = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-control-contracts"
+CARD_PROMPT_PATH = SCRIPT_DIR.parent / "prompts" / "giraffe-decision-card-scheduler-v1.md"
+CARD_PROMPT_SHA256 = "c87734f0034b7c80ecddde104524687c40c8e23c5a4ff32b71d95cedcaacc8c7"
+
+
+def check_card_prompt() -> None:
+    """Do not emit 07 authority that an altered 08 consumer could use."""
+    try:
+        actual = hashlib.sha256(CARD_PROMPT_PATH.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ManifestError("08 prompt unavailable") from exc
+    if actual != CARD_PROMPT_SHA256:
+        raise ManifestError("08 prompt integrity mismatch")
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -89,6 +101,7 @@ def target_dates(now: datetime | None = None) -> list[str]:
 def main() -> int:
     try:
         dates = target_dates()
+        check_card_prompt()
         summaries = []
         for date in dates:
             manifest = collect_manifest(date)

@@ -25,7 +25,8 @@ def test_market_boundary_weekday_only():
 def test_previous_krx_business_date_skips_weekends_and_configured_holiday_chain(monkeypatch):
     assert domain.previous_krx_business_date(date(2026, 9, 7)) == date(2026, 9, 4)  # Monday
     assert domain.previous_krx_business_date(date(2026, 9, 6)) == date(2026, 9, 4)  # Sunday
-    monkeypatch.setattr(domain, "KR_HOLIDAYS", frozenset({"2026-09-01", "2026-08-31"}))
+    from kr_stock_autotrader import krx_calendar
+    monkeypatch.setattr(krx_calendar, "_calendar", lambda: {2026: frozenset({date(2026, 9, 1), date(2026, 8, 31)})})
     assert domain.previous_krx_business_date(date(2026, 9, 2)) == date(2026, 8, 28)
 
 

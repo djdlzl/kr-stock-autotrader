@@ -415,6 +415,26 @@ def test_preflight_outside_window_makes_no_network_requests(runner, env_file, mo
     assert capsys.readouterr().out.strip() == "시장맥락 사전점검 완료"
 
 
+def test_closed_day_returns_before_prompt_or_api(runner, monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner, "check_prompt", lambda: calls.append("prompt"))
+    monkeypatch.setattr(runner, "urlopen", lambda *_: calls.append("api"))
+    closed = datetime.fromisoformat("2026-05-01T09:05:00+09:00")
+    assert runner.execute(env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=closed,
+                          source_topic="telegram:mac:7923", preflight=False) == ""
+    assert calls == []
+
+
+def test_prompt_integrity_guard_fails_before_api(runner, monkeypatch, tmp_path):
+    prompt = tmp_path / "scheduler-prompt.md"
+    prompt.write_text("mutated", encoding="utf-8")
+    monkeypatch.setattr(runner, "PROMPT_PATH", prompt)
+    monkeypatch.setattr(runner, "urlopen", lambda *_: pytest.fail("prompt mismatch must precede API"))
+    with pytest.raises(runner.RunFailure, match="prompt_sha256_mismatch"):
+        runner.execute(env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=now(),
+                       source_topic="telegram:mac:7923", preflight=False)
+
+
 def test_monotonic_mid_card_exhaustion_verifies_aggregate_error(runner, monkeypatch):
     """A card request cannot spend the two slots needed to terminalize."""
     clock = [0.0]

@@ -1,12 +1,36 @@
 {
   "schema_version": "krx-market-calendar-v1",
   "source": {
-    "publisher": "Korea Exchange (KRX)",
-    "url": "https://global.krx.co.kr/contents/GLB/05/0501/0501010000/GLB0501010000.jsp",
-    "retrieved_at": "2026-01-02",
-    "note": "KRX annual market-closure calendar; dates are versioned release input, not environment defaults."
+    "rule_source": {
+      "publisher": "Korea Exchange (KRX)",
+      "url": "https://global.krx.co.kr/contents/GLB/06/0602/0602010201/GLB0602010201T1.jsp",
+      "observed_at": "2026-09-12",
+      "claim": "Government holidays, May 1, Saturdays, and December 31 (or the prior closest business day) are non-trading days."
+    },
+    "dated_closure_source": {
+      "publisher": "Curated dated closure input",
+      "basis": "2026 government-holiday dates plus the KRX May 1 and December 31 rules; weekend dates are rejected because Saturdays are separately closed by the KRX rule.",
+      "provenance": "No annual KRX closure list was observed or claimed; this versioned input is reviewed dated authority."
+    }
   },
   "years": {
-    "2026": ["2026-01-01", "2026-02-16", "2026-02-17", "2026-02-18", "2026-03-02", "2026-05-05", "2026-05-25", "2026-06-03", "2026-08-17", "2026-09-24", "2026-09-25", "2026-09-26", "2026-10-05", "2026-10-09", "2026-12-25"]
+    "2026": [
+      "2026-01-01",
+      "2026-02-16",
+      "2026-02-17",
+      "2026-02-18",
+      "2026-03-02",
+      "2026-05-01",
+      "2026-05-05",
+      "2026-05-25",
+      "2026-06-03",
+      "2026-08-17",
+      "2026-09-24",
+      "2026-09-25",
+      "2026-10-05",
+      "2026-10-09",
+      "2026-12-25",
+      "2026-12-31"
+    ]
   }
 }
