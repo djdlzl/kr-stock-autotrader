@@ -17,6 +17,9 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from kr_stock_autotrader.krx_calendar import CalendarError, is_krx_business_date
+
 KST = ZoneInfo("Asia/Seoul")
 SOURCE_TOPIC = "telegram:mac:7923"
 API_SOURCE_TOPIC = "mac:7923"
@@ -276,8 +279,13 @@ def execute(*, env: Dict[str, str], now: datetime, source_topic: str, preflight:
             wall_clock: Callable[[], datetime] | None = None) -> str:
     if source_topic != SOURCE_TOPIC:
         raise RunFailure("topic", "source_topic_not_allowed")
-    check_prompt()
     current = now.astimezone(KST)
+    try:
+        if not is_krx_business_date(current.date()):
+            return ""
+    except CalendarError as exc:
+        raise RunFailure("calendar", "calendar_admission_failed") from exc
+    check_prompt()
     if preflight:
         return "시장맥락 사전점검 완료"
     # Cron is intentionally launched in its scheduled 09:05 minute. The

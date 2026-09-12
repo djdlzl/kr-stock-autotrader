@@ -450,7 +450,9 @@ def _research_commitment(run_key: str, contract: object) -> dict:
     expected, dates, sources = contract["expected_rcp_nos"], contract["dates"], contract["sources"]
     try: run_date = datetime.strptime(run_key.removeprefix("research-").removesuffix("-0700-kst"), "%Y-%m-%d")
     except ValueError: raise HTTPException(422, "invalid research run key")
-    expected_dates = [(run_date - timedelta(days=1)).strftime("%Y%m%d"), run_date.strftime("%Y%m%d")]
+    from .krx_calendar import CalendarError, admitted_backlog_dates
+    try: expected_dates = admitted_backlog_dates(run_date.date())
+    except CalendarError as exc: raise HTTPException(422, "KRX calendar admission failed") from exc
     packet_root = _research_packet_root()
     if (not isinstance(expected, list) or expected != sorted(expected) or len(expected) != len(set(expected))
             or any(not isinstance(rcp, str) or not re.fullmatch(r"\d{14}", rcp) for rcp in expected)

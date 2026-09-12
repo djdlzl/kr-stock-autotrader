@@ -20,6 +20,7 @@
 
 ## 실행 시작과 대상 고정
 
+- **가장 먼저, scheduler-start·API·KIS·LLM·저장·보고 전에** repository versioned `kr_stock_autotrader/data/krx_market_calendar_v1.json`을 `kr_stock_autotrader.krx_calendar.is_krx_business_date`로 검사한다. KST 실행일이 휴장일이거나 calendar가 미지원/오염이면 아무 scheduler run도 시작하거나 finish하지 않고, 어떠한 query/call/store/report도 하지 않는 silent no-op으로 종료한다. ENV `KR_HOLIDAYS` 또는 추정 weekday로 대체하지 않는다.
 - KST 실행일 `YYYY-MM-DD`와 `run_key=card-YYYY-MM-DD-0800-kst`를 만든다.
 - market snapshot의 `as_of`에는 날짜만 보내지 않는다. 반드시 `YYYY-MM-DDT08:00:00+09:00`처럼 KST timezone이 포함된 시각을 쓰며, 08:00 이상 08:10 미만이어야 한다. 날짜-only 값은 KST 자정으로 해석되어 premarket retry를 시작하지 못한다.
 - 이 KST 실행일이 scheduler run date이자 operation run date다. summary/detail/readback에서 날짜 축을 혼동하지 않는다.

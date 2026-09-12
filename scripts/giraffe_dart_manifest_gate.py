@@ -9,14 +9,16 @@ import os
 import sys
 import urllib.request
 import urllib.error
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, str(SCRIPT_DIR.parent))
 from giraffe_dart_manifest import ManifestError, collect_manifest  # noqa: E402
 from giraffe_dart_source import SourceError, completed_packet, fetch_with_retry, write_packet  # noqa: E402
+from kr_stock_autotrader.krx_calendar import CalendarError, admitted_backlog_dates  # noqa: E402
 
 OUTPUT_ROOT = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-manifests"
 SOURCE_ROOT = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
@@ -67,21 +69,28 @@ def register_research_run(run_key: str, contract: dict) -> None:
         raise ManifestError("deterministic research registration response invalid")
 
 
-def target_dates() -> list[str]:
+def target_dates(now: datetime | None = None) -> list[str]:
+    """Automatic runs use calendar admission; override is explicit recovery only."""
     override = os.environ.get("GIRAFFE_DART_GATE_DATES", "").strip()
     if override:
+        if os.environ.get("GIRAFFE_DART_GATE_RECOVERY", "") != "1":
+            raise ManifestError("GIRAFFE_DART_GATE_DATES is recovery-only")
         dates = [item.strip().replace("-", "") for item in override.split(",") if item.strip()]
-        if not dates or any(len(item) != 8 or not item.isdigit() for item in dates):
-            raise ManifestError("GIRAFFE_DART_GATE_DATES must contain YYYYMMDD dates")
-        return list(dict.fromkeys(dates))
-    now = datetime.now(ZoneInfo("Asia/Seoul"))
-    return [(now - timedelta(days=1)).strftime("%Y%m%d"), now.strftime("%Y%m%d")]
+        if not dates or any(len(item) != 8 or not item.isdigit() for item in dates) or len(dates) != len(set(dates)):
+            raise ManifestError("GIRAFFE_DART_GATE_DATES must be unique YYYYMMDD dates")
+        return dates
+    current = (now or datetime.now(ZoneInfo("Asia/Seoul"))).astimezone(ZoneInfo("Asia/Seoul"))
+    try:
+        return admitted_backlog_dates(current.date())
+    except CalendarError as exc:
+        raise ManifestError(str(exc)) from exc
 
 
 def main() -> int:
     try:
+        dates = target_dates()
         summaries = []
-        for date in target_dates():
+        for date in dates:
             manifest = collect_manifest(date)
             output = OUTPUT_ROOT / f"{date}.json"
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -115,6 +124,8 @@ def main() -> int:
                 "manifest_path": str(output),
             })
     except ManifestError as exc:
+        if str(exc) == "KRX market closed":
+            return 0
         print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": False, "error": str(exc)}, ensure_ascii=False))
         return 2
     today = summaries[-1]["date"]

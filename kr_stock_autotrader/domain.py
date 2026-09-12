@@ -4,7 +4,7 @@ from datetime import date, datetime, time, timedelta
 from math import isclose
 from zoneinfo import ZoneInfo
 
-from .config import KR_HOLIDAYS
+from .krx_calendar import is_krx_business_date, previous_krx_business_date
 
 KST = ZoneInfo("Asia/Seoul")
 KRX_REGULAR_OPEN = time(9, 0)
@@ -37,18 +37,6 @@ def parse_kst(value: str) -> datetime:
     parsed = datetime.fromisoformat(value)
     return parsed.replace(tzinfo=KST) if parsed.tzinfo is None else parsed.astimezone(KST)
 
-
-def is_krx_business_date(day: date) -> bool:
-    """KRX sessions configured for this runtime: weekdays excluding holidays."""
-    return day.weekday() < 5 and day.isoformat() not in KR_HOLIDAYS
-
-
-def previous_krx_business_date(day: date) -> date:
-    """Return the strictly preceding configured KRX business date."""
-    candidate = day - timedelta(days=1)
-    while not is_krx_business_date(candidate):
-        candidate -= timedelta(days=1)
-    return candidate
 
 
 def previous_krx_business_dates(day: date, count: int) -> list[date]:
