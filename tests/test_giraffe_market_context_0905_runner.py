@@ -140,6 +140,22 @@ def test_success_uses_authoritative_cards_and_exact_readbacks(runner, env_file, 
     ]
 
 
+def test_ordinary_58_second_cron_dispatch_has_the_full_operational_budget(runner, monkeypatch):
+    """09:05:58 dispatch remains on-time; only 09:25 ends observation authority."""
+    aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
+    calls = install_network(monkeypatch, runner, ids=(101,), latest_payloads=[
+        card_latest((101,)), {"run_key": aggregate_key, "status": "done", "detail": {"count": 1}},
+    ])
+    dispatched = datetime.fromisoformat("2026-09-09T09:05:58.462976+09:00")
+    assert runner.execute(
+        env={"GIRAFFE_URL": "http://giraffe.test", "INTERNAL_API_KEY": "secret"}, now=dispatched,
+        source_topic="telegram:mac:7923", preflight=False, monotonic=lambda: 0.0,
+    ) == "시장맥락 완료 count=1"
+    posted = [payload for method, path, payload, _ in calls if method == "POST" and "/cards/" in path]
+    assert posted == [{"run_key": "market-context-2026-09-09-0905-kst-topic7923-card-101",
+                       "as_of": "2026-09-09T09:05:58.462976+09:00"}]
+
+
 def test_cards_use_injected_actual_dispatch_times_and_aggregate_replays_them(runner, monkeypatch):
     aggregate_key = "market-context-2026-09-09-0905-kst-topic7923"
     calls = install_network(monkeypatch, runner, latest_payloads=[
