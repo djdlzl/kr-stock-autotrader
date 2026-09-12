@@ -135,12 +135,17 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(result["gate"], "GIRAFFE_DART_GATE_V1")
         self.assertFalse(result["complete"])
 
-    def test_automatic_closed_day_has_zero_collect_or_registration_side_effects(self):
+    def test_automatic_closed_day_suppresses_hermes_wake_before_dart_or_registration(self):
         with patch.object(self.gate, "admitted_backlog_dates", side_effect=self.gate.CalendarError("KRX market closed")), \
              patch.object(self.gate, "collect_manifest") as collect, \
              patch.object(self.gate, "register_research_run") as register, \
-             contextlib.redirect_stdout(io.StringIO()):
+             contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(self.gate.main(), 0)
+        lines = [line for line in output.getvalue().splitlines() if line.strip()]
+        payload = json.loads(lines[-1])
+        self.assertFalse(payload["wakeAgent"])
+        # Exact cron.scheduler_prompt._parse_wake_gate last-line contract.
+        self.assertFalse(isinstance(payload, dict) and payload.get("wakeAgent", True) is not False)
         collect.assert_not_called()
         register.assert_not_called()
 

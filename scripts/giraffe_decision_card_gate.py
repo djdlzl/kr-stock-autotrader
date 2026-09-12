@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Executable KRX admission boundary for the 08:00 card workflow.
+"""Hermes cron prehook for the 08:00 KRX decision-card workflow.
 
-The cron wrapper invokes this gate before it starts the scheduler agent.  The
-optional callable keeps the side-effect boundary explicit and testable: closed
-or malformed calendar input never reaches it.
+Hermes skips the scheduler agent only when the final non-empty stdout line is
+JSON containing ``{"wakeAgent": false}``.  This script is therefore directly
+installable as a cron ``script`` prehook; an optional command remains available
+for explicit non-cron recovery use.
 """
 from __future__ import annotations
 
@@ -20,23 +21,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from kr_stock_autotrader.krx_calendar import CalendarError, is_krx_business_date
 
 KST = ZoneInfo("Asia/Seoul")
+GATE_NAME = "GIRAFFE_0800_ADMISSION_V1"
 
 
 class AdmissionError(RuntimeError):
     pass
 
 
-def execute(*, now: datetime, run: Callable[[], object]) -> str:
-    """Run the 08 job only on an admitted KRX business date."""
+def evaluate(*, now: datetime, run: Callable[[], object] | None = None) -> dict:
+    """Return the Hermes wake-gate payload and run an optional recovery command."""
     current = now.astimezone(KST)
     try:
         admitted = is_krx_business_date(current.date())
     except CalendarError as exc:
         raise AdmissionError("calendar admission failed") from exc
-    if not admitted:
-        return ""
-    run()
-    return "08 admission complete"
+    payload = {"gate": GATE_NAME, "date": current.date().isoformat(), "wakeAgent": admitted}
+    if admitted and run is not None:
+        run()
+    return payload
 
 
 def _parse_now(value: str | None) -> datetime:
@@ -52,20 +54,20 @@ def _parse_now(value: str | None) -> datetime:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="KRX admission wrapper for the 08:00 scheduler")
+    parser = argparse.ArgumentParser(description="KRX admission prehook for the 08:00 scheduler")
     parser.add_argument("--at", help="test/recovery timestamp as ISO-8601 with timezone")
-    parser.add_argument("command", nargs=argparse.REMAINDER, help="scheduler command after --")
+    parser.add_argument("command", nargs=argparse.REMAINDER, help="optional recovery command after --")
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    if not command:
-        parser.error("an 08 scheduler command is required after --")
     try:
-        result = execute(now=_parse_now(args.at), run=lambda: subprocess.run(command, check=True))
+        payload = evaluate(
+            now=_parse_now(args.at),
+            run=(lambda: subprocess.run(command, check=True)) if command else None,
+        )
     except (AdmissionError, subprocess.CalledProcessError) as exc:
-        print(json.dumps({"gate": "GIRAFFE_0800_ADMISSION_V1", "complete": False, "error": str(exc)}))
+        print(json.dumps({"gate": GATE_NAME, "complete": False, "error": str(exc)}, sort_keys=True))
         return 2
-    if result:
-        print(json.dumps({"gate": "GIRAFFE_0800_ADMISSION_V1", "complete": True}))
+    print(json.dumps(payload, sort_keys=True))
     return 0
 
 

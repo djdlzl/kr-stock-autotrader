@@ -162,6 +162,9 @@ def main() -> int:
             })
     except ManifestError as exc:
         if str(exc) == "KRX market closed":
+            # Hermes only suppresses the LLM when this is the final non-empty
+            # stdout line. Emit it before any DART or registration side effect.
+            print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "wakeAgent": False, "reason": "KRX market closed"}, ensure_ascii=False, sort_keys=True))
             return 0
         print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": False, "error": str(exc)}, ensure_ascii=False))
         return 2
