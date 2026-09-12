@@ -11,9 +11,11 @@ def bar(day, close):
 
 
 def rows(*, jump=False, start=datetime(2026, 9, 1).date()):
+    from kr_stock_autotrader.krx_calendar import is_krx_business_date
+
     day, result = start, []
     while len(result) < 30:
-        if day.weekday() < 5:
+        if is_krx_business_date(day):
             close = 115 if jump and len(result) == 0 else 100
             result.append(bar(day, close))
         day -= timedelta(days=1)

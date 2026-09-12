@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -17,7 +18,24 @@ from pathlib import Path
 from typing import Callable, Sequence
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+def _add_deployed_repo_to_path() -> None:
+    """Locate the deployed package after this prehook is copied to Hermes scripts."""
+    candidates = (
+        Path(__file__).resolve().parents[1],
+        Path.cwd(),
+        Path(os.environ["GIRAFFE_DEPLOYED_REPO"]).expanduser()
+        if os.environ.get("GIRAFFE_DEPLOYED_REPO")
+        else None,
+    )
+    for root in candidates:
+        if root is not None and (root / "kr_stock_autotrader" / "krx_calendar.py").is_file():
+            sys.path.insert(0, str(root))
+            return
+    raise ImportError("cannot locate deployed kr_stock_autotrader package")
+
+
+_add_deployed_repo_to_path()
 from kr_stock_autotrader.krx_calendar import CalendarError, is_krx_business_date
 
 KST = ZoneInfo("Asia/Seoul")
@@ -65,7 +83,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             run=(lambda: subprocess.run(command, check=True)) if command else None,
         )
     except (AdmissionError, subprocess.CalledProcessError) as exc:
-        print(json.dumps({"gate": GATE_NAME, "complete": False, "error": str(exc)}, sort_keys=True))
+        # Hermes parses only the final non-empty stdout line, even after a failed script exit.
+        # Keep this explicit fail-closed gate so scheduler_prompt never starts an agent/LLM.
+        print(
+            json.dumps(
+                {"gate": GATE_NAME, "complete": False, "error": str(exc), "wakeAgent": False},
+                sort_keys=True,
+            )
+        )
         return 2
     print(json.dumps(payload, sort_keys=True))
     return 0
