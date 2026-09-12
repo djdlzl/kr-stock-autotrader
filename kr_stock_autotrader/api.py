@@ -7,7 +7,7 @@ import re
 import threading
 import time as monotonic_time
 from contextlib import contextmanager
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -19,6 +19,7 @@ from .auth import csrf_origin_ok, current_user, hash_password, issue_session, ve
 from .config import COOKIE_SECURE, LIVE_TRADING, SIGNUP_ENABLED
 from .db import connect
 from .domain import KST, Quote, is_krx_business_date, market_open, parse_kst, now_kst
+from .krx_calendar import CalendarError
 from .decision_cards import (require_internal_api_key, require_research_control_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, current_filter_head, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML, PROTOTYPE_HTML
@@ -418,6 +419,15 @@ _PREMARKET_STAGES = frozenset({"research_dependency", "market_snapshot", "filter
 
 def _is_premarket_card_run(run_key: str, kind: object) -> bool:
     return kind == "card" and _PREMARKET_RUN_KEY.fullmatch(run_key) is not None
+
+
+def _require_0800_calendar_admission(day: date) -> None:
+    """Reject a direct 08 API call before it can reach KIS or persistence."""
+    try:
+        if not is_krx_business_date(day):
+            raise HTTPException(409, "KRX market closed")
+    except CalendarError as exc:
+        raise HTTPException(409, "KRX calendar admission failed") from exc
 
 
 def _is_research_run(run_key: str, kind: object) -> bool:
@@ -1054,6 +1064,7 @@ async def internal_market_snapshot(symbol: str, request: Request, _: None = Depe
         as_of = parsed_as_of.astimezone(KST)
     except (KeyError, TypeError, ValueError):
         raise HTTPException(422, "as_of must be KST ISO-8601")
+    _require_0800_calendar_admission(as_of.date())
     provider = getattr(app.state, "kis_daily_snapshot_provider", None)
     if provider is None:
         global _default_kis_client
@@ -1342,6 +1353,8 @@ async def scheduler_start(run_key: str, request: Request, _: None = Depends(requ
     data=await request.json(); db=connect()
     try:
         if not isinstance(data, dict) or not isinstance(data.get('kind'), str): raise HTTPException(422,'invalid scheduler start')
+        if _is_premarket_card_run(run_key, data['kind']):
+            _require_0800_calendar_admission(date.fromisoformat(run_key[5:15]))
         existing=db.execute("SELECT kind,status FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
         if _is_research_run(run_key, data['kind']):
             if set(data) != {'kind'}: raise HTTPException(422, 'canonical research start accepts no contract fields')

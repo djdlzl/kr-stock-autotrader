@@ -12,7 +12,7 @@ Do **not** apply before the committed application is deployed. This is the exact
 | job | JSON pointer | exact new value |
 |---|---|---|
 | `ff7955881377` | `/prompt` | JSON string in `ops/giraffe-cron-07-prompt.txt` |
-| `8a223a4fa499` | embedded scheduler-prompt SHA-256 | `c87734f0034b7c80ecddde104524687c40c8e23c5a4ff32b71d95cedcaacc8c7` |
+| `8a223a4fa499` | embedded scheduler-prompt SHA-256 | `287972a1b03bc986905cb86e62575451ecde11893bbe786c0a2fc216826dfb38` |
 
 The exact desired 07:00 prompt is stored separately so an operator can use it byte-for-byte. It consumes `source_packet_paths` and `control_contract`; it does **not** require or inspect `material_candidate_records`.
 
@@ -20,12 +20,12 @@ The exact desired 07:00 prompt is stored separately so an operator can use it by
 
 ```text
 ff7955881377: enabled=true; schedule.expr="0 7 * * 1-5"; deliver="telegram:-1003936097485:7923"; script="giraffe_dart_manifest_gate.py"; prompt contains source_packet_paths and control_contract; prompt does not contain material_candidate_records; prompt retains LIVE_TRADING=false and no order/capital/card instructions.
-8a223a4fa499: enabled=true; schedule.expr="0 8 * * 1-5"; deliver="telegram:-1003936097485:7923"; prompt contains prompts/giraffe-decision-card-scheduler-v1.md and SHA `c87734f0034b7c80ecddde104524687c40c8e23c5a4ff32b71d95cedcaacc8c7`; prompt retains LIVE_TRADING=False and no order/capital side effects.
+8a223a4fa499: enabled=true; schedule.expr="0 8 * * 1-5"; deliver="telegram:-1003936097485:7923"; command is wrapped by `giraffe_decision_card_gate.py -- <08 scheduler command>` before scheduler/API/KIS/LLM; prompt contains prompts/giraffe-decision-card-scheduler-v1.md and SHA `287972a1b03bc986905cb86e62575451ecde11893bbe786c0a2fc216826dfb38`; prompt retains LIVE_TRADING=False and no order/capital side effects.
 ```
 
 ## Source prompt integrity
 
 - `prompts/giraffe-material-discovery-v1.md` SHA-256: `8705d14095a846067fa68c4fc41ca3e2270d9cef3a282bfee9a5534eb138c215`
-- `prompts/giraffe-decision-card-scheduler-v1.md` SHA-256: `c87734f0034b7c80ecddde104524687c40c8e23c5a4ff32b71d95cedcaacc8c7`
+- `prompts/giraffe-decision-card-scheduler-v1.md` SHA-256: `287972a1b03bc986905cb86e62575451ecde11893bbe786c0a2fc216826dfb38`
 
 No live registry mutation was made by this change.

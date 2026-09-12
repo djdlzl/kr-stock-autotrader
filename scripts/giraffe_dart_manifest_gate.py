@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import os
 import sys
 import urllib.request
@@ -24,7 +25,7 @@ OUTPUT_ROOT = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-manifest
 SOURCE_ROOT = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
 CONTROL_ROOT = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-control-contracts"
 CARD_PROMPT_PATH = SCRIPT_DIR.parent / "prompts" / "giraffe-decision-card-scheduler-v1.md"
-CARD_PROMPT_SHA256 = "c87734f0034b7c80ecddde104524687c40c8e23c5a4ff32b71d95cedcaacc8c7"
+CARD_PROMPT_SHA256 = "287972a1b03bc986905cb86e62575451ecde11893bbe786c0a2fc216826dfb38"
 
 
 def check_card_prompt() -> None:
@@ -85,11 +86,18 @@ def target_dates(now: datetime | None = None) -> list[str]:
     """Automatic runs use calendar admission; override is explicit recovery only."""
     override = os.environ.get("GIRAFFE_DART_GATE_DATES", "").strip()
     if override:
-        if os.environ.get("GIRAFFE_DART_GATE_RECOVERY", "") != "1":
-            raise ManifestError("GIRAFFE_DART_GATE_DATES is recovery-only")
+        # The automation date selector is not a capability.  A recovery caller
+        # must present an HMAC bound to the exact canonical date set, using the
+        # separately held recovery secret (never the cron toggle itself).
         dates = [item.strip().replace("-", "") for item in override.split(",") if item.strip()]
-        if not dates or any(len(item) != 8 or not item.isdigit() for item in dates) or len(dates) != len(set(dates)):
-            raise ManifestError("GIRAFFE_DART_GATE_DATES must be unique YYYYMMDD dates")
+        canonical_dates = ",".join(dates)
+        key = os.environ.get("GIRAFFE_DART_RECOVERY_KEY", "")
+        supplied = os.environ.get("GIRAFFE_DART_RECOVERY_AUTHORIZATION", "")
+        expected = hmac.new(key.encode("utf-8"), canonical_dates.encode("ascii"), hashlib.sha256).hexdigest() if key else ""
+        if (not dates or any(len(item) != 8 or not item.isdigit() for item in dates)
+                or len(dates) != len(set(dates)) or not expected
+                or not hmac.compare_digest(supplied, expected)):
+            raise ManifestError("GIRAFFE_DART_GATE_DATES requires authorized recovery capability")
         return dates
     current = (now or datetime.now(ZoneInfo("Asia/Seoul"))).astimezone(ZoneInfo("Asia/Seoul"))
     try:
@@ -98,9 +106,25 @@ def target_dates(now: datetime | None = None) -> list[str]:
         raise ManifestError(str(exc)) from exc
 
 
+def record_recovery_invocation(dates: list[str]) -> None:
+    """Leave an immutable local readback record before recovery side effects."""
+    if not os.environ.get("GIRAFFE_DART_GATE_DATES", "").strip():
+        return
+    audit_root = CONTROL_ROOT / "recovery-audit"
+    audit_root.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(canonical_bytes({"dates": dates})).hexdigest()
+    path = audit_root / f"{digest}.json"
+    payload = {"schema_version": "giraffe-recovery-audit-v1", "dates": dates, "authorization_sha256": hashlib.sha256(os.environ["GIRAFFE_DART_RECOVERY_AUTHORIZATION"].encode()).hexdigest()}
+    if path.exists() and path.read_bytes() != canonical_bytes(payload) + b"\n":
+        raise ManifestError("recovery audit conflict")
+    if not path.exists():
+        path.write_bytes(canonical_bytes(payload) + b"\n")
+
+
 def main() -> int:
     try:
         dates = target_dates()
+        record_recovery_invocation(dates)
         check_card_prompt()
         summaries = []
         for date in dates:

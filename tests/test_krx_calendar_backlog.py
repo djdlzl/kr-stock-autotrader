@@ -12,17 +12,20 @@ def test_monday_backlog_contains_weekend_and_run_date():
 
 
 def test_weekday_holiday_extends_backlog_through_first_business_day():
-    # Chuseok closures include Thu/Fri; the next Monday carries every calendar date.
     assert admitted_backlog_dates(date(2026, 9, 28)) == [
         "20260924", "20260925", "20260926", "20260927", "20260928",
     ]
 
 
-@pytest.mark.parametrize("closed", [date(2026, 5, 1), date(2026, 12, 31)])
-def test_krx_rule_closures_are_not_admitted(closed):
+@pytest.mark.parametrize("closed", [date(2026, 5, 1), date(2026, 7, 17), date(2026, 12, 31)])
+def test_krx_rule_and_special_closures_are_not_admitted(closed):
     assert not is_krx_business_date(closed)
     with pytest.raises(CalendarError, match="KRX market closed"):
         admitted_backlog_dates(closed)
+
+
+def test_july_special_closure_extends_next_business_backlog():
+    assert admitted_backlog_dates(date(2026, 7, 20)) == ["20260717", "20260718", "20260719", "20260720"]
 
 
 def test_weekend_is_not_admitted_and_unsupported_year_fails_closed():
@@ -54,7 +57,8 @@ def test_calendar_rejects_malformed_duplicate_year_mismatch_missing_year_and_wee
             is_krx_business_date(date(2026, 9, 7))
 
 
-def test_calendar_provenance_distinguishes_rule_and_dated_authority():
+def test_calendar_requires_authoritative_per_date_provenance():
     raw = json.loads(krx_calendar.DATA_PATH.read_text())
-    assert set(raw["source"]) == {"rule_source", "dated_closure_source"}
-    assert "No annual KRX closure list was observed" in raw["source"]["dated_closure_source"]["provenance"]
+    assert raw["source"]["closure_set"]["publisher"] == "Korea Exchange (KRX)"
+    assert "krx_special_2026_07_17" in raw["source"]["closures"]["2026-07-17"]
+    assert set(raw["source"]["closures"]) == set(raw["years"]["2026"])

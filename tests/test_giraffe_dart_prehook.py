@@ -116,7 +116,7 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             return {"schema_version": "giraffe-dart-source-packet-v2", "rcp_no": rcp, "source_date": rcp[:8], "source_valid": True,
                     "raw_sha256": hashlib.sha256(raw).hexdigest(), "raw_bytes": len(raw), "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
                     "main_raw_sha256": hashlib.sha256(main_raw).hexdigest(), "main_raw_bytes": len(main_raw), "text": text, "_raw": raw, "_main_raw": main_raw}
-        with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), patch.object(self.gate, "CONTROL_ROOT", pathlib.Path(temp) / "controls"), patch.object(self.gate, "collect_manifest", fake_collect), patch.object(self.gate, "fetch_with_retry", side_effect=fake_packet), patch.object(self.gate, "register_research_run") as register, patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "2026-08-31,20260901", "GIRAFFE_DART_GATE_RECOVERY": "1"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
+        with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), patch.object(self.gate, "CONTROL_ROOT", pathlib.Path(temp) / "controls"), patch.object(self.gate, "collect_manifest", fake_collect), patch.object(self.gate, "fetch_with_retry", side_effect=fake_packet), patch.object(self.gate, "register_research_run") as register, patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "2026-08-31,20260901", "GIRAFFE_DART_RECOVERY_KEY": "test-recovery-key", "GIRAFFE_DART_RECOVERY_AUTHORIZATION": "314efdba6e4f3ccaefa6c3c8dd980615e2191ccdac90fbe34b6a22efad04ef9a"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(self.gate.main(), 0)
         register.assert_called_once()
         result = json.loads(output.getvalue())
@@ -129,7 +129,7 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             self.assertEqual(item["source_error_count"], 0)
 
     def test_gate_fails_nonzero_when_manifest_is_incomplete(self):
-        with patch.object(self.gate, "collect_manifest", side_effect=self.gate.ManifestError("incomplete DART manifest")), patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "20260908", "GIRAFFE_DART_GATE_RECOVERY": "1"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
+        with patch.object(self.gate, "collect_manifest", side_effect=self.gate.ManifestError("incomplete DART manifest")), patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "20260908", "GIRAFFE_DART_RECOVERY_KEY": "test-recovery-key", "GIRAFFE_DART_RECOVERY_AUTHORIZATION": "ea00db45d13c4eda4f0315cf78065effdb8903a0da0a952a2e43d024bfbd2b51"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(self.gate.main(), 2)
         result = json.loads(output.getvalue())
         self.assertEqual(result["gate"], "GIRAFFE_DART_GATE_V1")
@@ -157,14 +157,17 @@ class GiraffeDartPrehookTests(unittest.TestCase):
 
     def test_recovery_override_requires_distinct_explicit_capability(self):
         with patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "20260912"}, clear=False):
-            with self.assertRaisesRegex(self.gate.ManifestError, "recovery-only"):
+            with self.assertRaisesRegex(self.gate.ManifestError, "authorized recovery capability"):
                 self.gate.target_dates()
         with patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "20260912", "GIRAFFE_DART_GATE_RECOVERY": "1"}, clear=False):
+            with self.assertRaisesRegex(self.gate.ManifestError, "authorized recovery capability"):
+                self.gate.target_dates()
+        with patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "20260912", "GIRAFFE_DART_RECOVERY_KEY": "test-recovery-key", "GIRAFFE_DART_RECOVERY_AUTHORIZATION": "1e08fbf409c6f9a55f7e2d2060d6b1b59eeb730104f3ca44be2dc5b008d3d987"}, clear=False):
             self.assertEqual(self.gate.target_dates(), ["20260912"])
 
     def test_gate_fails_closed_when_deterministic_registration_fails(self):
         with patch.object(self.gate, "register_research_run", side_effect=self.gate.ManifestError("registration failed")):
-            with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), patch.object(self.gate, "CONTROL_ROOT", pathlib.Path(temp) / "controls"), patch.object(self.gate, "collect_manifest", side_effect=self.gate.ManifestError("stop before registration")), patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "20260908", "GIRAFFE_DART_GATE_RECOVERY": "1"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
+            with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), patch.object(self.gate, "CONTROL_ROOT", pathlib.Path(temp) / "controls"), patch.object(self.gate, "collect_manifest", side_effect=self.gate.ManifestError("stop before registration")), patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "20260908", "GIRAFFE_DART_RECOVERY_KEY": "test-recovery-key", "GIRAFFE_DART_RECOVERY_AUTHORIZATION": "ea00db45d13c4eda4f0315cf78065effdb8903a0da0a952a2e43d024bfbd2b51"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(self.gate.main(), 2)
         self.assertFalse(json.loads(output.getvalue())["complete"])
 

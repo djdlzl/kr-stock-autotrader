@@ -1,36 +1,53 @@
 {
   "schema_version": "krx-market-calendar-v1",
   "source": {
-    "rule_source": {
+    "closure_set": {
       "publisher": "Korea Exchange (KRX)",
       "url": "https://global.krx.co.kr/contents/GLB/06/0602/0602010201/GLB0602010201T1.jsp",
       "observed_at": "2026-09-12",
       "claim": "Government holidays, May 1, Saturdays, and December 31 (or the prior closest business day) are non-trading days."
     },
-    "dated_closure_source": {
-      "publisher": "Curated dated closure input",
-      "basis": "2026 government-holiday dates plus the KRX May 1 and December 31 rules; weekend dates are rejected because Saturdays are separately closed by the KRX rule.",
-      "provenance": "No annual KRX closure list was observed or claimed; this versioned input is reviewed dated authority."
+    "government_2026": {
+      "publisher": "Korea Astronomy and Space Science Institute (KASI)",
+      "url": "https://www.kasi.re.kr/kor/publication/post/newsMaterial/32031",
+      "claim": "Official 2026 Korean public-holiday calendar."
+    },
+    "government_2026_crosscheck": {
+      "publisher": "Korea Customs Service",
+      "url": "https://www.customs.go.kr/engportal/cm/cntnts/cntntsView.do?cntntsId=7401&mi=13284",
+      "claim": "Official 2026 public-holiday notice, including July 17 Constitution Day."
+    },
+    "krx_special_2026_07_17": {
+      "publisher": "Korea Exchange (KRX)",
+      "url": "https://kind.krx.co.kr/external/2026/05/20/000110/20260520000197/32154.htm",
+      "claim": "KRX KONEX notice: market closed on 2026-07-17 (Constitution Day)."
+    },
+    "closures": {
+      "2026-01-01": ["closure_set", "government_2026"],
+      "2026-02-16": ["closure_set", "government_2026"],
+      "2026-02-17": ["closure_set", "government_2026"],
+      "2026-02-18": ["closure_set", "government_2026"],
+      "2026-03-02": ["closure_set", "government_2026"],
+      "2026-05-01": ["closure_set"],
+      "2026-05-05": ["closure_set", "government_2026"],
+      "2026-05-25": ["closure_set", "government_2026"],
+      "2026-06-03": ["closure_set", "government_2026"],
+      "2026-07-17": ["closure_set", "government_2026_crosscheck", "krx_special_2026_07_17"],
+      "2026-08-17": ["closure_set", "government_2026"],
+      "2026-09-24": ["closure_set", "government_2026"],
+      "2026-09-25": ["closure_set", "government_2026"],
+      "2026-10-05": ["closure_set", "government_2026"],
+      "2026-10-09": ["closure_set", "government_2026"],
+      "2026-12-25": ["closure_set", "government_2026"],
+      "2026-12-31": ["closure_set"]
     }
   },
   "years": {
     "2026": [
-      "2026-01-01",
-      "2026-02-16",
-      "2026-02-17",
-      "2026-02-18",
-      "2026-03-02",
-      "2026-05-01",
-      "2026-05-05",
-      "2026-05-25",
-      "2026-06-03",
-      "2026-08-17",
-      "2026-09-24",
-      "2026-09-25",
-      "2026-10-05",
-      "2026-10-09",
-      "2026-12-25",
-      "2026-12-31"
+      "2026-01-01", "2026-02-16", "2026-02-17", "2026-02-18", "2026-03-02",
+      "2026-05-01", "2026-05-05", "2026-05-25", "2026-06-03", "2026-07-17",
+      "2026-08-17", "2026-09-24", "2026-09-25", "2026-10-05", "2026-10-09",
+      "2026-12-25", "2026-12-31"
     ]
   }
 }
