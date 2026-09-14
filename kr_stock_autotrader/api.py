@@ -543,6 +543,13 @@ def _safe_premarket_scheduler_finish(data: object) -> dict:
         if not isinstance(failures, dict) or any(key not in _PREMARKET_DIAGNOSTIC_CATEGORIES or _nonnegative_int(value) is None for key, value in failures.items()):
             raise HTTPException(422, "invalid premarket scheduler detail")
         safe["failure_reasons"] = {key: failures[key] for key in sorted(failures)}
+    if data["status"] == "done":
+        cards = detail.get("cards")
+        ids = cards.get("ids") if isinstance(cards, dict) and set(cards) == {"ids"} else None
+        if (not isinstance(ids, list) or any(type(card_id) is not int or card_id <= 0 for card_id in ids)
+                or len(ids) != len(set(ids)) or safe.get("completed_count") != count or len(ids) != count):
+            raise HTTPException(422, "invalid premarket scheduler card authority")
+        safe["cards"] = {"ids": list(ids)}
     return {"status": data["status"], "count": count, "detail": safe}
 
 

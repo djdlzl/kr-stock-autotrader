@@ -125,3 +125,66 @@ def test_ambiguous_child_must_match_exact_time(workflow, fault):
     faults.update(post=fault, child_field='requested_as_of', child_value='2026-09-07T09:05:18+09:00')
     with pytest.raises(runner.RunFailure, match='mismatch'):
         execute()
+
+
+def test_zero_card_0800_receipt_drives_0905_done_noop_without_card_calls(monkeypatch, tmp_path, runner):
+    """A valid 08:00 zero cohort is authoritative and must not trigger child I/O."""
+    _, client, _, _, _ = _prepare_client(monkeypatch, tmp_path / 'zero-card-noop.db')
+    clock = datetime.fromisoformat('2026-09-09T09:05:17+09:00')
+    monkeypatch.setattr(api_module, 'now_kst', lambda: clock)
+    headers = {'X-Internal-API-Key': 'market-context-key'}
+    card_key = 'card-2026-09-09-0800-kst'
+    assert client.post('/api/internal/scheduler-runs/' + card_key + '/start', headers=headers,
+                       json={'kind': 'card'}).status_code == 200
+    finished = client.post('/api/internal/scheduler-runs/' + card_key + '/finish', headers=headers,
+                           json={'status': 'done', 'count': 0, 'detail': {
+                               'attempt_count': 0, 'eligible_count': 0, 'completed_count': 0,
+                               'cards': {'ids': []},
+                           }})
+    assert finished.status_code == 200
+    assert finished.json()['detail']['cards'] == {'ids': []}
+
+    calls = []
+    def local_urlopen(request, timeout):
+        import json
+        path = request.full_url.replace('http://local.test', '')
+        payload = json.loads(request.data) if request.data else None
+        calls.append((request.method, path, payload))
+        response = client.request(request.method, path, headers=headers, json=payload)
+        if response.status_code >= 400:
+            raise HTTPError(request.full_url, response.status_code, 'local error', None, None)
+        return Response(response.json())
+
+    monkeypatch.setattr(runner, 'urlopen', local_urlopen)
+    assert runner.execute(env={'GIRAFFE_URL': 'http://local.test', 'INTERNAL_API_KEY': 'market-context-key'},
+                          now=clock, source_topic=runner.SOURCE_TOPIC, preflight=False,
+                          wall_clock=lambda: clock, monotonic=lambda: 0) == '시장맥락 완료 count=0'
+    assert not any('/cards/' in path or '/market-context-runs/' in path for _, path, _ in calls)
+    latest = client.get('/api/internal/scheduler-runs/latest?kind=market_context&date=2026-09-09', headers=headers)
+    assert latest.status_code == 200
+    assert latest.json()['status'] == 'done'
+    assert latest.json()['detail'] == {
+        'status': 'done', 'count': 0,
+        'detail': {'cards': {'ids': [], 'observation_as_of': {}}},
+    }
+
+
+def test_done_premarket_card_authority_requires_exact_unique_ids_and_completed_count():
+    valid = api_module._safe_premarket_scheduler_finish({
+        'status': 'done', 'count': 2,
+        'detail': {'completed_count': 2, 'cards': {'ids': [101, 202]}},
+    })
+    assert valid == {
+        'status': 'done', 'count': 2,
+        'detail': {'completed_count': 2, 'cards': {'ids': [101, 202]}},
+    }
+    for cards, completed_count, count in [
+        ({}, 0, 0), ({'ids': [101, 101]}, 2, 2), ({'ids': [101, '202']}, 2, 2),
+        ({'ids': [101]}, 2, 2), ({'ids': [101, 202]}, 1, 2), ({'ids': [101], 'extra': 1}, 1, 1),
+    ]:
+        with pytest.raises(api_module.HTTPException) as exc:
+            api_module._safe_premarket_scheduler_finish({
+                'status': 'done', 'count': count,
+                'detail': {'completed_count': completed_count, 'cards': cards},
+            })
+        assert exc.value.status_code == 422
