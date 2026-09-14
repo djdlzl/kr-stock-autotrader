@@ -65,6 +65,29 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(result["duplicates"], [])
         self.assertEqual(result["material_candidate_count"], 113)
 
+    def test_subsidiary_major_management_voluntary_disclosure_is_material_candidate(self):
+        records = {
+            "20260914800268": "14:41 유 씨케이솔루션 기타경영사항(자율공시)(종속회사의주요경영사항)",
+            "20260914900999": "10:00 유 일반회사 기타경영사항(자율공시)",
+        }
+        rows = "".join(
+            "<tr><td><a onclick=\"openReportViewer('%s'); return false;\">%s</a></td>"
+            "<td>%s</td></tr>" % (receipt, title, receipt)
+            for receipt, title in records.items()
+        )
+        document = (
+            '<input id="totalCnt" value="2">'
+            '<div class="pageInfo">[1/1] [총 2건]</div>'
+            f"<table>{rows}</table>"
+        )
+
+        result = self.manifest.collect_manifest("20260914", lambda _date, _page: document)
+
+        self.assertEqual(
+            [record["rcp_no"] for record in result["material_candidate_records"]],
+            ["20260914800268"],
+        )
+
     def test_stock_cancellation_filings_are_material_candidates(self):
         records = {
             "20260909800465": "삼표시멘트 주식소각결정",
