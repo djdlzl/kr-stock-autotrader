@@ -78,12 +78,12 @@ def previous_krx_business_date(day: date) -> date:
 
 
 def admitted_backlog_dates(run_date: date) -> list[str]:
-    """Return every calendar date after the prior trading session through run date."""
+    """Return every calendar date from the prior trading session through run date."""
     if not is_krx_business_date(run_date):
         raise CalendarError("KRX market closed")
     previous = previous_krx_business_date(run_date)
     values = []
-    cursor = previous + timedelta(days=1)
+    cursor = previous
     while cursor <= run_date:
         values.append(cursor.strftime("%Y%m%d"))
         cursor += timedelta(days=1)

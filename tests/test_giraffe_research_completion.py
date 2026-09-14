@@ -104,6 +104,7 @@ def test_internal_scheduler_cannot_create_or_forge_canonical_research_runs():
     client = TestClient(app); key = "research-2026-09-15-0700-kst"
     assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research"}, headers=HEADERS).status_code == 404
     contract, _ = commitment(key, ["20260915000001"])
+    assert contract["dates"] == ["20260914", "20260915"]
     assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research", "control_contract": contract}, headers=HEADERS).status_code == 422
     assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=HEADERS).status_code == 403
     assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers={"X-Research-Control-Key": "wrong"}).status_code == 403

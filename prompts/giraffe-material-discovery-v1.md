@@ -32,6 +32,8 @@ Giraffe는 paper-only이고 `LIVE_TRADING=False`다. 이 작업은 주문·자�
 - prehook의 `source_error_count>0`, 누락 packet, charset/source packet 검증 실패는 원문 접근 실패다. `INSUFFICIENT_EVIDENCE`로 분류하거나 `done`으로 끝내지 말고 `scheduler-finish ... error`로 끝낸다. `INSUFFICIENT_EVIDENCE`는 source-valid packet을 읽은 뒤 경제적 의미가 부족할 때만 쓴다.
 - 전일·당일 두 manifest를 합친 제어 목록에서 중복 receipt가 있으면 실패 처리한다. 검토 완료 receipt 수는 고유 제어 receipt 수와 정확히 일치해야 한다. 불일치·누락·중복 검토면 `scheduler-finish ... error`로 종료하며 저장 성공으로 보고하지 않는다.
 - 각 후보별 receipt에는 `rcp_no`, 검토 결과(`SAVED|REJECTED|INSUFFICIENT_EVIDENCE|ERROR`), 해당 시 material ID 또는 탈락/오류 사유를 기록한다. `reviewed receipt count`와 제어 목록 count를 최종 보고에 포함한다.
+- DART `control_count=0`은 `NO_NEW_DART_FILING`일 뿐 전체 조사 0건이나 `NO_DISCOVERY`가 아니다. DART와 독립적으로 KIND/한국거래소, 회사 공식 IR·뉴스룸, 신뢰 가능한 언론의 discovery lane을 실제로 각각 실행·완료한 뒤에만 `done`, `count=0`을 쓸 수 있다. 각 lane의 query/대상·원문 확인 결과를 receipt에 남긴다.
+- 독립 lane의 검색엔진·WAF·원문 접근 실패는 `NO_DISCOVERY`로 분류하지 않는다. 실패 lane과 접근 불가 원문은 `coverage_error` 또는 `error`로 종료한다. source-valid 원문을 실제로 확인한 lane만 후보 0건을 `NO_DISCOVERY`로 결론낼 수 있으며, 이 규칙은 발표시각·`known_at`·원문 검증 요구를 완화하지 않는다.
 
 - KST 실행일 `YYYY-MM-DD`와 `run_key=research-YYYY-MM-DD-0700-kst`를 만든다.
 - deterministic prehook은 완전한 source capture와 atomic control contract 뒤, 별도 `RESEARCH_CONTROL_KEY` capability로 canonical research run을 등록한다. 이 capability는 prehook에만 속하며 LLM scheduler caller의 `INTERNAL_API_KEY`에는 속하지 않는다.
@@ -175,7 +177,7 @@ POST 성공만으로 완료라고 하지 않는다. 필수 evidence 일부가 �
 
 - `done`에는 `detail.completion_receipt`로 `schema_version=giraffe-research-completion-v1`, `control_count`, `source_valid`, `reviewed_unique`, `source_error`, `store_error`, `coverage_error`, `rejected_after_evidence`, `saved`, `existing`, `correction_stored`를 모두 명시한다. terminal semantic counts의 합은 control_count와 같아야 한다.
 - 모든 저장 대상이 `STORED`, `EXISTING`, `CORRECTION_STORED`이고 readback이 일치하며 `source_error=store_error=coverage_error=0`일 때만 `scheduler-finish ... done`.
-- 진짜 빈 manifest(control_count=0)는 위 receipt의 모든 count=0으로만 `done`, count=0 가능하다. source-valid 후보가 하나라도 있으면 그 후보별 semantic terminal result 없이 done을 호출하지 않는다.
+- DART가 빈 manifest(`control_count=0`)여도 위 독립 discovery lanes의 실제 완료 전에는 `done`, count=0이 불가하다. 모든 lane이 source-valid 원문 확인으로 후보 0건을 결론낸 경우에만 위 receipt의 모든 count=0으로 `done`, count=0 가능하다. source-valid 후보가 하나라도 있으면 그 후보별 semantic terminal result 없이 done을 호출하지 않는다.
 - 하나라도 `STORE_UNVERIFIED` 또는 `STORE_FAILED`면 `scheduler-finish ... error`.
 - count는 신규 `STORED + CORRECTION_STORED` 건수만 사용한다.
 - detail에는 비밀값 없이 조사 수, schema 통과 수, 등급별 수, 각 저장 상태 수, material ID, 실패 단계, 휴장 여부를 기록한다.

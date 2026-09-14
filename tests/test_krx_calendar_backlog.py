@@ -7,13 +7,17 @@ from kr_stock_autotrader import krx_calendar
 from kr_stock_autotrader.krx_calendar import CalendarError, admitted_backlog_dates, is_krx_business_date, previous_krx_business_date
 
 
-def test_monday_backlog_contains_weekend_and_run_date():
-    assert admitted_backlog_dates(date(2026, 9, 7)) == ["20260905", "20260906", "20260907"]
+def test_monday_backlog_includes_prior_session_weekend_and_run_date():
+    assert admitted_backlog_dates(date(2026, 9, 7)) == ["20260904", "20260905", "20260906", "20260907"]
+
+
+def test_consecutive_business_day_includes_previous_session_for_prior_afternoon_filing():
+    assert admitted_backlog_dates(date(2026, 9, 15)) == ["20260914", "20260915"]
 
 
 def test_weekday_holiday_extends_backlog_through_first_business_day():
     assert admitted_backlog_dates(date(2026, 9, 28)) == [
-        "20260924", "20260925", "20260926", "20260927", "20260928",
+        "20260923", "20260924", "20260925", "20260926", "20260927", "20260928",
     ]
 
 
@@ -25,7 +29,7 @@ def test_krx_rule_and_special_closures_are_not_admitted(closed):
 
 
 def test_july_special_closure_extends_next_business_backlog():
-    assert admitted_backlog_dates(date(2026, 7, 20)) == ["20260717", "20260718", "20260719", "20260720"]
+    assert admitted_backlog_dates(date(2026, 7, 20)) == ["20260716", "20260717", "20260718", "20260719", "20260720"]
 
 
 def test_weekend_is_not_admitted_and_unsupported_year_fails_closed():

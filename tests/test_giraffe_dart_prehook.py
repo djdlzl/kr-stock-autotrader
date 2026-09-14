@@ -101,6 +101,21 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         with self.assertRaisesRegex(self.manifest.ManifestError, "incomplete DART manifest"):
             self.manifest.collect_manifest("20260901", lambda _date, page: docs[page])
 
+    def test_0700_production_gate_admits_prior_afternoon_supply_contract_fixture(self):
+        now = self.gate.datetime(2026, 9, 15, 7, 0, tzinfo=self.gate.ZoneInfo("Asia/Seoul"))
+        dates = self.gate.target_dates(now)
+        self.assertEqual(dates, ["20260914", "20260915"])
+        with tempfile.TemporaryDirectory() as temp:
+            packet_path = pathlib.Path(temp) / "20260914001539.json"
+            packet_path.write_text(json.dumps({"rcp_no": "20260914001539", "source_date": "20260914"}), encoding="utf-8")
+            contract = self.gate.control_contract(
+                "research-2026-09-15-0700-kst",
+                [{"date": "20260914", "source_packet_paths": [str(packet_path)]}, {"date": "20260915", "source_packet_paths": []}],
+            )
+        self.assertEqual(contract["dates"], dates)
+        self.assertEqual(contract["expected_rcp_nos"], ["20260914001539"])
+        self.assertEqual(contract["sources"][0]["date"], "20260914")
+
     def test_gate_emits_giraffe_contract_for_previous_and_current_dates(self):
         def fake_collect(date):
             return {
