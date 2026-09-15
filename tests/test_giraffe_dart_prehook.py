@@ -24,20 +24,11 @@ def load_module(name: str, filename: str):
 
 
 def dart_page(current, pages, total, receipts, material_receipts=()):
-    rows = "".join(
-        "<tr><td><a onclick=\"openReportViewer('%s'); return false;\">%s</a></td>"
-        "<td>%s</td></tr>" % (
-            receipt,
-            "단일판매ㆍ공급계약체결" if receipt in material_receipts else "정기공시",
-            receipt,
-        )
-        for receipt in receipts
-    )
-    return (
-        '<input id="totalCnt" value="%s">' % total
-        + '<div class="pageInfo">[%s/%s] [총 %s건]</div>' % (current, pages, total)
-        + "<table>%s</table>" % rows
-    )
+    rows = []
+    for receipt in receipts:
+        report = "단일판매ㆍ공급계약체결" if receipt in material_receipts else "정기공시"
+        rows.append({"rcept_no": receipt, "corp_name": "테스트회사", "stock_code": "123456", "report_nm": report, "rcept_dt": "20260901"})
+    return {"status": "000", "total_count": str(total), "total_page": str(pages), "page_no": str(current), "page_count": "100", "list": rows}
 
 
 class GiraffeDartPrehookTests(unittest.TestCase):
@@ -47,7 +38,7 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         sys.path.insert(0, str(SCRIPTS))
         cls.gate = load_module("giraffe_dart_manifest_gate_test", "giraffe_dart_manifest_gate.py")
 
-    def test_fixed_20260901_replay_collects_all_366_records(self):
+    def test_api_replay_collects_all_366_records(self):
         receipts = ["20260901%06d" % n for n in range(1, 367)]
         material = set(receipts[:113])
         pages = {
@@ -58,6 +49,7 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         }
         result = self.manifest.collect_manifest("20260901", lambda _date, page: pages[page])
         self.assertTrue(result["complete"])
+        self.assertEqual(result["source_url"], "https://opendart.fss.or.kr/api/list.json")
         self.assertEqual(result["declared_total"], 366)
         self.assertEqual(result["declared_pages"], 4)
         self.assertEqual(result["page_counts"], [100, 100, 100, 66])
@@ -65,22 +57,55 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(result["duplicates"], [])
         self.assertEqual(result["material_candidate_count"], 113)
 
-    def test_subsidiary_major_management_voluntary_disclosure_is_material_candidate(self):
-        records = {
-            "20260914800268": "14:41 유 씨케이솔루션 기타경영사항(자율공시)(종속회사의주요경영사항)",
-            "20260914900999": "10:00 유 일반회사 기타경영사항(자율공시)",
-        }
-        rows = "".join(
-            "<tr><td><a onclick=\"openReportViewer('%s'); return false;\">%s</a></td>"
-            "<td>%s</td></tr>" % (receipt, title, receipt)
-            for receipt, title in records.items()
-        )
-        document = (
-            '<input id="totalCnt" value="2">'
-            '<div class="pageInfo">[1/1] [총 2건]</div>'
-            f"<table>{rows}</table>"
-        )
+    def test_actual_local_workflow_uses_sanitized_fake_transport(self):
+        calls = []
+        payload = dart_page(1, 1, 1, ["20260901000001"], {"20260901000001"})
 
+        def transport(url, params):
+            calls.append((url, dict(params)))
+            return payload
+
+        result = self.manifest.collect_manifest(
+            "20260901",
+            lambda date, page: self.manifest.fetch_page(date, page, api_key="sanitized-test-key", transport=transport),
+        )
+        self.assertTrue(result["complete"])
+        self.assertEqual(calls, [(self.manifest.BASE_URL, {"crtfc_key": "sanitized-test-key", "bgn_de": "20260901", "end_de": "20260901", "page_no": 1, "page_count": 100})])
+        self.assertNotIn("sanitized-test-key", json.dumps(result, ensure_ascii=False))
+
+    def test_api_status_013_is_a_complete_empty_manifest(self):
+        result = self.manifest.collect_manifest("20260901", lambda _date, _page: {"status": "013", "message": "조회된 데이타가 없습니다."})
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["declared_total"], 0)
+        self.assertEqual(result["records"], [])
+
+    def test_missing_api_key_fails_closed(self):
+        with patch.dict(os.environ, {"OPENDART_API_KEY": ""}, clear=False):
+            with self.assertRaisesRegex(self.manifest.ManifestError, "OPENDART_API_KEY is required"):
+                self.manifest.fetch_page("20260901", 1)
+
+    def test_api_status_and_malformed_metadata_fail_closed_without_secret(self):
+        secret = "not-for-output"
+        with self.assertRaisesRegex(self.manifest.ManifestError, "OpenDART API status 010") as status_error:
+            self.manifest.collect_manifest("20260901", lambda _date, _page: {"status": "010", "message": secret})
+        self.assertNotIn(secret, str(status_error.exception))
+        with self.assertRaisesRegex(self.manifest.ManifestError, "metadata missing"):
+            self.manifest.collect_manifest("20260901", lambda _date, _page: {"status": "000", "total_count": "1"})
+
+    def test_requested_page_total_and_list_completeness_mismatches_fail_closed(self):
+        returned_second_page = dart_page(2, 2, 101, ["20260901%06d" % n for n in range(100, 101)])
+        with self.assertRaisesRegex(self.manifest.ManifestError, "requested page 1"):
+            self.manifest.collect_manifest("20260901", lambda _date, _page: returned_second_page)
+        broken_pages = dart_page(1, 3, 101, ["20260901000001"])
+        with self.assertRaisesRegex(self.manifest.ManifestError, "total/page inconsistency"):
+            self.manifest.collect_manifest("20260901", lambda _date, _page: broken_pages)
+        short = dart_page(1, 1, 2, ["20260901000001"])
+        with self.assertRaisesRegex(self.manifest.ManifestError, "list count mismatch"):
+            self.manifest.collect_manifest("20260901", lambda _date, _page: short)
+
+    def test_subsidiary_major_management_voluntary_disclosure_is_material_candidate(self):
+        document = dart_page(1, 1, 2, ["20260914800268", "20260914900999"])
+        document["list"][0]["report_nm"] = "기타경영사항(자율공시)(종속회사의주요경영사항)"
         result = self.manifest.collect_manifest("20260914", lambda _date, _page: document)
 
         self.assertEqual(
@@ -89,22 +114,9 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         )
 
     def test_stock_cancellation_filings_are_material_candidates(self):
-        records = {
-            "20260909800465": "삼표시멘트 주식소각결정",
-            "20260909900188": "아이퀘스트 주식소각",
-            "20260909900999": "정기공시",
-        }
-        rows = "".join(
-            "<tr><td><a onclick=\"openReportViewer('%s'); return false;\">%s</a></td>"
-            "<td>%s</td></tr>" % (receipt, title, receipt)
-            for receipt, title in records.items()
-        )
-        document = (
-            '<input id="totalCnt" value="3">'
-            '<div class="pageInfo">[1/1] [총 3건]</div>'
-            f"<table>{rows}</table>"
-        )
-
+        document = dart_page(1, 1, 3, ["20260909800465", "20260909900188", "20260909900999"])
+        document["list"][0]["report_nm"] = "주식소각결정"
+        document["list"][1]["report_nm"] = "주식소각"
         result = self.manifest.collect_manifest("20260909", lambda _date, _page: document)
 
         self.assertEqual(
@@ -117,11 +129,9 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         )
 
     def test_incomplete_duplicate_case_fails_closed(self):
-        docs = {
-            1: dart_page(1, 2, 3, ["20260901000001", "20260901000002"]),
-            2: dart_page(2, 2, 3, ["20260901000002"]),
-        }
-        with self.assertRaisesRegex(self.manifest.ManifestError, "incomplete DART manifest"):
+        docs = {1: dart_page(1, 1, 2, ["20260901000001", "20260901000002"])}
+        docs[1]["list"][1]["rcept_no"] = "20260901000001"
+        with self.assertRaisesRegex(self.manifest.ManifestError, "duplicate receipt"):
             self.manifest.collect_manifest("20260901", lambda _date, page: docs[page])
 
     def test_0700_production_gate_admits_prior_afternoon_supply_contract_fixture(self):

@@ -20,12 +20,15 @@ Giraffe는 paper-only이고 `LIVE_TRADING=False`다. 이 작업은 주문·자�
 6. API 주소 또는 토큰이 없으면 저장을 시도하지 말고 실행을 `error`로 종료한다.
 7. 토큰, 인증 헤더, `.env` 본문은 출력·보고·로그·DB snapshot에 남기지 않는다.
 8. 원격 DB에 직접 접속하지 않고 Giraffe 내부 API/CLI만 사용한다.
+9. DART manifest 수집에는 `OPENDART_API_KEY`가 필수다. 값이 없으면 DART/조사/저장을 시작하지 말고 `error`로 종료한다. 이 key, key가 포함된 URL query, transport 오류 원문은 출력·receipt·manifest·snapshot에 남기지 않는다.
 
 ## 실행 시작
 
 ### DART 완전성 prehook 계약 (조사·저장 전에 강제)
 
 - 이 job은 먼저 repo-owned `giraffe_dart_manifest_gate.py` prehook의 stdout JSON을 주입받아야 한다. 정상 gate 식별자는 정확히 `GIRAFFE_DART_GATE_V1`이고 `complete=true`여야 한다.
+- prehook의 DART 목록 source는 공식 OpenDART JSON API `GET https://opendart.fss.or.kr/api/list.json`만 사용한다. `crtfc_key`, 대상일과 정확히 같은 `bgn_de`/`end_de`, `page_no`, `page_count=100`을 사용하며, `status=000`, `total_count`/`total_page`와 모든 page의 list 수·receipt 고유성이 일치할 때만 complete다. 공식 `status=013`은 no-data empty manifest로만 허용한다. HTML DART 화면 scrape·첫 페이지 대체·HTML fallback은 금지다.
+- manifest의 `source_url`은 secret 없는 위 base endpoint여야 한다. API status/metadata/page mismatch, pagination 중 total 변경, 누락·중복 receipt는 fail-closed이며 prehook이 `complete=true`를 내보내면 안 된다.
 - gate가 없거나 JSON이 아니거나 `gate` 값이 다르거나 `complete!=true`이면 **조사·웹검색·저장 어느 것도 시작하지 않는다**. 이 경우 `scheduler-finish ... error`로 종료한다. 첫 페이지 DART 목록이나 일반 웹검색으로 대체하지 않는다.
 - gate는 전일+당일 KST DART manifest를 `/Users/jaewoo/.hermes/runs/giraffe-7923/dart-manifests/`에 남긴다. 각 date의 `declared_total`, `declared_pages`, `pages_collected`, `page_counts`, `unique_receipts`, `duplicates`, `material_candidate_count`, `complete`, `manifest_path`를 실행 receipt에 기록한다.
 - 각 complete manifest의 `source_packet_paths`만이 DART 조사 제어 목록이다. packet 밖의 DART URL·검색 결과를 원문 근거로 쓰지 않는다. packet metadata의 `rcp_no`를 **정확히 한 번씩** 검토하고, path 수와 `source_valid_count`가 제어 수와 같아야 한다.
