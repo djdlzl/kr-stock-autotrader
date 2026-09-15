@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import shutil
 
 import pytest
 
@@ -83,6 +84,24 @@ def test_open_day_08_prehook_wakes_hermes_without_a_wrapper_command(gate):
     payload = json.loads(output.getvalue())
     assert payload["wakeAgent"] is True
     assert parse_hermes_wake_gate(output.getvalue()) is True
+
+
+def test_installed_prehook_locates_home_repo_outside_job_workdir(tmp_path):
+    installed = tmp_path / "giraffe_decision_card_gate.py"
+    shutil.copy2(ROOT / "scripts" / "giraffe_decision_card_gate.py", installed)
+    env = os.environ.copy()
+    env.pop("GIRAFFE_DEPLOYED_REPO", None)
+
+    completed = subprocess.run(
+        [sys.executable, str(installed), "--at", "2026-07-20T08:00:00+09:00"],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert json.loads(completed.stdout)["wakeAgent"] is True
 
 
 def test_open_day_08_optional_recovery_command_runs_after_admission(gate):

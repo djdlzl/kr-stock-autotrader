@@ -27,6 +27,7 @@ def _add_deployed_repo_to_path() -> None:
         Path(os.environ["GIRAFFE_DEPLOYED_REPO"]).expanduser()
         if os.environ.get("GIRAFFE_DEPLOYED_REPO")
         else None,
+        Path.home() / "kr-stock-autotrader",
     )
     for root in candidates:
         if root is not None and (root / "kr_stock_autotrader" / "krx_calendar.py").is_file():
