@@ -502,7 +502,7 @@ def _registered_research_detail(run_key: str, contract: object) -> dict:
     return {"kind": "research", "control_commitment": _research_commitment(run_key, contract)}
 
 
-def _safe_research_scheduler_finish(run_key: str, start_detail: object, data: object) -> dict:
+def _safe_research_scheduler_finish(db, run_key: str, start_detail: object, data: object) -> dict:
     """DONE requires the immutable start commitment and exact per-receipt census."""
     if not isinstance(data, dict) or data.get("status") not in {"done", "error"} or not isinstance(start_detail, dict): raise HTTPException(422, "invalid research scheduler finish")
     count = _nonnegative_int(data.get("count", 0)); commitment = start_detail.get("control_commitment")
@@ -517,6 +517,8 @@ def _safe_research_scheduler_finish(run_key: str, start_detail: object, data: ob
             or receipt["run_key"] != run_key or receipt["control_contract_sha256"] != commitment["control_contract_sha256"]
             or not isinstance(reviewed, list) or reviewed != expected or reviewed != sorted(reviewed) or len(reviewed) != len(set(reviewed))): raise HTTPException(422, "research completion does not match start commitment")
     fields = {name: int(value) for name, value in fields.items()}; control = len(expected)
+    if not _valid_candidate_evidence_bindings(db, receipt["coverage_lanes"], run_key, fields):
+        raise HTTPException(422, "research candidate evidence bindings are not done-safe")
     terminal = sum(fields[name] for name in ("rejected_after_evidence", "saved", "existing", "correction_stored", "source_error", "store_error", "coverage_error"))
     if (fields["control_count"] != control or fields["source_valid"] != control or fields["reviewed_unique"] != control or terminal != control or any(fields[name] for name in ("source_error", "store_error", "coverage_error")) or count != fields["saved"] + fields["correction_stored"]): raise HTTPException(422, "research completion receipt is not done-safe")
     return {"status": "done", "count": count, "detail": data["detail"], "control_commitment": commitment}
@@ -528,9 +530,10 @@ def _nonnegative_int(value: object) -> int | None:
 
 _COVERAGE_LANE_NAMES = frozenset({"kind_krx", "issuer_ir_newsroom", "reputable_media"})
 _COVERAGE_LANE_FIELDS = frozenset({"executed", "query_count", "checked_url_count", "source_valid_count", "candidate_count", "coverage_error_count", "queries", "checked_sources"})
-_CHECKED_SOURCE_FIELDS = frozenset({"url", "source_valid", "published_at", "retrieved_at", "outcome", "economic_disposition", "economic_reason"})
+_CHECKED_SOURCE_FIELDS = frozenset({"url", "source_valid", "published_at", "retrieved_at", "outcome", "economic_disposition", "economic_reason", "evidence_id"})
 _COVERAGE_OUTCOMES = frozenset({"candidate", "negative_evidence", "not_material", "timing_ineligible", "invalid_source"})
-_CANDIDATE_DISPOSITIONS = frozenset({"eligible", "rejected", "hold"})
+_CANDIDATE_DISPOSITIONS = frozenset({"saved", "existing", "correction_stored", "rejected", "hold"})
+_EVIDENCE_CANDIDATE_DISPOSITIONS = frozenset({"saved", "existing", "correction_stored"})
 _MAX_COVERAGE_QUERIES = 100
 _MAX_COVERAGE_SOURCES = 100
 _MAX_COVERAGE_QUERY_LENGTH = 500
@@ -604,7 +607,13 @@ def _valid_checked_source(value: object, cutoff: datetime) -> bool:
     if outcome == "candidate":
         if disposition not in _CANDIDATE_DISPOSITIONS or not isinstance(reason, str) or reason.strip() != reason or not 0 < len(reason) <= 1000:
             return False
-    elif disposition is not None or reason is not None:
+        evidence_id = value.get("evidence_id")
+        if disposition in _EVIDENCE_CANDIDATE_DISPOSITIONS:
+            if not isinstance(evidence_id, int) or isinstance(evidence_id, bool) or not 0 < evidence_id <= 9223372036854775807:
+                return False
+        elif evidence_id is not None:
+            return False
+    elif disposition is not None or reason is not None or value.get("evidence_id") is not None:
         return False
     if not source_valid:
         return outcome == "invalid_source" and value.get("published_at") is None
@@ -621,6 +630,7 @@ def _valid_coverage_lanes(value: object, run_key: str) -> bool:
     if not isinstance(value, dict) or set(value) != _COVERAGE_LANE_NAMES:
         return False
     cutoff = datetime.combine(_research_run_date(run_key), time(7), tzinfo=ZoneInfo("Asia/Seoul"))
+    canonical_urls = []
     for lane in value.values():
         if not isinstance(lane, dict) or set(lane) != _COVERAGE_LANE_FIELDS or lane.get("executed") is not True:
             return False
@@ -636,11 +646,46 @@ def _valid_coverage_lanes(value: object, run_key: str) -> bool:
         urls = [_canonical_coverage_url(source["url"]) for source in checked_sources]
         if len(set(urls)) != len(urls):
             return False
+        canonical_urls.extend(urls)
         valid_count = sum(source["source_valid"] for source in checked_sources)
         candidate_count = sum(source["outcome"] == "candidate" for source in checked_sources)
         if (lane["query_count"] != len(queries) or lane["checked_url_count"] != len(checked_sources)
                 or lane["source_valid_count"] != valid_count or lane["candidate_count"] != candidate_count
                 or lane["query_count"] <= 0 or lane["source_valid_count"] <= 0 or lane["coverage_error_count"] != 0):
+            return False
+    return len(set(canonical_urls)) == len(canonical_urls)
+
+
+def _valid_candidate_evidence_bindings(db, coverage_lanes: dict, run_key: str, fields: dict[str, int]) -> bool:
+    """Bind candidate terminal outcomes to durable evidence without changing DART controls."""
+    candidates = [source for lane in coverage_lanes.values() for source in lane["checked_sources"] if source["outcome"] == "candidate"]
+    bound = [(source["economic_disposition"], source["evidence_id"], source) for source in candidates]
+    evidence_dispositions: dict[int, str] = {}
+    for disposition, evidence_id, _ in bound:
+        if disposition in _EVIDENCE_CANDIDATE_DISPOSITIONS:
+            previous = evidence_dispositions.setdefault(evidence_id, disposition)
+            if previous != disposition:
+                return False
+    if any(len({evidence_id for disposition, evidence_id, _ in bound if disposition == terminal}) != fields[terminal]
+           for terminal in _EVIDENCE_CANDIDATE_DISPOSITIONS):
+        return False
+    if not evidence_dispositions:
+        return True
+    placeholders = ",".join("?" for _ in evidence_dispositions)
+    rows = db.execute(f"SELECT id,source_url,announcement_at FROM material_evidence WHERE id IN ({placeholders})", tuple(evidence_dispositions)).fetchall()
+    evidence = {row["id"]: row for row in rows}
+    if len(evidence) != len(evidence_dispositions):
+        return False
+    cutoff = datetime.combine(_research_run_date(run_key), time(7), tzinfo=ZoneInfo("Asia/Seoul")).astimezone(ZoneInfo("UTC"))
+    for disposition, evidence_id, source in bound:
+        if disposition not in _EVIDENCE_CANDIDATE_DISPOSITIONS:
+            continue
+        row = evidence[evidence_id]
+        announcement_at = _parse_timezone_aware_iso_timestamp(row["announcement_at"])
+        published_at = _parse_timezone_aware_iso_timestamp(source["published_at"])
+        if (_canonical_coverage_url(row["source_url"]) != _canonical_coverage_url(source["url"])
+                or announcement_at is None or published_at is None or announcement_at.astimezone(ZoneInfo("UTC")) > cutoff
+                or announcement_at.astimezone(ZoneInfo("UTC")) != published_at.astimezone(ZoneInfo("UTC"))):
             return False
     return True
 
@@ -1518,7 +1563,7 @@ async def scheduler_finish(run_key: str, request: Request, _: None = Depends(req
         if not existing: raise HTTPException(404,'scheduler run not found')
         start_detail = json.loads(existing['detail'])
         finished = (_safe_premarket_scheduler_finish(data) if _is_premarket_card_run(run_key, existing['kind'])
-                    else _safe_research_scheduler_finish(run_key, start_detail, data) if _is_research_run(run_key, existing['kind']) else data)
+                    else _safe_research_scheduler_finish(db, run_key, start_detail, data) if _is_research_run(run_key, existing['kind']) else data)
         updated = db.execute("UPDATE scheduler_runs SET status=?,finished_at=?,detail=? WHERE run_key=? AND NOT ((kind='market_context' OR kind='research') AND status IN ('done','error'))",(finished['status'],__import__('kr_stock_autotrader.decision_cards',fromlist=['now']).now(),json.dumps(finished),run_key))
         if updated.rowcount == 0: finished = json.loads(db.execute("SELECT detail FROM scheduler_runs WHERE run_key=?", (run_key,)).fetchone()['detail'])
         db.commit()

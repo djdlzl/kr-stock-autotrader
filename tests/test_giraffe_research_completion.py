@@ -78,6 +78,7 @@ def coverage_lane(name, *, outcome="not_material", source_valid=True, published_
             "outcome": outcome,
             "economic_disposition": None,
             "economic_reason": None,
+            "evidence_id": None,
         }],
     }
 
@@ -179,6 +180,7 @@ def test_research_done_requires_durable_inline_query_source_audit_and_readback()
     invalid(lambda lane: lane["checked_sources"][0].update({"outcome": "made_up"}))
     invalid(lambda lane: lane["checked_sources"][0].update({"outcome": "invalid_source"}))
     invalid(lambda lane: lane.update({"candidate_count": 1}))
+    invalid(lambda lane: lane["checked_sources"][0].update({"evidence_id": 1}))
     invalid(lambda lane: lane["checked_sources"][0].update({"extra": "no"}))
 
     for value in variants:
@@ -206,7 +208,7 @@ def test_coverage_cutoff_canonical_urls_and_candidate_economics_are_enforced():
     source = exact["coverage_lanes"]["kind_krx"]["checked_sources"][0]
     source.update({"outcome": "candidate", "published_at": "2026-09-15T22:00:00Z", "economic_disposition": "eligible", "economic_reason": "published before this run cutoff and satisfies the stated economics"})
     exact["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
-    assert finish(exact).status_code == 200
+    assert finish(exact).status_code == 422
     no_economics = receipt(key, digest, [])
     no_economics["coverage_lanes"]["kind_krx"]["checked_sources"][0]["outcome"] = "candidate"
     no_economics["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
@@ -246,6 +248,73 @@ def test_coverage_cutoff_canonical_urls_and_candidate_economics_are_enforced():
     lane["checked_sources"].append({**lane["checked_sources"][0], "url": "https://example.com/kind_krx?version=2"})
     lane.update({"checked_url_count": 2, "source_valid_count": 2})
     assert finish(distinct).status_code == 200
+
+
+def test_coverage_candidate_terminal_evidence_binding_and_cross_lane_dedupe():
+    client = TestClient(app); key = "research-2026-09-16-0700-kst-r1"
+    _, digest = start(client, key, ["20260916000001"])
+
+    def finish(value):
+        return client.post(f"/api/internal/scheduler-runs/{key}/finish", json={"status": "done", "count": value["saved"] + value["correction_stored"], "detail": {"completion_receipt": value}}, headers=HEADERS)
+
+    def candidate(value, disposition, evidence_id=None):
+        source = value["coverage_lanes"]["kind_krx"]["checked_sources"][0]
+        source.update({"outcome": "candidate", "economic_disposition": disposition, "economic_reason": "terminal economic review", "evidence_id": evidence_id})
+        value["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
+        return source
+
+    # Canonical uniqueness is global across independent lanes, not merely local.
+    duplicate = receipt(key, digest, ["20260916000001"])
+    duplicate["coverage_lanes"]["issuer_ir_newsroom"]["checked_sources"][0]["url"] = "https://EXAMPLE.com:443/kind_krx"
+    assert finish(duplicate).status_code == 422
+    independent = receipt(key, digest, ["20260916000001"])
+    independent["coverage_lanes"]["issuer_ir_newsroom"]["checked_sources"][0]["url"] = "https://example.com/other-original"
+
+    prior_eligible = receipt(key, digest, ["20260916000001"])
+    candidate(prior_eligible, "eligible")
+    assert finish(prior_eligible).status_code == 422
+    zero_saved = receipt(key, digest, ["20260916000001"])
+    candidate(zero_saved, "saved", 1)
+    assert finish(zero_saved).status_code == 422
+    fake = receipt(key, digest, ["20260916000001"], rejected_after_evidence=0, saved=1)
+    candidate(fake, "saved", 999999)
+    assert finish(fake).status_code == 422
+
+    evidence = client.post("/api/internal/evidence", headers=HEADERS, json={
+        "symbol": "005930", "kind": "news", "title": "candidate evidence", "summary": "material",
+        "source": "issuer", "source_url": "https://example.com/kind_krx",
+        "announcement_at": "2026-09-16T06:00:00+09:00", "collected_at": "2026-09-16T07:00:00+09:00",
+        "known_at": "2026-09-16T06:00:00+09:00", "snapshot": {}, "dedupe_key": "candidate-terminal-binding",
+    })
+    assert evidence.status_code == 200
+    saved = receipt(key, digest, ["20260916000001"], rejected_after_evidence=0, saved=1)
+    candidate(saved, "saved", evidence.json()["id"])
+    response = finish(saved)
+    assert response.status_code == 200
+    assert client.get(f"/api/internal/scheduler-runs/{key}", headers=CONTROL_HEADERS).json()["detail"]["detail"]["completion_receipt"] == saved
+    assert finish(independent).status_code == 200
+
+    for disposition, field in (("existing", "existing"), ("correction_stored", "correction_stored")):
+        mismatch = receipt(key, digest, ["20260916000001"], rejected_after_evidence=0, **{field: 1})
+        candidate(mismatch, disposition, evidence.json()["id"])
+        mismatch[field] = 0
+        mismatch["rejected_after_evidence"] = 1
+        assert finish(mismatch).status_code == 422
+
+    conflicting = receipt(key, digest, ["20260916000001"], rejected_after_evidence=0, saved=1, existing=1)
+    candidate(conflicting, "saved", evidence.json()["id"])
+    other = conflicting["coverage_lanes"]["issuer_ir_newsroom"]["checked_sources"][0]
+    other.update({"outcome": "candidate", "economic_disposition": "existing", "economic_reason": "terminal economic review", "evidence_id": evidence.json()["id"]})
+    conflicting["coverage_lanes"]["issuer_ir_newsroom"]["candidate_count"] = 1
+    assert finish(conflicting).status_code == 422
+
+    for disposition in ("rejected", "hold"):
+        no_evidence = receipt(key, digest, ["20260916000001"])
+        candidate(no_evidence, disposition)
+        assert finish(no_evidence).status_code == 200
+    rejected_with_evidence = receipt(key, digest, ["20260916000001"])
+    candidate(rejected_with_evidence, "rejected", evidence.json()["id"])
+    assert finish(rejected_with_evidence).status_code == 422
 
 
 def test_research_run_exact_readback_is_versioned_and_control_key_gated():
