@@ -568,6 +568,69 @@ def test_discovery_provenance_uses_the_run_date_cutoff_and_exact_payload():
     assert not api_module._bounded_discovery_payload({"api_key": "secret", "blob": "x" * 2001})
 
 
+def test_carried_discovery_manual_catch_up_existing_is_exact_atomic_and_idempotent(monkeypatch, tmp_path):
+    """A later run may bind only the exact prior manual recovery record."""
+    import kr_stock_autotrader.db as db_module
+    from kr_stock_autotrader.db import connect
+
+    monkeypatch.setattr(db_module, "DATABASE_PATH", str(tmp_path / "manual-existing.db"))
+    client = TestClient(app)
+    old = "research-2026-09-16-0700-kst-r3"
+    source_url = "https://kind.krx.co.kr/notice/doosan"
+    announcement_at = "2026-09-15T10:43:20+09:00"
+    payload = {"symbol": "336260", "name": "두산퓨얼셀", "title": "연료전지 시스템 공급 계약"}
+    candidate = {"source_url": source_url, "announcement_at": announcement_at, "payload": payload}
+    start(client, old, [])
+    evidence_data = {"symbol": payload["symbol"], "name": payload["name"], "kind": "news", "title": payload["title"],
+        "summary": "contract", "source": "KIND", "source_url": source_url, "announcement_at": announcement_at,
+        "known_at": "2026-09-16T15:42:00+09:00", "collected_at": "2026-09-16T15:43:00+09:00", "snapshot": {},
+        "dedupe_key": "manual-existing-exact", "research_mode": "manual_catch_up", "research_run_key": old}
+    evidence_id = client.post("/api/internal/evidence", headers=HEADERS, json=evidence_data).json()["id"]
+    assert client.post(f"/api/internal/scheduler-runs/{old}/finish", headers=HEADERS,
+                       json={"status": "error", "count": 0, "detail": {"carry_forward_candidates": [candidate]}}).status_code == 200
+    carried = client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"]
+    assert len(carried) == 1 and carried[0]["original_announcement_at"] == announcement_at
+
+    key = "research-2026-09-17-0700-kst"
+    contract, _ = commitment(key, [])
+    contract.update({"schema_version": "giraffe-research-control-v2", "carry_forward": [{"identity": carried[0]["identity"], "kind": "discovery", **candidate}]})
+    assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 200
+    assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research"}, headers=HEADERS).status_code == 200
+    done_receipt = receipt(key, hashlib.sha256(canonical(contract)).hexdigest(), [], rejected_after_evidence=0, existing=1)
+    done = {"status": "done", "count": 0, "detail": {"completion_receipt": done_receipt,
+        "control_terminal_dispositions": [], "discovery_terminal_dispositions": [{"identity": carried[0]["identity"], "disposition": "existing", "evidence_id": evidence_id}]}}
+    for field, value in (("source_url", "https://kind.krx.co.kr/notice/other"), ("announcement_at", "2026-09-15T10:43:21+09:00"),
+                         ("symbol", "005930"), ("name", "다른회사"), ("title", "다른 계약")):
+        bad = dict(evidence_data, dedupe_key=f"manual-existing-bad-{field}", **{field: value})
+        if field == "announcement_at":
+            bad["known_at"] = "2026-09-16T15:42:00+09:00"
+        bad_id = client.post("/api/internal/evidence", headers=HEADERS, json=bad).json()["id"]
+        rejected = json.loads(json.dumps(done))
+        rejected["detail"]["discovery_terminal_dispositions"][0]["evidence_id"] = bad_id
+        assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=rejected).status_code == 422
+        assert len(client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"]) == 1
+    generic = dict(evidence_data, dedupe_key="generic-existing-cannot-clear")
+    generic.pop("research_mode"); generic.pop("research_run_key")
+    generic_id = client.post("/api/internal/evidence", headers=HEADERS, json=generic).json()["id"]
+    rejected = json.loads(json.dumps(done))
+    rejected["detail"]["discovery_terminal_dispositions"][0]["evidence_id"] = generic_id
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=rejected).status_code == 422
+    assert client.get(f"/api/internal/scheduler-runs/{key}", headers=CONTROL_HEADERS).json()["status"] == "started"
+    assert len(client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"]) == 1
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done).status_code == 200
+    assert client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"] == []
+    exact = client.get(f"/api/internal/scheduler-runs/{key}", headers=CONTROL_HEADERS).json()
+    assert exact["status"] == "done" and exact["detail"]["detail"]["discovery_terminal_dispositions"] == done["detail"]["discovery_terminal_dispositions"]
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done).status_code == 200
+    db = connect()
+    try:
+        assert db.execute("SELECT COUNT(*) AS count FROM material_evidence").fetchone()["count"] == 7
+        row = db.execute("SELECT status,terminal_disposition,terminal_evidence_id FROM giraffe_research_backlog WHERE identity=?", (carried[0]["identity"],)).fetchone()
+        assert dict(row) == {"status": "terminal", "terminal_disposition": "existing", "terminal_evidence_id": evidence_id}
+    finally:
+        db.close()
+
+
 def test_backlog_seeding_skips_noncanonical_scheduler_rows_at_source():
     """A legacy scheduler key cannot manufacture an unvalidated DART cursor."""
     from kr_stock_autotrader.db import connect

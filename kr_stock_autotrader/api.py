@@ -666,6 +666,39 @@ def _discovery_evidence_matches_run(evidence: dict, expected: dict, run_key: str
     )
 
 
+def _discovery_evidence_matches_prior_manual_catch_up(evidence: dict, expected: dict, run_key: str, *, prior_run_exists: bool) -> bool:
+    """Bounded cross-path binding for an already-durable manual recovery.
+
+    This is intentionally narrower than scheduled provenance: only an
+    ``existing`` disposition may use it, the evidence must name a real earlier
+    research run, URL and announcement instants compare canonically/UTC, and
+    every stable identity supplied by the carried payload must exactly match.
+    A URL/time pair without at least one supplied stable identity is not enough.
+    """
+    if not prior_run_exists or not isinstance(evidence, dict) or not isinstance(expected, dict):
+        return False
+    try:
+        evidence_run_key = evidence['research_run_key']
+        announcement_at = _parse_timezone_aware_iso_timestamp(evidence['announcement_at'])
+        known_at = _parse_timezone_aware_iso_timestamp(evidence['known_at'])
+        expected_announcement_at = _parse_timezone_aware_iso_timestamp(expected['announcement_at'])
+        payload = expected['payload']
+    except (KeyError, TypeError):
+        return False
+    if (evidence.get('research_mode') != 'manual_catch_up' or evidence.get('eligible_for_original_cutoff') != 0
+            or evidence_run_key == run_key or not _is_research_run(evidence_run_key, 'research')
+            or _canonical_coverage_url(evidence.get('source_url')) != _canonical_coverage_url(expected.get('source_url'))
+            or announcement_at is None or known_at is None or expected_announcement_at is None
+            or announcement_at.astimezone(ZoneInfo('UTC')) != expected_announcement_at.astimezone(ZoneInfo('UTC'))
+            or known_at.astimezone(ZoneInfo('UTC')) < announcement_at.astimezone(ZoneInfo('UTC'))
+            or not isinstance(payload, dict)):
+        return False
+    identity_fields = [("symbol", "symbol"), ("name", "name"), ("company", "name"), ("title", "title")]
+    supplied = [(payload[key], evidence.get(column)) for key, column in identity_fields if key in payload]
+    return bool(supplied) and all(isinstance(expected_value, str) and expected_value and expected_value == actual_value
+                                  for expected_value, actual_value in supplied)
+
+
 def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) -> None:
     """Delete nothing: terminal rows remain auditable; pending query is the cursor."""
     contract = commitment['control_contract']
@@ -723,8 +756,15 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
                 or json.loads(backlog['payload']) != {'source_url': expected_item['source_url'], 'announcement_at': expected_item['announcement_at'], 'payload': expected_item['payload']}):
             raise HTTPException(422, 'research discovery terminal item was not actually pending for this run')
         if item['disposition'] in _EVIDENCE_CANDIDATE_DISPOSITIONS:
-            evidence = db.execute("SELECT source_url,announcement_at,known_at,research_mode,research_run_key,eligible_for_original_cutoff,snapshot FROM material_evidence WHERE id=?", (item['evidence_id'],)).fetchone()
-            if evidence is None or not _discovery_evidence_matches_run(dict(evidence), expected_item, run_key):
+            evidence = db.execute("SELECT source_url,announcement_at,known_at,research_mode,research_run_key,eligible_for_original_cutoff,snapshot,symbol,name,title FROM material_evidence WHERE id=?", (item['evidence_id'],)).fetchone()
+            prior_run_exists = bool(evidence and db.execute(
+                "SELECT 1 FROM scheduler_runs WHERE run_key=? AND kind='research'", (evidence['research_run_key'],)
+            ).fetchone())
+            scheduled_match = evidence is not None and _discovery_evidence_matches_run(dict(evidence), expected_item, run_key)
+            manual_existing_match = (item['disposition'] == 'existing' and evidence is not None
+                                     and _discovery_evidence_matches_prior_manual_catch_up(
+                                         dict(evidence), expected_item, run_key, prior_run_exists=prior_run_exists))
+            if not scheduled_match and not manual_existing_match:
                 raise HTTPException(422, 'research discovery evidence lacks matching run provenance')
         db.execute("UPDATE giraffe_research_backlog SET status='terminal',terminal_disposition=?,terminal_run_key=?,terminal_evidence_id=?,terminal_at=? WHERE identity=? AND status='pending'", (item['disposition'], run_key, item['evidence_id'], at, item['identity']))
         row = db.execute("SELECT status,terminal_disposition,terminal_run_key,terminal_evidence_id FROM giraffe_research_backlog WHERE identity=?", (item['identity'],)).fetchone()
@@ -758,7 +798,13 @@ def _safe_research_scheduler_finish(db, run_key: str, start_detail: object, data
             or receipt["run_key"] != run_key or receipt["control_contract_sha256"] != commitment["control_contract_sha256"]
             or not isinstance(reviewed, list) or reviewed != expected or reviewed != sorted(reviewed) or len(reviewed) != len(set(reviewed))): raise HTTPException(422, "research completion does not match start commitment")
     fields = {name: int(value) for name, value in fields.items()}; control = len(expected)
-    if not _valid_candidate_evidence_bindings(db, receipt["coverage_lanes"], run_key, fields):
+    discovery_terminal_counts = {
+        terminal: sum(isinstance(item, dict) and item.get('disposition') == terminal
+                      for item in data['detail'].get('discovery_terminal_dispositions', []))
+        for terminal in _EVIDENCE_CANDIDATE_DISPOSITIONS
+    }
+    if not _valid_candidate_evidence_bindings(db, receipt["coverage_lanes"], run_key, fields,
+                                              discovery_terminal_counts=discovery_terminal_counts):
         raise HTTPException(422, "research candidate evidence bindings are not done-safe")
     terminal = sum(fields[name] for name in ("rejected_after_evidence", "saved", "existing", "correction_stored", "source_error", "store_error", "coverage_error"))
     discovery_count = sum(item.get('kind') == 'discovery' for item in commitment['control_contract'].get('carry_forward', []))
@@ -899,8 +945,14 @@ def _valid_coverage_lanes(value: object, run_key: str) -> bool:
     return len(set(canonical_urls)) == len(canonical_urls)
 
 
-def _valid_candidate_evidence_bindings(db, coverage_lanes: dict, run_key: str, fields: dict[str, int]) -> bool:
-    """Bind candidate terminal outcomes to durable evidence without changing DART controls."""
+def _valid_candidate_evidence_bindings(db, coverage_lanes: dict, run_key: str, fields: dict[str, int], *, discovery_terminal_counts: dict[str, int] | None = None) -> bool:
+    """Bind inline coverage candidates; carried cursors are validated separately.
+
+    Receipt totals include carried discovery dispositions, while this function
+    only owns evidence IDs embedded in coverage lanes.  The caller supplies the
+    bounded carried-discovery subtotal so neither path can mask the other.
+    """
+    discovery_terminal_counts = discovery_terminal_counts or {}
     candidates = [source for lane in coverage_lanes.values() for source in lane["checked_sources"] if source["outcome"] == "candidate"]
     bound = [(source["economic_disposition"], source["evidence_id"], source) for source in candidates]
     evidence_dispositions: dict[int, str] = {}
@@ -909,7 +961,7 @@ def _valid_candidate_evidence_bindings(db, coverage_lanes: dict, run_key: str, f
             previous = evidence_dispositions.setdefault(evidence_id, disposition)
             if previous != disposition:
                 return False
-    if any(len({evidence_id for disposition, evidence_id, _ in bound if disposition == terminal}) != fields[terminal]
+    if any(discovery_terminal_counts.get(terminal, 0) < 0 or len({evidence_id for disposition, evidence_id, _ in bound if disposition == terminal}) != fields[terminal] - discovery_terminal_counts.get(terminal, 0)
            for terminal in _EVIDENCE_CANDIDATE_DISPOSITIONS):
         return False
     if not evidence_dispositions:
@@ -1835,8 +1887,13 @@ async def scheduler_start(run_key: str, request: Request, _: None = Depends(requ
 async def scheduler_finish(run_key: str, request: Request, _: None = Depends(require_internal_api_key)):
     data=await request.json(); db=connect()
     try:
-        existing=db.execute("SELECT kind,detail FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
+        existing=db.execute("SELECT kind,status,detail FROM scheduler_runs WHERE run_key=?",(run_key,)).fetchone()
         if not existing: raise HTTPException(404,'scheduler run not found')
+        if _is_research_run(run_key, existing['kind']) and existing['status'] in {'done', 'error'}:
+            finished = json.loads(existing['detail'])
+            prior_request = {'status': finished['status'], 'count': finished.get('count', 0), 'detail': finished.get('detail', {})}
+            if data == prior_request:
+                return {'run_key':run_key,'status':finished['status'],'count':finished.get('count',0),'detail':finished.get('detail',{})}
         start_detail = json.loads(existing['detail'])
         finished = (_safe_premarket_scheduler_finish(data) if _is_premarket_card_run(run_key, existing['kind'])
                     else _safe_research_scheduler_finish(db, run_key, start_detail, data) if _is_research_run(run_key, existing['kind']) else data)
