@@ -103,6 +103,35 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         with self.assertRaisesRegex(self.manifest.ManifestError, "list count mismatch"):
             self.manifest.collect_manifest("20260901", lambda _date, _page: short)
 
+    def test_manifest_row_allowlist_blocks_reserved_collisions_and_secrets(self):
+        receipt = "20260901000001"
+        payload = dart_page(1, 1, 1, [receipt])
+        payload["list"][0].update({
+            "corp_cls": "Y",
+            "corp_code": "00126380",
+            "flr_nm": "테스트제출인",
+            "rm": "",
+            "rcp_no": "forged",
+            "row_text": "단일판매",
+            "opendart": "forged",
+            "message": "manifest-secret-message",
+            "crtfc_key": "manifest-secret-key",
+            "unknown_secret": "manifest-secret-unknown",
+        })
+
+        result = self.manifest.collect_manifest("20260901", lambda _date, _page: payload)
+        record = result["records"][0]
+
+        self.assertEqual(record["rcp_no"], receipt)
+        self.assertEqual(record["rcept_no"], receipt)
+        self.assertNotIn("단일판매", record["row_text"])
+        self.assertIsInstance(record["opendart"], dict)
+        self.assertNotIn("opendart", record["opendart"])
+        self.assertEqual(result["material_candidate_records"], [])
+        serialized = json.dumps(result, ensure_ascii=False)
+        for forbidden in ("manifest-secret-message", "manifest-secret-key", "manifest-secret-unknown"):
+            self.assertNotIn(forbidden, serialized)
+
     def test_subsidiary_major_management_voluntary_disclosure_is_material_candidate(self):
         document = dart_page(1, 1, 2, ["20260914800268", "20260914900999"])
         document["list"][0]["report_nm"] = "기타경영사항(자율공시)(종속회사의주요경영사항)"

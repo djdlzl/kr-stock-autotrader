@@ -28,6 +28,14 @@ MATERIAL_KEYWORDS = (
     "종속회사의주요경영사항",
     "거래정지", "관리종목", "상장폐지", "감사의견", "횡령", "배임", "소송",
 )
+OPENDART_LIST_FIELDS = (
+    "corp_cls", "corp_name", "corp_code", "stock_code", "report_nm", "rcept_no",
+    "flr_nm", "rcept_dt", "rm",
+)
+
+
+def _is_scalar(value: Any) -> bool:
+    return isinstance(value, (str, int, float, bool, type(None)))
 
 
 class ManifestError(RuntimeError):
@@ -63,10 +71,25 @@ def _record(row: dict[str, Any]) -> dict[str, Any]:
     report_name = row.get("report_nm")
     if not isinstance(report_name, str):
         raise ManifestError("OpenDART list row missing or invalid report_nm")
-    # Preserve both the legacy downstream fields and official structured fields.
-    official = {key: value for key, value in row.items() if isinstance(key, str) and isinstance(value, (str, int, float, bool, type(None)))}
-    row_text = " ".join(str(value) for value in (row.get("corp_name"), report_name, row.get("rcept_dt"), row.get("stock_code")) if value not in (None, ""))
-    return {"rcp_no": receipt, "rcept_no": receipt, "row_text": row_text, "opendart": official, **official}
+    # Preserve documented OpenDART list fields only.  Derived compatibility
+    # fields below must not be writable by response-row keys.
+    official = {
+        key: row[key]
+        for key in OPENDART_LIST_FIELDS
+        if key in row and _is_scalar(row[key])
+    }
+    row_text = " ".join(
+        str(official.get(key))
+        for key in ("corp_name", "report_nm", "rcept_dt", "stock_code")
+        if official.get(key) not in (None, "")
+    )
+    return {
+        **{key: value for key, value in official.items() if key != "rcept_no"},
+        "rcp_no": receipt,
+        "rcept_no": receipt,
+        "row_text": row_text,
+        "opendart": official,
+    }
 
 
 def parse_page(payload: Any) -> ParsedPage:
