@@ -535,7 +535,10 @@ def _valid_coverage_lanes(value: object) -> bool:
             return False
         if any(_nonnegative_int(lane.get(field)) is None for field in lane_fields - {"executed"}):
             return False
-        if lane["query_count"] <= 0 or lane["coverage_error_count"] != 0:
+        if (lane["query_count"] <= 0 or lane["checked_url_count"] <= 0
+                or lane["source_valid_count"] <= 0
+                or lane["source_valid_count"] > lane["checked_url_count"]
+                or lane["coverage_error_count"] != 0):
             return False
     return True
 

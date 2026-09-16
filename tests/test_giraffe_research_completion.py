@@ -71,8 +71,8 @@ def receipt(run_key, digest, receipts, **extra):
         "coverage_error": 0, "rejected_after_evidence": control, "saved": 0,
         "existing": 0, "correction_stored": 0,
         "coverage_lanes": {
-            name: {"executed": True, "query_count": 1, "checked_url_count": 0,
-                   "source_valid_count": 0, "candidate_count": 0, "coverage_error_count": 0}
+            name: {"executed": True, "query_count": 1, "checked_url_count": 1,
+                   "source_valid_count": 1, "candidate_count": 0, "coverage_error_count": 0}
             for name in ("kind_krx", "issuer_ir_newsroom", "reputable_media")
         },
     }
@@ -111,6 +111,18 @@ def test_research_done_requires_exact_coverage_lanes():
         invalid["coverage_lanes"]["kind_krx"][field] = value
         payload = {"status": "done", "count": 0, "detail": {"completion_receipt": invalid}}
         assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 422
+    # A query alone is not coverage: every independent lane must check and
+    # validate an original source before a no-candidate DONE is safe.
+    for lane_name in ("kind_krx", "issuer_ir_newsroom", "reputable_media"):
+        for field, value in (("checked_url_count", 0), ("source_valid_count", 0)):
+            invalid = receipt(key, digest, [])
+            invalid["coverage_lanes"][lane_name][field] = value
+            payload = {"status": "done", "count": 0, "detail": {"completion_receipt": invalid}}
+            assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 422
+    invalid = receipt(key, digest, [])
+    invalid["coverage_lanes"]["issuer_ir_newsroom"].update({"checked_url_count": 1, "source_valid_count": 2})
+    payload = {"status": "done", "count": 0, "detail": {"completion_receipt": invalid}}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 422
     payload = {"status": "done", "count": 0, "detail": {"completion_receipt": valid}}
     assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 200
 

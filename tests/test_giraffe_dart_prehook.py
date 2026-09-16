@@ -187,14 +187,35 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(contract["sources"][0]["date"], "20260914")
 
     def test_versioned_rerun_key_is_strict_and_default_is_unchanged(self):
-        with patch.dict(os.environ, {"GIRAFFE_RESEARCH_RERUN_VERSION": ""}, clear=False):
-            self.assertEqual(self.gate.research_run_key("20260916"), "research-2026-09-16-0700-kst")
-        with patch.dict(os.environ, {"GIRAFFE_RESEARCH_RERUN_VERSION": "1"}, clear=False):
-            self.assertEqual(self.gate.research_run_key("20260916"), "research-2026-09-16-0700-kst-r1")
-        for invalid in ("0", "01", "+1", "-1", "1.0", "one"):
-            with patch.dict(os.environ, {"GIRAFFE_RESEARCH_RERUN_VERSION": invalid}, clear=False):
-                with self.assertRaisesRegex(self.gate.ManifestError, "positive integer"):
-                    self.gate.research_run_key("20260916")
+        self.assertEqual(self.gate.research_run_key("20260916", self.gate.rerun_suffix("")), "research-2026-09-16-0700-kst")
+        self.assertEqual(self.gate.research_run_key("20260916", self.gate.rerun_suffix("1")), "research-2026-09-16-0700-kst-r1")
+        self.assertEqual(self.gate.research_run_key("20260916", self.gate.rerun_suffix("12")), "research-2026-09-16-0700-kst-r12")
+        for invalid in ("0", "01", "+1", "-1", "1.0", " ", "abc"):
+            with self.assertRaisesRegex(self.gate.ManifestError, "positive integer"):
+                self.gate.rerun_suffix(invalid)
+
+    def test_invalid_rerun_version_fails_before_all_prehook_side_effects(self):
+        for invalid in ("0", "01", "+1", "-1", "1.0", " ", "abc"):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as temp, \
+                 patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp) / "manifests"), \
+                 patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), \
+                 patch.object(self.gate, "CONTROL_ROOT", pathlib.Path(temp) / "controls"), \
+                 patch.object(self.gate, "target_dates") as dates, \
+                 patch.object(self.gate, "record_recovery_invocation") as audit, \
+                 patch.object(self.gate, "check_card_prompt") as prompt, \
+                 patch.object(self.gate, "collect_manifest") as collect, \
+                 patch.object(self.gate, "fetch_with_retry") as fetch, \
+                 patch.object(self.gate, "register_research_run") as register, \
+                 patch.dict(os.environ, {"GIRAFFE_RESEARCH_RERUN_VERSION": invalid}, clear=False), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(self.gate.main(), 2)
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["gate"], "GIRAFFE_DART_GATE_V1")
+                self.assertFalse(result["complete"])
+                self.assertIn("positive integer", result["error"])
+                self.assertEqual(list(pathlib.Path(temp).iterdir()), [])
+            for side_effect in (dates, audit, prompt, collect, fetch, register):
+                side_effect.assert_not_called()
 
     def test_research_prompt_preserves_coverage_timing_and_economic_review_contract(self):
         prompt = (ROOT / "prompts" / "giraffe-material-discovery-v1.md").read_text(encoding="utf-8")

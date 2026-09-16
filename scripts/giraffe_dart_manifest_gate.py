@@ -96,16 +96,20 @@ def control_contract(run_key: str, summaries: list[dict]) -> dict:
             "expected_rcp_nos": receipts, "control_count": len(receipts), "sources": sources}
 
 
-def research_run_key(today: str) -> str:
-    """Return canonical run identity, with an explicit strict correction suffix only."""
+def rerun_suffix(version: str) -> str:
+    """Validate the raw rerun environment value before any prehook side effect."""
+    if version == "":
+        return ""
+    if not isinstance(version, str) or re.fullmatch(r"[1-9]\d*", version) is None:
+        raise ManifestError("GIRAFFE_RESEARCH_RERUN_VERSION must be a strict positive integer")
+    return f"-r{version}"
+
+
+def research_run_key(today: str, rerun: str = "") -> str:
+    """Construct canonical identity from an already validated rerun suffix."""
     if not isinstance(today, str) or re.fullmatch(r"\d{8}", today) is None:
         raise ManifestError("invalid research run date")
-    version = os.environ.get("GIRAFFE_RESEARCH_RERUN_VERSION", "")
-    if version == "":
-        return f"research-{today[:4]}-{today[4:6]}-{today[6:]}-0700-kst"
-    if re.fullmatch(r"[1-9]\d*", version) is None:
-        raise ManifestError("GIRAFFE_RESEARCH_RERUN_VERSION must be a strict positive integer")
-    return f"research-{today[:4]}-{today[4:6]}-{today[6:]}-0700-kst-r{version}"
+    return f"research-{today[:4]}-{today[4:6]}-{today[6:]}-0700-kst{rerun}"
 
 
 
@@ -167,6 +171,11 @@ def record_recovery_invocation(dates: list[str]) -> None:
 
 def main() -> int:
     try:
+        rerun = rerun_suffix(os.environ.get("GIRAFFE_RESEARCH_RERUN_VERSION", ""))
+    except ManifestError as exc:
+        print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": False, "error": str(exc)}, ensure_ascii=False))
+        return 2
+    try:
         dates = target_dates()
         record_recovery_invocation(dates)
         check_card_prompt()
@@ -214,7 +223,7 @@ def main() -> int:
         print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": False, "error": str(exc)}, ensure_ascii=False))
         return 2
     today = summaries[-1]["date"]
-    run_key = research_run_key(today)
+    run_key = research_run_key(today, rerun)
     contract = control_contract(run_key, summaries)
     digest = hashlib.sha256(canonical_bytes(contract)).hexdigest()
     CONTROL_ROOT.mkdir(parents=True, exist_ok=True)
