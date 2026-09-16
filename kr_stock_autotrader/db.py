@@ -115,6 +115,7 @@ def connect() -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS material_evidence (
       id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, name TEXT, kind TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL,
       source TEXT NOT NULL, source_url TEXT, announcement_at TEXT, collected_at TEXT NOT NULL, known_at TEXT NOT NULL,
+      research_mode TEXT NOT NULL DEFAULT 'scheduled_as_of', eligible_for_original_cutoff INTEGER NOT NULL DEFAULT 1 CHECK(eligible_for_original_cutoff IN (0,1)),
       snapshot TEXT NOT NULL, newness TEXT NOT NULL, dedupe_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'new',
       created_by TEXT NOT NULL, updated_at TEXT NOT NULL, invalidated_at TEXT, audit_json TEXT NOT NULL DEFAULT '[]',
       version INTEGER NOT NULL DEFAULT 1
@@ -159,6 +160,23 @@ def connect() -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS positions (id INTEGER PRIMARY KEY, order_plan_id INTEGER NOT NULL UNIQUE REFERENCES order_plans(id), symbol TEXT NOT NULL, qty INTEGER NOT NULL, avg_price REAL, status TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS exit_lineage (id INTEGER PRIMARY KEY, order_plan_id INTEGER NOT NULL REFERENCES order_plans(id), fill_id INTEGER NOT NULL REFERENCES order_fills(id), rule TEXT NOT NULL, quote_known_at TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS scheduler_runs (id INTEGER PRIMARY KEY, run_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, detail TEXT NOT NULL DEFAULT '{}');
+    -- Durable research work is intentionally separate from a run receipt: an
+    -- error/restart must not make an unresolved source disappear.
+    CREATE TABLE IF NOT EXISTS giraffe_research_backlog (
+      id INTEGER PRIMARY KEY,
+      identity TEXT NOT NULL UNIQUE,
+      kind TEXT NOT NULL CHECK(kind IN ('dart','discovery')),
+      payload TEXT NOT NULL,
+      original_announcement_at TEXT,
+      first_run_key TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('pending','terminal')) DEFAULT 'pending',
+      terminal_disposition TEXT,
+      terminal_run_key TEXT,
+      terminal_evidence_id INTEGER,
+      created_at TEXT NOT NULL,
+      terminal_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_giraffe_research_backlog_pending ON giraffe_research_backlog(status, kind, id);
     -- One opaque KIS OAuth token per non-secret application-key digest.  The
     -- row is deliberately not exposed through any API or audit projection.
     CREATE TABLE IF NOT EXISTS kis_oauth_token_cache (
@@ -350,6 +368,8 @@ def connect() -> sqlite3.Connection:
     # Additive, repeat-safe migration for databases created before card lineage versions.
     for table, column, ddl in (
         ("material_evidence", "version", "INTEGER NOT NULL DEFAULT 1"),
+        ("material_evidence", "research_mode", "TEXT NOT NULL DEFAULT 'scheduled_as_of'"),
+        ("material_evidence", "eligible_for_original_cutoff", "INTEGER NOT NULL DEFAULT 1 CHECK(eligible_for_original_cutoff IN (0,1))"),
         ("deterministic_filter_results", "evidence_version", "INTEGER NOT NULL DEFAULT 1"),
         ("decision_cards", "schema_version", "INTEGER NOT NULL DEFAULT 1"),
         ("order_plans", "approval_generation", "INTEGER NOT NULL DEFAULT 1"),

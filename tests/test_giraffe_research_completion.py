@@ -462,3 +462,56 @@ def test_registration_rejects_contract_date_shrink_expand_reorder_and_cross_date
     for bad in variants:
         response = client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": bad}, headers=CONTROL_HEADERS)
         assert response.status_code == 422
+
+
+def test_v2_backlog_unions_prior_error_dedupes_and_only_terminal_readback_clears():
+    client = TestClient(app)
+    old = "research-2026-09-15-0700-kst-r1"
+    old_contract, _ = start(client, old, ["20260915000271"])
+    assert client.post(f"/api/internal/scheduler-runs/{old}/finish", json={"status": "error", "count": 0, "detail": {}}, headers=HEADERS).status_code == 200
+    pending = client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS)
+    assert pending.status_code == 200
+    item = pending.json()["items"][0]
+    assert item["identity"] == "dart:20260915000271" and item["first_run_key"] == old
+
+    key = "research-2026-09-16-0700-kst"
+    contract, digest = commitment(key, ["20260915000271"])
+    contract.update({"schema_version": "giraffe-research-control-v2", "carry_forward": [item["identity"]]})
+    assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 200
+    assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research"}, headers=HEADERS).status_code == 200
+    digest = hashlib.sha256(canonical(contract)).hexdigest()
+    value = receipt(key, digest, ["20260915000271"])
+    done = {"status": "done", "count": 0, "detail": {"completion_receipt": value,
+        "control_terminal_dispositions": [{"rcp_no": "20260915000271", "disposition": "hold", "evidence_id": None}]}}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=done, headers=HEADERS).status_code == 200
+    assert client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"] == []
+
+
+def test_error_discovery_candidate_is_durable_with_original_time_and_deduped():
+    client = TestClient(app); key = "research-2026-09-16-0700-kst-r2"
+    start(client, key, [])
+    candidate = {"source_url": "https://issuer.example.com/doosan", "announcement_at": "2026-09-15T10:43:20+09:00", "payload": {"company": "두산퓨얼셀"}}
+    payload = {"status": "error", "count": 0, "detail": {"carry_forward_candidates": [candidate, candidate]}}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 200
+    items = client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"]
+    found = [item for item in items if item["kind"] == "discovery"]
+    assert len(found) == 1 and found[0]["original_announcement_at"] == candidate["announcement_at"]
+
+
+def test_manual_catch_up_preserves_delayed_truth_and_rejects_bad_chronology():
+    client = TestClient(app)
+    base = {"symbol":"336260", "kind":"news", "title":"두산퓨얼셀 계약", "summary":"3222억원", "source":"KIND",
+            "source_url":"https://issuer.example.com/doosan", "announcement_at":"2026-09-15T10:43:20+09:00",
+            "known_at":"2026-09-16T12:00:00+09:00", "collected_at":"2026-09-16T12:01:00+09:00", "snapshot":{},
+            "dedupe_key":"doosan-manual-catch-up", "research_mode":"manual_catch_up"}
+    created = client.post("/api/internal/evidence", headers=HEADERS, json=base)
+    assert created.status_code == 200
+    detail = client.get(f"/api/internal/evidence/{created.json()['id']}", headers=HEADERS).json()
+    assert detail["announcement_at"] == base["announcement_at"] and detail["known_at"] == base["known_at"]
+    assert detail["research_mode"] == "manual_catch_up" and detail["eligible_for_original_cutoff"] == 0
+    assert client.post("/api/internal/evidence", headers=HEADERS, json=base).status_code == 409
+    scheduled = dict(base, dedupe_key="doosan-scheduled-late", research_mode="scheduled_as_of")
+    assert client.post("/api/internal/evidence", headers=HEADERS, json=scheduled).status_code == 422
+    for field, value in (("known_at", "2026-09-15T10:00:00+09:00"), ("known_at", "2026-09-16T12:02:00+09:00"), ("known_at", "2026-09-16T12:00:00")):
+        bad = dict(base, dedupe_key="bad-" + field + value, **{field: value})
+        assert client.post("/api/internal/evidence", headers=HEADERS, json=bad).status_code == 422

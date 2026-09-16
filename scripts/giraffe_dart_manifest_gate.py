@@ -43,7 +43,24 @@ def canonical_bytes(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def control_contract(run_key: str, summaries: list[dict]) -> dict:
+def fetch_research_backlog() -> list[dict]:
+    """Read the pending cursor before constructing this run's immutable union."""
+    base, key = os.environ.get("GIRAFFE_URL", "").strip().rstrip("/"), os.environ.get("RESEARCH_CONTROL_KEY", "")
+    if not base or not key:
+        raise ManifestError("GIRAFFE_URL and RESEARCH_CONTROL_KEY are required for durable backlog")
+    request = urllib.request.Request(base + "/api/internal/research-backlog", headers={"X-Research-Control-Key": key})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response: value = json.load(response)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as exc:
+        raise ManifestError("durable research backlog read failed") from exc
+    items = value.get("items") if isinstance(value, dict) and value.get("schema_version") == "giraffe-research-backlog-v1" else None
+    if (not isinstance(items, list) or any(not isinstance(item, dict) or not isinstance(item.get("identity"), str) for item in items)
+            or [item["identity"] for item in items] != sorted(item["identity"] for item in items)):
+        raise ManifestError("durable research backlog response invalid")
+    return items
+
+
+def control_contract(run_key: str, summaries: list[dict], carry_forward: list[dict] | None = None) -> dict:
     sources = []
     for summary in summaries:
         control_date = summary.get("date")
@@ -87,13 +104,28 @@ def control_contract(run_key: str, summaries: list[dict]) -> dict:
                             "receipt_source_date": source_date})
         if packet_receipts != candidate_receipts:
             raise ManifestError("DART candidate/packet receipt sets do not match")
+    carry_forward = carry_forward or []
+    carry_identities = []
+    for item in carry_forward:
+        identity, kind, payload = item.get("identity"), item.get("kind"), item.get("payload")
+        if not isinstance(identity, str) or identity in carry_identities or kind not in {"dart", "discovery"}:
+            raise ManifestError("durable research backlog item invalid")
+        carry_identities.append(identity)
+        if kind == "dart":
+            if not isinstance(payload, dict) or set(payload) != {"rcp_no", "date", "receipt_source_date", "packet_path", "packet_sha256"}:
+                raise ManifestError("durable DART backlog source invalid")
+            metadata = completed_packet(Path(payload["packet_path"]), payload["rcp_no"], expected_control_date=payload["date"])
+            if metadata is None or payload["rcp_no"] in {item["rcp_no"] for item in sources}:
+                raise ManifestError("durable DART backlog packet unavailable")
+            sources.append(payload)
     sources.sort(key=lambda item: item["rcp_no"])
     receipts = [item["rcp_no"] for item in sources]
     if len(receipts) != len(set(receipts)):
         raise ManifestError("duplicate DART receipt across control dates")
-    return {"schema_version": "giraffe-research-control-v1", "run_key": run_key,
+    return {"schema_version": "giraffe-research-control-v2", "run_key": run_key,
             "dates": [item["date"] for item in summaries], "source_valid": True,
-            "expected_rcp_nos": receipts, "control_count": len(receipts), "sources": sources}
+            "expected_rcp_nos": receipts, "control_count": len(receipts), "sources": sources,
+            "carry_forward": sorted(carry_identities)}
 
 
 def rerun_suffix(version: str) -> str:
@@ -224,7 +256,12 @@ def main() -> int:
         return 2
     today = summaries[-1]["date"]
     run_key = research_run_key(today, rerun)
-    contract = control_contract(run_key, summaries)
+    try:
+        carry_forward = fetch_research_backlog()
+    except ManifestError as exc:
+        print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": False, "error": str(exc)}, ensure_ascii=False))
+        return 2
+    contract = control_contract(run_key, summaries, carry_forward)
     digest = hashlib.sha256(canonical_bytes(contract)).hexdigest()
     CONTROL_ROOT.mkdir(parents=True, exist_ok=True)
     contract_path = CONTROL_ROOT / f"{run_key}.json"
