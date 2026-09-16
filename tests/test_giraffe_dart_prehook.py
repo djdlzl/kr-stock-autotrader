@@ -225,6 +225,7 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             "kind_krx", "issuer_ir_newsroom", "reputable_media", "source_published_at",
             "evidence_source_published_at", "DART `rcept_dt`는 date-only", "economic_disposition",
             "발표시각 미확인은 경제 검토 생략 사유가 아니다", "미래 가격 반응은 사용 금지",
+            "단일 `web_search` backend 오류로 lane을 즉시 닫지 않는다", "최소 3회", "direct-domain",
         ):
             self.assertIn(required, prompt)
 
