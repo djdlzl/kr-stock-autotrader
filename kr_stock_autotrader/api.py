@@ -7,10 +7,11 @@ import re
 import threading
 import time as monotonic_time
 from contextlib import contextmanager
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -512,7 +513,7 @@ def _safe_research_scheduler_finish(run_key: str, start_detail: object, data: ob
     if not isinstance(receipt, dict) or set(receipt) != required or receipt.get("schema_version") != "giraffe-research-completion-v1": raise HTTPException(422, "invalid research completion receipt")
     fields = {name: _nonnegative_int(receipt[name]) for name in required - {"schema_version", "run_key", "control_contract_sha256", "reviewed_rcp_nos", "coverage_lanes"}}
     reviewed = receipt.get("reviewed_rcp_nos"); expected = commitment["control_contract"]["expected_rcp_nos"]
-    if (any(value is None for value in fields.values()) or not _valid_coverage_lanes(receipt["coverage_lanes"])
+    if (any(value is None for value in fields.values()) or not _valid_coverage_lanes(receipt["coverage_lanes"], run_key)
             or receipt["run_key"] != run_key or receipt["control_contract_sha256"] != commitment["control_contract_sha256"]
             or not isinstance(reviewed, list) or reviewed != expected or reviewed != sorted(reviewed) or len(reviewed) != len(set(reviewed))): raise HTTPException(422, "research completion does not match start commitment")
     fields = {name: int(value) for name, value in fields.items()}; control = len(expected)
@@ -527,54 +528,99 @@ def _nonnegative_int(value: object) -> int | None:
 
 _COVERAGE_LANE_NAMES = frozenset({"kind_krx", "issuer_ir_newsroom", "reputable_media"})
 _COVERAGE_LANE_FIELDS = frozenset({"executed", "query_count", "checked_url_count", "source_valid_count", "candidate_count", "coverage_error_count", "queries", "checked_sources"})
-_CHECKED_SOURCE_FIELDS = frozenset({"url", "source_valid", "published_at", "retrieved_at", "outcome"})
+_CHECKED_SOURCE_FIELDS = frozenset({"url", "source_valid", "published_at", "retrieved_at", "outcome", "economic_disposition", "economic_reason"})
 _COVERAGE_OUTCOMES = frozenset({"candidate", "negative_evidence", "not_material", "timing_ineligible", "invalid_source"})
+_CANDIDATE_DISPOSITIONS = frozenset({"eligible", "rejected", "hold"})
 _MAX_COVERAGE_QUERIES = 100
 _MAX_COVERAGE_SOURCES = 100
 _MAX_COVERAGE_QUERY_LENGTH = 500
 _MAX_COVERAGE_URL_LENGTH = 2000
 
 
-def _timezone_aware_iso_timestamp(value: object, *, nullable: bool = False) -> bool:
-    if value is None:
-        return nullable
+def _parse_timezone_aware_iso_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str) or not value or len(value) > 64 or any(ord(char) < 32 or ord(char) == 127 for char in value):
-        return False
+        return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
-        return False
-    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+        return None
+    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+
+
+def _timezone_aware_iso_timestamp(value: object, *, nullable: bool = False) -> bool:
+    return value is None and nullable or _parse_timezone_aware_iso_timestamp(value) is not None
+
+
+def _normalized_percent_component(value: str) -> str | None:
+    pieces: list[str] = []; index = 0
+    while index < len(value):
+        character = value[index]
+        if character != "%":
+            pieces.append(character); index += 1; continue
+        if index + 2 >= len(value) or not re.fullmatch(r"[0-9A-Fa-f]{2}", value[index + 1:index + 3]):
+            return None
+        code = int(value[index + 1:index + 3], 16); decoded = chr(code)
+        pieces.append(decoded if decoded.isascii() and (decoded.isalnum() or decoded in "-._~") else "%" + value[index + 1:index + 3].upper())
+        index += 3
+    return "".join(pieces)
+
+
+def _canonical_coverage_url(value: object) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > _MAX_COVERAGE_URL_LENGTH or any(ord(char) <= 32 or ord(char) == 127 for char in value):
+        return None
+    try:
+        parsed = urlsplit(value); host = parsed.hostname; port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or host is None or parsed.username is not None or parsed.password is not None or parsed.fragment:
+        return None
+    try:
+        canonical_host = host.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+    if not canonical_host:
+        return None
+    if ":" in canonical_host:
+        canonical_host = "[" + canonical_host + "]"
+    path = _normalized_percent_component(parsed.path); query = _normalized_percent_component(parsed.query)
+    if path is None or query is None:
+        return None
+    hostport = canonical_host if port in (None, 443) else canonical_host + ":" + str(port)
+    return urlunsplit(("https", hostport, "" if path in ("", "/") else path, query, ""))
 
 
 def _valid_coverage_url(value: object) -> bool:
-    if not isinstance(value, str) or not value or len(value) > _MAX_COVERAGE_URL_LENGTH or any(ord(char) < 32 or ord(char) == 127 for char in value):
-        return False
-    try:
-        parsed = urlsplit(value)
-        host = parsed.hostname
-        port = parsed.port
-    except ValueError:
-        return False
-    return (parsed.scheme == "https" and host is not None and parsed.username is None
-            and parsed.password is None and not parsed.fragment)
+    return _canonical_coverage_url(value) is not None
 
 
-def _valid_checked_source(value: object) -> bool:
+def _valid_checked_source(value: object, cutoff: datetime) -> bool:
     if not isinstance(value, dict) or set(value) != _CHECKED_SOURCE_FIELDS:
         return False
     source_valid, outcome = value.get("source_valid"), value.get("outcome")
-    if not isinstance(source_valid, bool) or outcome not in _COVERAGE_OUTCOMES or not _valid_coverage_url(value.get("url")) or not _timezone_aware_iso_timestamp(value.get("retrieved_at")):
+    retrieved_at = _parse_timezone_aware_iso_timestamp(value.get("retrieved_at"))
+    if not isinstance(source_valid, bool) or outcome not in _COVERAGE_OUTCOMES or not _valid_coverage_url(value.get("url")) or retrieved_at is None:
         return False
-    if source_valid:
-        return outcome != "invalid_source" and _timezone_aware_iso_timestamp(value.get("published_at"))
-    return outcome == "invalid_source" and value.get("published_at") is None
+    disposition, reason = value.get("economic_disposition"), value.get("economic_reason")
+    if outcome == "candidate":
+        if disposition not in _CANDIDATE_DISPOSITIONS or not isinstance(reason, str) or reason.strip() != reason or not 0 < len(reason) <= 1000:
+            return False
+    elif disposition is not None or reason is not None:
+        return False
+    if not source_valid:
+        return outcome == "invalid_source" and value.get("published_at") is None
+    published_at = _parse_timezone_aware_iso_timestamp(value.get("published_at"))
+    if outcome == "invalid_source" or published_at is None or retrieved_at.astimezone(ZoneInfo("UTC")) < published_at.astimezone(ZoneInfo("UTC")):
+        return False
+    published_utc = published_at.astimezone(ZoneInfo("UTC")); cutoff_utc = cutoff.astimezone(ZoneInfo("UTC"))
+    return ((outcome in {"candidate", "negative_evidence", "not_material"} and published_utc <= cutoff_utc)
+            or (outcome == "timing_ineligible" and published_utc > cutoff_utc))
 
 
-def _valid_coverage_lanes(value: object) -> bool:
+def _valid_coverage_lanes(value: object, run_key: str) -> bool:
     """Persist bounded query and source audit records with derived coverage counts."""
     if not isinstance(value, dict) or set(value) != _COVERAGE_LANE_NAMES:
         return False
+    cutoff = datetime.combine(_research_run_date(run_key), time(7), tzinfo=ZoneInfo("Asia/Seoul"))
     for lane in value.values():
         if not isinstance(lane, dict) or set(lane) != _COVERAGE_LANE_FIELDS or lane.get("executed") is not True:
             return False
@@ -585,9 +631,9 @@ def _valid_coverage_lanes(value: object) -> bool:
                 or not all(isinstance(query, str) and query.strip() == query and 0 < len(query) <= _MAX_COVERAGE_QUERY_LENGTH for query in queries)
                 or len(set(queries)) != len(queries)
                 or not isinstance(checked_sources, list) or not 0 < len(checked_sources) <= _MAX_COVERAGE_SOURCES
-                or not all(_valid_checked_source(source) for source in checked_sources)):
+                or not all(_valid_checked_source(source, cutoff) for source in checked_sources)):
             return False
-        urls = [source["url"] for source in checked_sources]
+        urls = [_canonical_coverage_url(source["url"]) for source in checked_sources]
         if len(set(urls)) != len(urls):
             return False
         valid_count = sum(source["source_valid"] for source in checked_sources)
@@ -1493,6 +1539,21 @@ def scheduler_latest(kind: str, date: str | None = None, _: None = Depends(requi
         if not item: raise HTTPException(404,'scheduler run not found')
         result=dict(item); result['detail']=json.loads(result['detail']); return result
     finally: db.close()
+
+
+@app.get('/api/internal/scheduler-runs/{run_key}')
+def research_scheduler_run_exact(run_key: str, _: None = Depends(require_research_control_key)):
+    """Prehook-control readers retrieve precisely one canonical or versioned run."""
+    if not _is_research_run(run_key, 'research'):
+        raise HTTPException(422, 'invalid research run key')
+    db = connect()
+    try:
+        item = db.execute("SELECT * FROM scheduler_runs WHERE run_key=? AND kind='research'", (run_key,)).fetchone()
+        if not item:
+            raise HTTPException(404, 'scheduler run not found')
+        result = dict(item); result['detail'] = json.loads(result['detail']); return result
+    finally:
+        db.close()
 
 @app.get('/api/internal/cards')
 def internal_cards(missing: bool = False, _: None = Depends(require_internal_api_key)):

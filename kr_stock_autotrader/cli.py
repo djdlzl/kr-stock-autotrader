@@ -3,11 +3,12 @@ import argparse, json, os
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-def call(method,path,payload=None):
-    base=os.getenv('GIRAFFE_URL','http://127.0.0.1:8000').rstrip('/'); key=os.getenv('INTERNAL_API_KEY','')
-    if not key: raise SystemExit('INTERNAL_API_KEY is required')
+def call(method,path,payload=None,*,research_control=False):
+    base=os.getenv('GIRAFFE_URL','http://127.0.0.1:8000').rstrip('/'); key=os.getenv('RESEARCH_CONTROL_KEY' if research_control else 'INTERNAL_API_KEY','')
+    if not key: raise SystemExit('RESEARCH_CONTROL_KEY is required' if research_control else 'INTERNAL_API_KEY is required')
     body=None if payload is None else json.dumps(payload,ensure_ascii=False).encode()
-    req=Request(base+path,data=body,method=method,headers={'X-Internal-API-Key':key,'Content-Type':'application/json'})
+    header='X-Research-Control-Key' if research_control else 'X-Internal-API-Key'
+    req=Request(base+path,data=body,method=method,headers={header:key,'Content-Type':'application/json'})
     with urlopen(req,timeout=20) as r:return json.load(r)
 def main(argv=None):
     p=argparse.ArgumentParser(prog='python -m kr_stock_autotrader.cli'); s=p.add_subparsers(dest='cmd',required=True)
@@ -22,6 +23,7 @@ def main(argv=None):
     a=s.add_parser('scheduler-start');a.add_argument('run_key');a.add_argument('kind')
     a=s.add_parser('scheduler-finish');a.add_argument('run_key');a.add_argument('status');a.add_argument('--count',type=int,default=0);a.add_argument('--detail',default='{}')
     a=s.add_parser('scheduler-latest');a.add_argument('kind');a.add_argument('--date',required=True)
+    a=s.add_parser('scheduler-readback');a.add_argument('run_key')
     x=p.parse_args(argv)
     if x.cmd=='today-evidence': out=call('GET','/api/internal/evidence?'+urlencode({'date':x.date}))
     elif x.cmd=='evidence-detail': out=call('GET','/api/internal/evidence/'+x.evidence_id)
@@ -40,6 +42,7 @@ def main(argv=None):
     elif x.cmd=='scheduler-start':
         out=call('POST',f'/api/internal/scheduler-runs/{x.run_key}/start',{'kind':x.kind})
     elif x.cmd=='scheduler-latest': out=call('GET','/api/internal/scheduler-runs/latest?'+urlencode({'kind':x.kind,'date':x.date}))
+    elif x.cmd=='scheduler-readback': out=call('GET',f'/api/internal/scheduler-runs/{x.run_key}',research_control=True)
     elif x.cmd=='market-context': out=call('POST',f'/api/internal/cards/{x.card_id}/market-context',{'run_key':x.run_key,'as_of':x.as_of})
     else: out=call('POST',f'/api/internal/scheduler-runs/{x.run_key}/finish',{'status':x.status,'count':x.count,'detail':json.loads(x.detail)})
     print(json.dumps(out,ensure_ascii=False,sort_keys=True));return 0

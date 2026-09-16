@@ -61,7 +61,7 @@ def start(client, key, receipts=(), **commitment_kwargs):
     return contract, digest
 
 
-def coverage_lane(name, *, outcome="not_material", source_valid=True, published_at="2026-09-15T06:00:00+09:00"):
+def coverage_lane(name, *, outcome="not_material", source_valid=True, published_at="2026-09-15T06:00:00+09:00", retrieved_at="2026-09-16T07:00:00+09:00"):
     return {
         "executed": True,
         "query_count": 1,
@@ -74,8 +74,10 @@ def coverage_lane(name, *, outcome="not_material", source_valid=True, published_
             "url": f"https://example.com/{name}",
             "source_valid": source_valid,
             "published_at": published_at if source_valid else None,
-            "retrieved_at": "2026-09-16T07:00:00+09:00",
+            "retrieved_at": retrieved_at,
             "outcome": outcome,
+            "economic_disposition": None,
+            "economic_reason": None,
         }],
     }
 
@@ -89,7 +91,7 @@ def receipt(run_key, digest, receipts, **extra):
         "reviewed_rcp_nos": sorted(receipts), "source_error": 0, "store_error": 0,
         "coverage_error": 0, "rejected_after_evidence": control, "saved": 0,
         "existing": 0, "correction_stored": 0,
-        "coverage_lanes": {name: coverage_lane(name) for name in ("kind_krx", "issuer_ir_newsroom", "reputable_media")},
+        "coverage_lanes": {name: coverage_lane(name, published_at=f"{run_key[9:19]}T06:00:00+09:00", retrieved_at=f"{run_key[9:19]}T07:00:00+09:00") for name in ("kind_krx", "issuer_ir_newsroom", "reputable_media")},
     }
     value.update(extra)
     return value
@@ -189,6 +191,74 @@ def test_research_done_requires_durable_inline_query_source_audit_and_readback()
     latest = client.get("/api/internal/scheduler-runs/latest?kind=research&date=2026-09-18", headers=HEADERS)
     assert latest.status_code == 200
     assert latest.json()["detail"]["detail"]["completion_receipt"]["coverage_lanes"] == valid["coverage_lanes"]
+
+
+def test_coverage_cutoff_canonical_urls_and_candidate_economics_are_enforced():
+    client = TestClient(app); key = "research-2026-09-16-0700-kst"
+    _, digest = start(client, key, [])
+
+    def finish(value):
+        return client.post(f"/api/internal/scheduler-runs/{key}/finish", json={"status": "done", "count": 0, "detail": {"completion_receipt": value}}, headers=HEADERS)
+
+    # Candidate-side evidence is admitted at the 07:00 KST instant, including
+    # its UTC equivalent, but timing-ineligible must be strictly later.
+    exact = receipt(key, digest, [])
+    source = exact["coverage_lanes"]["kind_krx"]["checked_sources"][0]
+    source.update({"outcome": "candidate", "published_at": "2026-09-15T22:00:00Z", "economic_disposition": "eligible", "economic_reason": "published before this run cutoff and satisfies the stated economics"})
+    exact["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
+    assert finish(exact).status_code == 200
+    no_economics = receipt(key, digest, [])
+    no_economics["coverage_lanes"]["kind_krx"]["checked_sources"][0]["outcome"] = "candidate"
+    no_economics["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
+    assert finish(no_economics).status_code == 422
+    retrieved_before_publication = receipt(key, digest, [])
+    retrieved_before_publication["coverage_lanes"]["kind_krx"]["checked_sources"][0].update({"published_at": "2026-09-16T06:30:00+09:00", "retrieved_at": "2026-09-16T06:00:00+09:00"})
+    assert finish(retrieved_before_publication).status_code == 422
+
+    for outcome, published_at in (("candidate", "2026-09-16T07:01:00+09:00"), ("negative_evidence", "2026-09-16T07:01:00+09:00"), ("not_material", "2026-09-16T07:01:00+09:00"), ("timing_ineligible", "2026-09-16T06:59:00+09:00")):
+        value = receipt(key, digest, [])
+        source = value["coverage_lanes"]["kind_krx"]["checked_sources"][0]
+        source.update({"outcome": outcome, "published_at": published_at})
+        if outcome == "candidate":
+            source.update({"economic_disposition": "hold", "economic_reason": "needs evidence"}); value["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
+        assert finish(value).status_code == 422
+
+    for duplicate in ("https://EXAMPLE.com:443/kind_krx", "https://example.com./kind_krx", "https://example.com/%6b%69nd_krx"):
+        value = receipt(key, digest, [])
+        lane = value["coverage_lanes"]["kind_krx"]
+        lane["checked_sources"].append({**lane["checked_sources"][0], "url": duplicate})
+        lane.update({"checked_url_count": 2, "source_valid_count": 2})
+        assert finish(value).status_code == 422
+    value = receipt(key, digest, [])
+    lane = value["coverage_lanes"]["kind_krx"]
+    lane["checked_sources"][0]["url"] = "https://example.com/"
+    lane["checked_sources"].append({**lane["checked_sources"][0], "url": "https://example.com"})
+    lane.update({"checked_url_count": 2, "source_valid_count": 2})
+    assert finish(value).status_code == 422
+
+    for invalid_url in ("https://example .com/no", "https://example.com/a\tb", "https://example.com/a\nb", "https://example.com/a\x01b", "https://example.com/%zz"):
+        value = receipt(key, digest, [])
+        value["coverage_lanes"]["kind_krx"]["checked_sources"][0]["url"] = invalid_url
+        assert finish(value).status_code == 422
+
+    distinct = receipt(key, digest, [])
+    lane = distinct["coverage_lanes"]["kind_krx"]
+    lane["checked_sources"].append({**lane["checked_sources"][0], "url": "https://example.com/kind_krx?version=2"})
+    lane.update({"checked_url_count": 2, "source_valid_count": 2})
+    assert finish(distinct).status_code == 200
+
+
+def test_research_run_exact_readback_is_versioned_and_control_key_gated():
+    client = TestClient(app)
+    keys = ("research-2026-09-16-0700-kst", "research-2026-09-16-0700-kst-r1", "research-2026-09-16-0700-kst-r12")
+    for key in keys:
+        _, digest = start(client, key, [])
+        assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json={"status": "done", "count": 0, "detail": {"completion_receipt": receipt(key, digest, [])}}, headers=HEADERS).status_code == 200
+        response = client.get(f"/api/internal/scheduler-runs/{key}", headers=CONTROL_HEADERS)
+        assert response.status_code == 200 and response.json()["run_key"] == key
+    assert client.get("/api/internal/scheduler-runs/research-2026-09-16-0700-kst-r2", headers=CONTROL_HEADERS).status_code == 404
+    assert client.get("/api/internal/scheduler-runs/research-nope", headers=CONTROL_HEADERS).status_code == 422
+    assert client.get(f"/api/internal/scheduler-runs/{keys[0]}", headers=HEADERS).status_code == 403
 
 
 def test_exact_observed_forged_done_control_exploit_is_rejected_and_keeps_started():
