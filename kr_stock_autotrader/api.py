@@ -7,6 +7,7 @@ import re
 import threading
 import time as monotonic_time
 from contextlib import contextmanager
+from urllib.parse import urlsplit
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal
@@ -524,21 +525,76 @@ def _nonnegative_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+_COVERAGE_LANE_NAMES = frozenset({"kind_krx", "issuer_ir_newsroom", "reputable_media"})
+_COVERAGE_LANE_FIELDS = frozenset({"executed", "query_count", "checked_url_count", "source_valid_count", "candidate_count", "coverage_error_count", "queries", "checked_sources"})
+_CHECKED_SOURCE_FIELDS = frozenset({"url", "source_valid", "published_at", "retrieved_at", "outcome"})
+_COVERAGE_OUTCOMES = frozenset({"candidate", "negative_evidence", "not_material", "timing_ineligible", "invalid_source"})
+_MAX_COVERAGE_QUERIES = 100
+_MAX_COVERAGE_SOURCES = 100
+_MAX_COVERAGE_QUERY_LENGTH = 500
+_MAX_COVERAGE_URL_LENGTH = 2000
+
+
+def _timezone_aware_iso_timestamp(value: object, *, nullable: bool = False) -> bool:
+    if value is None:
+        return nullable
+    if not isinstance(value, str) or not value or len(value) > 64 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _valid_coverage_url(value: object) -> bool:
+    if not isinstance(value, str) or not value or len(value) > _MAX_COVERAGE_URL_LENGTH or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    return (parsed.scheme == "https" and host is not None and parsed.username is None
+            and parsed.password is None and not parsed.fragment)
+
+
+def _valid_checked_source(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != _CHECKED_SOURCE_FIELDS:
+        return False
+    source_valid, outcome = value.get("source_valid"), value.get("outcome")
+    if not isinstance(source_valid, bool) or outcome not in _COVERAGE_OUTCOMES or not _valid_coverage_url(value.get("url")) or not _timezone_aware_iso_timestamp(value.get("retrieved_at")):
+        return False
+    if source_valid:
+        return outcome != "invalid_source" and _timezone_aware_iso_timestamp(value.get("published_at"))
+    return outcome == "invalid_source" and value.get("published_at") is None
+
+
 def _valid_coverage_lanes(value: object) -> bool:
-    """Require independent discovery evidence; a failed lane cannot become no discovery."""
-    lane_names = {"kind_krx", "issuer_ir_newsroom", "reputable_media"}
-    lane_fields = {"executed", "query_count", "checked_url_count", "source_valid_count", "candidate_count", "coverage_error_count"}
-    if not isinstance(value, dict) or set(value) != lane_names:
+    """Persist bounded query and source audit records with derived coverage counts."""
+    if not isinstance(value, dict) or set(value) != _COVERAGE_LANE_NAMES:
         return False
     for lane in value.values():
-        if not isinstance(lane, dict) or set(lane) != lane_fields or lane.get("executed") is not True:
+        if not isinstance(lane, dict) or set(lane) != _COVERAGE_LANE_FIELDS or lane.get("executed") is not True:
             return False
-        if any(_nonnegative_int(lane.get(field)) is None for field in lane_fields - {"executed"}):
+        if any(_nonnegative_int(lane.get(field)) is None for field in _COVERAGE_LANE_FIELDS - {"executed", "queries", "checked_sources"}):
             return False
-        if (lane["query_count"] <= 0 or lane["checked_url_count"] <= 0
-                or lane["source_valid_count"] <= 0
-                or lane["source_valid_count"] > lane["checked_url_count"]
-                or lane["coverage_error_count"] != 0):
+        queries, checked_sources = lane.get("queries"), lane.get("checked_sources")
+        if (not isinstance(queries, list) or not 0 < len(queries) <= _MAX_COVERAGE_QUERIES
+                or not all(isinstance(query, str) and query.strip() == query and 0 < len(query) <= _MAX_COVERAGE_QUERY_LENGTH for query in queries)
+                or len(set(queries)) != len(queries)
+                or not isinstance(checked_sources, list) or not 0 < len(checked_sources) <= _MAX_COVERAGE_SOURCES
+                or not all(_valid_checked_source(source) for source in checked_sources)):
+            return False
+        urls = [source["url"] for source in checked_sources]
+        if len(set(urls)) != len(urls):
+            return False
+        valid_count = sum(source["source_valid"] for source in checked_sources)
+        candidate_count = sum(source["outcome"] == "candidate" for source in checked_sources)
+        if (lane["query_count"] != len(queries) or lane["checked_url_count"] != len(checked_sources)
+                or lane["source_valid_count"] != valid_count or lane["candidate_count"] != candidate_count
+                or lane["query_count"] <= 0 or lane["source_valid_count"] <= 0 or lane["coverage_error_count"] != 0):
             return False
     return True
 

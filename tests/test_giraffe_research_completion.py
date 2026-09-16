@@ -61,6 +61,25 @@ def start(client, key, receipts=(), **commitment_kwargs):
     return contract, digest
 
 
+def coverage_lane(name, *, outcome="not_material", source_valid=True, published_at="2026-09-15T06:00:00+09:00"):
+    return {
+        "executed": True,
+        "query_count": 1,
+        "checked_url_count": 1,
+        "source_valid_count": int(source_valid),
+        "candidate_count": int(outcome == "candidate"),
+        "coverage_error_count": 0,
+        "queries": [f"{name} material disclosure 2026-09-15"],
+        "checked_sources": [{
+            "url": f"https://example.com/{name}",
+            "source_valid": source_valid,
+            "published_at": published_at if source_valid else None,
+            "retrieved_at": "2026-09-16T07:00:00+09:00",
+            "outcome": outcome,
+        }],
+    }
+
+
 def receipt(run_key, digest, receipts, **extra):
     control = len(receipts)
     value = {
@@ -70,11 +89,7 @@ def receipt(run_key, digest, receipts, **extra):
         "reviewed_rcp_nos": sorted(receipts), "source_error": 0, "store_error": 0,
         "coverage_error": 0, "rejected_after_evidence": control, "saved": 0,
         "existing": 0, "correction_stored": 0,
-        "coverage_lanes": {
-            name: {"executed": True, "query_count": 1, "checked_url_count": 1,
-                   "source_valid_count": 1, "candidate_count": 0, "coverage_error_count": 0}
-            for name in ("kind_krx", "issuer_ir_newsroom", "reputable_media")
-        },
+        "coverage_lanes": {name: coverage_lane(name) for name in ("kind_krx", "issuer_ir_newsroom", "reputable_media")},
     }
     value.update(extra)
     return value
@@ -125,6 +140,55 @@ def test_research_done_requires_exact_coverage_lanes():
     assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 422
     payload = {"status": "done", "count": 0, "detail": {"completion_receipt": valid}}
     assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 200
+
+
+def test_research_done_requires_durable_inline_query_source_audit_and_readback():
+    client = TestClient(app); key = "research-2026-09-18-0700-kst"
+    _, digest = start(client, key, [])
+
+    counts_only = receipt(key, digest, [])
+    for lane in counts_only["coverage_lanes"].values():
+        lane.pop("queries"); lane.pop("checked_sources")
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json={"status": "done", "count": 0, "detail": {"completion_receipt": counts_only}}, headers=HEADERS).status_code == 422
+
+    variants = []
+    def invalid(mutator):
+        value = receipt(key, digest, [])
+        mutator(value["coverage_lanes"]["kind_krx"])
+        variants.append(value)
+
+    invalid(lambda lane: lane.update({"unexpected": True}))
+    invalid(lambda lane: lane.pop("queries"))
+    invalid(lambda lane: lane.update({"query_count": 2}))
+    invalid(lambda lane: lane.update({"queries": [""]}))
+    invalid(lambda lane: lane.update({"queries": ["x" * 501]}))
+    invalid(lambda lane: lane.update({"queries": [f"query {n}" for n in range(101)], "query_count": 101}))
+    invalid(lambda lane: lane.update({"queries": [lane for lane in ["same", "same"]], "query_count": 2}))
+    invalid(lambda lane: lane["checked_sources"][0].update({"url": "http://example.com/no"}))
+    invalid(lambda lane: lane["checked_sources"][0].update({"url": "/relative"}))
+    invalid(lambda lane: lane["checked_sources"][0].update({"url": "https://user:pass@example.com/no"}))
+    invalid(lambda lane: lane["checked_sources"][0].update({"url": "https://example.com/no#fragment"}))
+    invalid(lambda lane: lane.update({"checked_sources": [lane["checked_sources"][0], dict(lane["checked_sources"][0])], "checked_url_count": 2, "source_valid_count": 2}))
+    invalid(lambda lane: lane.update({"checked_sources": [{**lane["checked_sources"][0], "url": f"https://example.com/{n}"} for n in range(101)], "checked_url_count": 101, "source_valid_count": 101}))
+    invalid(lambda lane: lane["checked_sources"][0].update({"source_valid": "true"}))
+    invalid(lambda lane: lane["checked_sources"][0].update({"published_at": "2026-09-15T06:00:00"}))
+    invalid(lambda lane: lane["checked_sources"][0].update({"retrieved_at": "not-a-timestamp"}))
+    invalid(lambda lane: lane["checked_sources"][0].update({"retrieved_at": "2026-09-16T07:00:00"}))
+    invalid(lambda lane: lane["checked_sources"][0].update({"outcome": "made_up"}))
+    invalid(lambda lane: lane["checked_sources"][0].update({"outcome": "invalid_source"}))
+    invalid(lambda lane: lane.update({"candidate_count": 1}))
+    invalid(lambda lane: lane["checked_sources"][0].update({"extra": "no"}))
+
+    for value in variants:
+        payload = {"status": "done", "count": 0, "detail": {"completion_receipt": value}}
+        assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 422
+
+    valid = receipt(key, digest, [])
+    response = client.post(f"/api/internal/scheduler-runs/{key}/finish", json={"status": "done", "count": 0, "detail": {"completion_receipt": valid}}, headers=HEADERS)
+    assert response.status_code == 200
+    latest = client.get("/api/internal/scheduler-runs/latest?kind=research&date=2026-09-18", headers=HEADERS)
+    assert latest.status_code == 200
+    assert latest.json()["detail"]["detail"]["completion_receipt"]["coverage_lanes"] == valid["coverage_lanes"]
 
 
 def test_exact_observed_forged_done_control_exploit_is_rejected_and_keeps_started():
