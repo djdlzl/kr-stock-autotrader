@@ -100,6 +100,20 @@ def test_checkpoint_rejects_cross_directory_symlink_and_corrupt_siblings(tmp_pat
     assert source.completed_packet(checkpoint, rcp) is None
 
 
+def test_checkpoint_reuses_receipt_in_explicit_later_control_date_without_weakening_containment(tmp_path):
+    rcp = "20260914000432"
+    control_date = "20260915"
+    packet = source.source_packet(rcp, fetch_from({
+        "main.do": (main_page(rcp), "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp),
+        "viewer.do": (b"<html><meta charset='utf-8'><body>valid correction disclosure source body</body></html>", "text/html; charset=utf-8", "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML"),
+    }))
+    checkpoint = source.write_packet(packet, tmp_path / control_date)
+
+    assert source.completed_packet(checkpoint, rcp, expected_control_date=control_date) is not None
+    assert source.completed_packet(checkpoint, rcp, expected_control_date=rcp[:8]) is None
+    assert source.completed_packet(checkpoint, rcp, expected_control_date="bad-date") is None
+
+
 def test_checkpoint_rederives_semantics_and_rejects_resealed_tampering(tmp_path):
     rcp = "20260911800823"
     packet = source.source_packet(rcp, fetch_from({

@@ -7,6 +7,7 @@ import json
 import hashlib
 import hmac
 import os
+import re
 import sys
 import urllib.request
 import urllib.error
@@ -44,17 +45,36 @@ def canonical_bytes(value: object) -> bytes:
 
 def control_contract(run_key: str, summaries: list[dict]) -> dict:
     sources = []
-    allowed_dates = [item["date"] for item in summaries]
     for summary in summaries:
+        control_date = summary.get("date")
+        candidates = summary.get("material_candidate_records")
+        if (not isinstance(control_date, str) or not re.fullmatch(r"\d{8}", control_date)
+                or not isinstance(candidates, list)):
+            raise ManifestError("DART source summary is invalid")
+        candidate_receipts = set()
+        for candidate in candidates:
+            rcp_no = candidate.get("rcp_no") if isinstance(candidate, dict) else None
+            rcept_dt = candidate.get("rcept_dt") if isinstance(candidate, dict) else None
+            if (not isinstance(rcp_no, str) or not re.fullmatch(r"\d{14}", rcp_no)
+                    or not isinstance(rcept_dt, str) or rcept_dt != control_date
+                    or rcp_no in candidate_receipts):
+                raise ManifestError("DART manifest candidate does not bind to the control date")
+            candidate_receipts.add(rcp_no)
         for packet_path in summary["source_packet_paths"]:
-            raw = Path(packet_path).read_bytes()
-            metadata = json.loads(raw)
-            rcp_no = metadata.get("rcp_no")
+            path = Path(packet_path)
+            if path.parent.name != control_date:
+                raise ManifestError("DART source packet path does not bind to the control date")
+            rcp_no = path.stem
+            metadata = completed_packet(path, rcp_no, expected_control_date=control_date)
+            if metadata is None:
+                raise ManifestError("DART source packet is incomplete or invalid")
             source_date = metadata.get("source_date")
-            if not isinstance(rcp_no, str) or source_date != rcp_no[:8] or source_date not in allowed_dates:
+            if rcp_no not in candidate_receipts or source_date != rcp_no[:8]:
                 raise ManifestError("DART source packet date does not match the control window")
-            sources.append({"rcp_no": rcp_no, "date": source_date, "packet_path": packet_path,
-                            "packet_sha256": hashlib.sha256(raw).hexdigest()})
+            raw = path.read_bytes()
+            sources.append({"rcp_no": rcp_no, "date": control_date, "packet_path": packet_path,
+                            "packet_sha256": hashlib.sha256(raw).hexdigest(),
+                            "receipt_source_date": source_date})
     sources.sort(key=lambda item: item["rcp_no"])
     receipts = [item["rcp_no"] for item in sources]
     if len(receipts) != len(set(receipts)):
@@ -139,7 +159,7 @@ def main() -> int:
                 rcp_no = candidate["rcp_no"]
                 try:
                     checkpoint = packet_dir / f"{rcp_no}.json"
-                    if completed_packet(checkpoint, rcp_no) is None:
+                    if completed_packet(checkpoint, rcp_no, expected_control_date=date) is None:
                         write_packet(fetch_with_retry(rcp_no), packet_dir)
                     source_packets.append(str(checkpoint))
                 except SourceError as exc:
@@ -154,6 +174,7 @@ def main() -> int:
                 "page_counts": manifest["page_counts"],
                 "unique_receipts": manifest["unique_receipts"],
                 "material_candidate_count": manifest["material_candidate_count"],
+                "material_candidate_records": manifest["material_candidate_records"],
                 "source_packet_paths": source_packets,
                 "source_valid_count": len(source_packets),
                 "source_error_count": len(source_errors),

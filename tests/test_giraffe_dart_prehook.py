@@ -31,6 +31,14 @@ def dart_page(current, pages, total, receipts, material_receipts=()):
     return {"status": "000", "total_count": str(total), "total_page": str(pages), "page_no": str(current), "page_count": "100", "list": rows}
 
 
+def valid_source_packet(gate, rcp_no):
+    main = (f"<html><meta charset='utf-8'><script>viewDoc('{rcp_no}','11577485','0','0','0','HTML','')</script></html>").encode()
+    viewer = b"<html><meta charset='utf-8'><body>valid DART disclosure source body for control test</body></html>"
+    main_url = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp_no
+    viewer_url = "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp_no + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML"
+    return sys.modules["giraffe_dart_source"].source_packet(rcp_no, lambda url: (main, "text/html; charset=utf-8", main_url) if "main.do" in url else (viewer, "text/html; charset=utf-8", viewer_url))
+
+
 class GiraffeDartPrehookTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -168,15 +176,60 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         dates = self.gate.target_dates(now)
         self.assertEqual(dates, ["20260914", "20260915"])
         with tempfile.TemporaryDirectory() as temp:
-            packet_path = pathlib.Path(temp) / "20260914001539.json"
-            packet_path.write_text(json.dumps({"rcp_no": "20260914001539", "source_date": "20260914"}), encoding="utf-8")
+            receipt = "20260914001539"
+            packet_path = self.gate.write_packet(valid_source_packet(self.gate, receipt), pathlib.Path(temp) / "20260914")
             contract = self.gate.control_contract(
                 "research-2026-09-15-0700-kst",
-                [{"date": "20260914", "source_packet_paths": [str(packet_path)]}, {"date": "20260915", "source_packet_paths": []}],
+                [{"date": "20260914", "material_candidate_records": [{"rcp_no": receipt, "rcept_dt": "20260914"}], "source_packet_paths": [str(packet_path)]}, {"date": "20260915", "material_candidate_records": [], "source_packet_paths": []}],
             )
         self.assertEqual(contract["dates"], dates)
-        self.assertEqual(contract["expected_rcp_nos"], ["20260914001539"])
+        self.assertEqual(contract["expected_rcp_nos"], [receipt])
         self.assertEqual(contract["sources"][0]["date"], "20260914")
+
+    def test_correction_receipt_uses_manifest_control_date_and_rejects_unsafe_bindings(self):
+        receipt, control_date = "20260914000432", "20260915"
+        candidate = {"rcp_no": receipt, "rcept_dt": control_date}
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            correction_path = self.gate.write_packet(valid_source_packet(self.gate, receipt), root / control_date)
+            correction_summary = [{"date": control_date, "material_candidate_records": [candidate], "source_packet_paths": [str(correction_path)]}]
+            contract = self.gate.control_contract("research-2026-09-15-0700-kst", correction_summary)
+            self.assertEqual(contract["sources"], [{"rcp_no": receipt, "date": control_date, "packet_path": str(correction_path), "packet_sha256": hashlib.sha256(correction_path.read_bytes()).hexdigest(), "receipt_source_date": "20260914"}])
+
+            wrong_path = self.gate.write_packet(valid_source_packet(self.gate, receipt), root / "20260914")
+            with self.assertRaisesRegex(self.gate.ManifestError, "path does not bind"):
+                self.gate.control_contract("research-2026-09-15-0700-kst", [{"date": control_date, "material_candidate_records": [candidate], "source_packet_paths": [str(wrong_path)]}])
+
+            metadata = json.loads(correction_path.read_text(encoding="utf-8"))
+            metadata["source_date"] = "20260915"
+            correction_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with self.assertRaisesRegex(self.gate.ManifestError, "incomplete or invalid"):
+                self.gate.control_contract("research-2026-09-15-0700-kst", correction_summary)
+
+    def test_duplicate_receipt_across_control_dates_fails_closed(self):
+        receipt = "20260914000432"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            first = self.gate.write_packet(valid_source_packet(self.gate, receipt), root / "20260914")
+            second = self.gate.write_packet(valid_source_packet(self.gate, receipt), root / "20260915")
+            summaries = [
+                {"date": "20260914", "material_candidate_records": [{"rcp_no": receipt, "rcept_dt": "20260914"}], "source_packet_paths": [str(first)]},
+                {"date": "20260915", "material_candidate_records": [{"rcp_no": receipt, "rcept_dt": "20260915"}], "source_packet_paths": [str(second)]},
+            ]
+            with self.assertRaisesRegex(self.gate.ManifestError, "duplicate DART receipt"):
+                self.gate.control_contract("research-2026-09-15-0700-kst", summaries)
+
+    def test_gate_reuses_correction_checkpoint_in_control_directory_without_refetch(self):
+        receipt, control_date = "20260914000432", "20260915"
+        def fake_collect(date):
+            return {"declared_total": 1, "declared_pages": 1, "pages_collected": 1, "page_counts": [1], "unique_receipts": 1, "material_candidate_count": 1, "material_candidate_records": [{"rcp_no": receipt, "rcept_dt": date}], "complete": True, "date": date}
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            self.gate.write_packet(valid_source_packet(self.gate, receipt), root / "sources" / control_date)
+            with patch.object(self.gate, "OUTPUT_ROOT", root / "manifests"), patch.object(self.gate, "SOURCE_ROOT", root / "sources"), patch.object(self.gate, "CONTROL_ROOT", root / "controls"), patch.object(self.gate, "target_dates", return_value=[control_date]), patch.object(self.gate, "check_card_prompt"), patch.object(self.gate, "collect_manifest", side_effect=fake_collect), patch.object(self.gate, "fetch_with_retry", side_effect=AssertionError("checkpoint must avoid refetch")) as fetch, patch.object(self.gate, "register_research_run"), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(self.gate.main(), 0)
+        fetch.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue())["control_contract"]["sources"][0]["date"], control_date)
 
     def test_gate_emits_giraffe_contract_for_previous_and_current_dates(self):
         def fake_collect(date):
@@ -184,15 +237,12 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                 "declared_total": 1, "declared_pages": 1, "pages_collected": 1,
                 "page_counts": [1], "unique_receipts": 1,
                 "material_candidate_count": 1,
-                "material_candidate_records": [{"rcp_no": date + "000001", "row_text": "단일판매ㆍ공급계약체결"}],
+                "material_candidate_records": [{"rcp_no": date + "000001", "rcept_dt": date, "row_text": "단일판매ㆍ공급계약체결"}],
                 "complete": True, "date": date,
             }
 
         def fake_packet(rcp):
-            raw, main_raw, text = b"viewer raw", b"main raw", "valid source"
-            return {"schema_version": "giraffe-dart-source-packet-v2", "rcp_no": rcp, "source_date": rcp[:8], "source_valid": True,
-                    "raw_sha256": hashlib.sha256(raw).hexdigest(), "raw_bytes": len(raw), "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
-                    "main_raw_sha256": hashlib.sha256(main_raw).hexdigest(), "main_raw_bytes": len(main_raw), "text": text, "_raw": raw, "_main_raw": main_raw}
+            return valid_source_packet(self.gate, rcp)
         with tempfile.TemporaryDirectory() as temp, patch.object(self.gate, "OUTPUT_ROOT", pathlib.Path(temp)), patch.object(self.gate, "SOURCE_ROOT", pathlib.Path(temp) / "sources"), patch.object(self.gate, "CONTROL_ROOT", pathlib.Path(temp) / "controls"), patch.object(self.gate, "collect_manifest", fake_collect), patch.object(self.gate, "fetch_with_retry", side_effect=fake_packet), patch.object(self.gate, "register_research_run") as register, patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "2026-08-31,20260901", "GIRAFFE_DART_RECOVERY_KEY": "test-recovery-key", "GIRAFFE_DART_RECOVERY_AUTHORIZATION": "314efdba6e4f3ccaefa6c3c8dd980615e2191ccdac90fbe34b6a22efad04ef9a"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(self.gate.main(), 0)
         register.assert_called_once()

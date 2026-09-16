@@ -180,10 +180,13 @@ def _capture_time_is_fresh(value: object, now: datetime) -> bool:
     return -MAX_FUTURE_CAPTURE_SKEW <= age <= MAX_CAPTURE_AGE
 
 
-def completed_packet(path: Path, rcp_no: str, *, now: datetime | None = None) -> dict | None:
-    """Resume only a packet re-derived from its raw DART responses, never metadata alone."""
+def completed_packet(path: Path, rcp_no: str, *, expected_control_date: str | None = None, now: datetime | None = None) -> dict | None:
+    """Resume only a raw-revalidated packet in its declared control-date directory."""
     try:
-        if not re.fullmatch(r"\d{14}", rcp_no) or path.is_symlink() or path.name != f"{rcp_no}.json" or path.parent.is_symlink() or path.parent.name != rcp_no[:8]: return None
+        if (not re.fullmatch(r"\d{14}", rcp_no) or path.is_symlink() or path.name != f"{rcp_no}.json"
+                or path.parent.is_symlink() or not re.fullmatch(r"\d{8}", path.parent.name)
+                or (expected_control_date is not None and (not re.fullmatch(r"\d{8}", expected_control_date) or path.parent.name != expected_control_date))):
+            return None
         directory = path.parent.resolve(strict=True)
         metadata = json.loads(path.read_text(encoding="utf-8"))
         raw_path, text_path, main_raw_path = (directory / f"{rcp_no}.viewer.raw", directory / f"{rcp_no}.viewer.txt", directory / f"{rcp_no}.main.raw")
