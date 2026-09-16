@@ -672,7 +672,7 @@ def _valid_candidate_evidence_bindings(db, coverage_lanes: dict, run_key: str, f
     if not evidence_dispositions:
         return True
     placeholders = ",".join("?" for _ in evidence_dispositions)
-    rows = db.execute(f"SELECT id,source_url,announcement_at FROM material_evidence WHERE id IN ({placeholders})", tuple(evidence_dispositions)).fetchall()
+    rows = db.execute(f"SELECT id,source_url,announcement_at,known_at FROM material_evidence WHERE id IN ({placeholders})", tuple(evidence_dispositions)).fetchall()
     evidence = {row["id"]: row for row in rows}
     if len(evidence) != len(evidence_dispositions):
         return False
@@ -682,9 +682,12 @@ def _valid_candidate_evidence_bindings(db, coverage_lanes: dict, run_key: str, f
             continue
         row = evidence[evidence_id]
         announcement_at = _parse_timezone_aware_iso_timestamp(row["announcement_at"])
+        known_at = _parse_timezone_aware_iso_timestamp(row["known_at"])
         published_at = _parse_timezone_aware_iso_timestamp(source["published_at"])
         if (_canonical_coverage_url(row["source_url"]) != _canonical_coverage_url(source["url"])
-                or announcement_at is None or published_at is None or announcement_at.astimezone(ZoneInfo("UTC")) > cutoff
+                or announcement_at is None or known_at is None or published_at is None
+                or announcement_at.astimezone(ZoneInfo("UTC")) > cutoff or known_at.astimezone(ZoneInfo("UTC")) > cutoff
+                or known_at.astimezone(ZoneInfo("UTC")) < announcement_at.astimezone(ZoneInfo("UTC"))
                 or announcement_at.astimezone(ZoneInfo("UTC")) != published_at.astimezone(ZoneInfo("UTC"))):
             return False
     return True

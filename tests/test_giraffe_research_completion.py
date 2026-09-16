@@ -317,6 +317,38 @@ def test_coverage_candidate_terminal_evidence_binding_and_cross_lane_dedupe():
     assert finish(rejected_with_evidence).status_code == 422
 
 
+def test_candidate_evidence_known_at_is_cutoff_bound_and_chronological():
+    """A stored candidate cannot use knowledge unavailable at the 07:00 run."""
+    client = TestClient(app)
+    evidence = client.post("/api/internal/evidence", headers=HEADERS, json={
+        "symbol": "005930", "kind": "news", "title": "known-at cutoff evidence", "summary": "material",
+        "source": "issuer", "source_url": "https://example.com/known-at-cutoff",
+        "announcement_at": "2026-09-16T06:00:00+09:00", "collected_at": "2026-09-16T07:00:00+09:00",
+        "known_at": "2026-09-16T06:00:00+09:00", "snapshot": {}, "dedupe_key": "candidate-known-at-cutoff",
+    })
+    assert evidence.status_code == 200
+
+    def finish(version, known_at):
+        key = f"research-2026-09-16-0700-kst-r{version}"
+        _, digest = start(client, key, [f"202609160000{version:02d}"])
+        db = api_module.connect()
+        try:
+            db.execute("UPDATE material_evidence SET known_at=? WHERE id=?", (known_at, evidence.json()["id"]))
+            db.commit()
+        finally:
+            db.close()
+        value = receipt(key, digest, [f"202609160000{version:02d}"], rejected_after_evidence=0, saved=1)
+        source = value["coverage_lanes"]["kind_krx"]["checked_sources"][0]
+        source.update({"url": "https://example.com/known-at-cutoff", "outcome": "candidate", "economic_disposition": "saved", "economic_reason": "durable candidate evidence", "evidence_id": evidence.json()["id"]})
+        value["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
+        return client.post(f"/api/internal/scheduler-runs/{key}/finish", json={"status": "done", "count": 1, "detail": {"completion_receipt": value}}, headers=HEADERS)
+
+    assert finish(2, "2026-09-16T07:00:00+09:00").status_code == 200
+    assert finish(3, "2026-09-15T22:00:00Z").status_code == 200
+    for version, known_at in ((4, "2026-09-16T07:00:01+09:00"), (5, "2026-09-16T07:00:00"), (6, "not-a-timestamp"), (7, "2026-09-16T05:59:59+09:00")):
+        assert finish(version, known_at).status_code == 422
+
+
 def test_research_run_exact_readback_is_versioned_and_control_key_gated():
     client = TestClient(app)
     keys = ("research-2026-09-16-0700-kst", "research-2026-09-16-0700-kst-r1", "research-2026-09-16-0700-kst-r12")
