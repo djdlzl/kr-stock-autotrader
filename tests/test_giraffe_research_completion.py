@@ -684,3 +684,87 @@ def test_backlog_seed_cleanup_and_canonical_seed_rollback_together(monkeypatch):
         assert db.execute("SELECT status FROM giraffe_research_backlog WHERE identity='dart:20260912009999'").fetchone()["status"] == "pending"
     finally:
         db.close()
+
+
+def test_backlog_readback_rolls_back_quarantine_and_seed_when_payload_is_poisoned(monkeypatch, tmp_path):
+    """No cursor mutation may commit until every returned payload is JSON-safe."""
+    import kr_stock_autotrader.db as db_module
+    from kr_stock_autotrader.db import connect
+
+    monkeypatch.setattr(db_module, "DATABASE_PATH", str(tmp_path / "atomic-backlog.db"))
+    bad_identity = "dart:legacy-poison"
+    seeded_identity = "dart:20260916009999"
+    db = connect()
+    try:
+        db.execute(
+            "INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,created_at) VALUES(?,?,?,?,?)",
+            (bad_identity, "dart", json.dumps({"rcp_no": "legacy-poison"}),
+             "incident-stale-packet-contract-2026-09-12-1747", "2026-09-16T07:00:00+09:00"),
+        )
+        db.execute(
+            "INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,created_at) VALUES(?,?,?,?,?)",
+            ("dart:poison-canonical", "dart", "{", "research-2026-09-16-0700-kst-r1", "2026-09-16T07:00:00+09:00"),
+        )
+        db.execute(
+            "INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?,?,?,?)",
+            ("research-2026-09-16-0700-kst-r2", "research", "error", "2026-09-16T07:00:00+09:00", json.dumps({
+                "control_commitment": {"control_contract": {"sources": [{"rcp_no": "20260916009999"}]}}
+            })),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/api/internal/research-backlog", headers=CONTROL_HEADERS
+    )
+    assert response.status_code == 500
+    db = connect()
+    try:
+        assert db.execute("SELECT status FROM giraffe_research_backlog WHERE identity=?", (bad_identity,)).fetchone()["status"] == "pending"
+        assert db.execute("SELECT identity FROM giraffe_research_backlog WHERE identity=?", (seeded_identity,)).fetchone() is None
+    finally:
+        db.close()
+
+
+def test_backlog_seed_requires_a_real_calendar_date_and_preserves_valid_reruns(monkeypatch, tmp_path):
+    import kr_stock_autotrader.db as db_module
+    from kr_stock_autotrader.db import connect
+
+    monkeypatch.setattr(db_module, "DATABASE_PATH", str(tmp_path / "calendar-backlog.db"))
+    invalid_keys = [
+        "research-2026-99-99-0700-kst",
+        "research-2026-02-29-0700-kst-r1",
+        "research-2026-09-16-0700-kst-r0",
+    ]
+    valid_keys = ["research-2024-02-29-0700-kst-r1", "research-2026-09-16-0700-kst-r2"]
+    db = connect()
+    try:
+        for index, run_key in enumerate(invalid_keys + valid_keys):
+            db.execute(
+                "INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,created_at) VALUES(?,?,?,?,?)",
+                (f"dart:calendar-{index}", "dart", json.dumps({"rcp_no": f"calendar-{index}"}), run_key,
+                 "2026-09-16T07:00:00+09:00"),
+            )
+        db.execute(
+            "INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?,?,?,?)",
+            ("research-2026-99-99-0700-kst", "research", "error", "2026-09-16T07:00:00+09:00", json.dumps({
+                "control_commitment": {"control_contract": {"sources": [{"rcp_no": "20260916999999"}]}}
+            })),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = TestClient(app).get("/api/internal/research-backlog", headers=CONTROL_HEADERS)
+    assert response.status_code == 200
+    assert {item["first_run_key"] for item in response.json()["items"]} == set(valid_keys)
+    db = connect()
+    try:
+        rows = db.execute("SELECT identity,status FROM giraffe_research_backlog ORDER BY identity").fetchall()
+        statuses = {row["identity"]: row["status"] for row in rows}
+        assert all(statuses[f"dart:calendar-{index}"] == "terminal" for index in range(len(invalid_keys)))
+        assert all(statuses[f"dart:calendar-{index}"] == "pending" for index in range(len(invalid_keys), len(invalid_keys) + len(valid_keys)))
+        assert "dart:20260916999999" not in statuses
+    finally:
+        db.close()

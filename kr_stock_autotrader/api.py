@@ -433,7 +433,14 @@ def _require_0800_calendar_admission(day: date) -> None:
 
 
 def _is_research_run(run_key: str, kind: object) -> bool:
-    return kind == "research" and _RESEARCH_RUN_KEY.fullmatch(run_key) is not None
+    """Admit only grammar-conformant keys that name a real calendar day."""
+    if kind != "research" or _RESEARCH_RUN_KEY.fullmatch(run_key) is None:
+        return False
+    try:
+        _research_run_date(run_key)
+    except HTTPException:
+        return False
+    return True
 
 
 def _research_run_date(run_key: str) -> date:
@@ -513,7 +520,7 @@ def _seed_unfinished_research_backlog(db) -> None:
     for row in db.execute(
         "SELECT identity,first_run_key FROM giraffe_research_backlog WHERE status='pending'"
     ).fetchall():
-        if _RESEARCH_RUN_KEY.fullmatch(row['first_run_key']) is None:
+        if not _is_research_run(row['first_run_key'], 'research'):
             db.execute(
                 "UPDATE giraffe_research_backlog "
                 "SET status='terminal',terminal_disposition='invalid_noncanonical_seed',"
@@ -1765,8 +1772,18 @@ def research_backlog(_: None = Depends(require_research_control_key)):
     try:
         _seed_unfinished_research_backlog(db)
         rows = db.execute("SELECT identity,kind,payload,original_announcement_at,first_run_key FROM giraffe_research_backlog WHERE status='pending' ORDER BY identity").fetchall()
+        response = {
+            'schema_version': 'giraffe-research-backlog-v1',
+            'items': [dict(row, payload=json.loads(row['payload'])) for row in rows],
+        }
+        # Render validation belongs inside the transaction: non-finite JSON values
+        # would otherwise fail only after a committed quarantine/seed mutation.
+        json.dumps(response, ensure_ascii=False, allow_nan=False)
         db.commit()
-        return {'schema_version': 'giraffe-research-backlog-v1', 'items': [dict(row, payload=json.loads(row['payload'])) for row in rows]}
+        return response
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
