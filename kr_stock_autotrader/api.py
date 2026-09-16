@@ -454,6 +454,29 @@ def _research_run_date(run_key: str) -> date:
         raise HTTPException(422, "invalid research run key") from exc
 
 
+def _research_run_order(run_key: object) -> tuple[date, int] | None:
+    """Return the closed chronological order for a canonical research run."""
+    match = _RESEARCH_RUN_KEY.fullmatch(run_key) if isinstance(run_key, str) else None
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y-%m-%d").date(), int(match.group(2) or 0)
+    except ValueError:
+        return None
+
+
+def _is_terminal_prior_research_run(db, evidence_run_key: object, completing_run_key: str) -> bool:
+    """Manual evidence may only cross into a strictly later terminal run."""
+    evidence_order = _research_run_order(evidence_run_key)
+    completing_order = _research_run_order(completing_run_key)
+    if evidence_order is None or completing_order is None or evidence_order >= completing_order:
+        return False
+    return db.execute(
+        "SELECT 1 FROM scheduler_runs WHERE run_key=? AND kind='research' AND status IN ('done','error')",
+        (evidence_run_key,),
+    ).fetchone() is not None
+
+
 def _canonical_json(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -666,7 +689,7 @@ def _discovery_evidence_matches_run(evidence: dict, expected: dict, run_key: str
     )
 
 
-def _discovery_evidence_matches_prior_manual_catch_up(evidence: dict, expected: dict, run_key: str, *, prior_run_exists: bool) -> bool:
+def _discovery_evidence_matches_prior_manual_catch_up(evidence: dict, expected: dict, run_key: str, *, prior_run_is_terminal_and_earlier: bool) -> bool:
     """Bounded cross-path binding for an already-durable manual recovery.
 
     This is intentionally narrower than scheduled provenance: only an
@@ -675,7 +698,7 @@ def _discovery_evidence_matches_prior_manual_catch_up(evidence: dict, expected: 
     every stable identity supplied by the carried payload must exactly match.
     A URL/time pair without at least one supplied stable identity is not enough.
     """
-    if not prior_run_exists or not isinstance(evidence, dict) or not isinstance(expected, dict):
+    if not prior_run_is_terminal_and_earlier or not isinstance(evidence, dict) or not isinstance(expected, dict):
         return False
     try:
         evidence_run_key = evidence['research_run_key']
@@ -757,13 +780,14 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
             raise HTTPException(422, 'research discovery terminal item was not actually pending for this run')
         if item['disposition'] in _EVIDENCE_CANDIDATE_DISPOSITIONS:
             evidence = db.execute("SELECT source_url,announcement_at,known_at,research_mode,research_run_key,eligible_for_original_cutoff,snapshot,symbol,name,title FROM material_evidence WHERE id=?", (item['evidence_id'],)).fetchone()
-            prior_run_exists = bool(evidence and db.execute(
-                "SELECT 1 FROM scheduler_runs WHERE run_key=? AND kind='research'", (evidence['research_run_key'],)
-            ).fetchone())
+            prior_run_is_terminal_and_earlier = bool(evidence and _is_terminal_prior_research_run(
+                db, evidence['research_run_key'], run_key,
+            ))
             scheduled_match = evidence is not None and _discovery_evidence_matches_run(dict(evidence), expected_item, run_key)
             manual_existing_match = (item['disposition'] == 'existing' and evidence is not None
                                      and _discovery_evidence_matches_prior_manual_catch_up(
-                                         dict(evidence), expected_item, run_key, prior_run_exists=prior_run_exists))
+                                         dict(evidence), expected_item, run_key,
+                                         prior_run_is_terminal_and_earlier=prior_run_is_terminal_and_earlier))
             if not scheduled_match and not manual_existing_match:
                 raise HTTPException(422, 'research discovery evidence lacks matching run provenance')
         db.execute("UPDATE giraffe_research_backlog SET status='terminal',terminal_disposition=?,terminal_run_key=?,terminal_evidence_id=?,terminal_at=? WHERE identity=? AND status='pending'", (item['disposition'], run_key, item['evidence_id'], at, item['identity']))

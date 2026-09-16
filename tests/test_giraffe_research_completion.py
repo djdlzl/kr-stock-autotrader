@@ -568,6 +568,37 @@ def test_discovery_provenance_uses_the_run_date_cutoff_and_exact_payload():
     assert not api_module._bounded_discovery_payload({"api_key": "secret", "blob": "x" * 2001})
 
 
+def test_manual_existing_requires_a_strictly_earlier_terminal_canonical_research_run(monkeypatch, tmp_path):
+    """Future, started, later, same, and noncanonical evidence runs cannot clear discovery."""
+    import kr_stock_autotrader.db as db_module
+    from kr_stock_autotrader.db import connect
+
+    monkeypatch.setattr(db_module, "DATABASE_PATH", str(tmp_path / "manual-order.db"))
+    db = connect()
+    completing = "research-2026-09-17-0700-kst-r4"
+    cases = (
+        ("research-2026-09-18-0700-kst", "started", False),  # future started
+        ("research-2026-09-16-0700-kst", "started", False),  # earlier started
+        ("research-2026-09-19-0700-kst", "done", False),     # later terminal
+        (completing, "error", False),                           # same run
+        ("research-2026-09-16-0700-kst-r3", "error", True),  # earlier terminal error
+        ("research-2026-09-16-0700-kst-r4", "done", True),   # earlier terminal done
+        ("research-2026-09-17-0700-kst-r3", "error", True),  # same-date lower rerun
+    )
+    try:
+        for key, status, _ in cases:
+            db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?,?,?,?)",
+                       (key, "research", status, "2026-09-16T07:00:00+09:00", "{}"))
+        db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?,?,?,?)",
+                   ("research-2026-09-15-0700-kst-r0", "research", "done", "2026-09-16T07:00:00+09:00", "{}"))
+        db.commit()
+        for key, _, expected in cases:
+            assert api_module._is_terminal_prior_research_run(db, key, completing) is expected
+        assert not api_module._is_terminal_prior_research_run(db, "research-2026-09-15-0700-kst-r0", completing)
+    finally:
+        db.close()
+
+
 def test_carried_discovery_manual_catch_up_existing_is_exact_atomic_and_idempotent(monkeypatch, tmp_path):
     """A later run may bind only the exact prior manual recovery record."""
     import kr_stock_autotrader.db as db_module
@@ -575,7 +606,7 @@ def test_carried_discovery_manual_catch_up_existing_is_exact_atomic_and_idempote
 
     monkeypatch.setattr(db_module, "DATABASE_PATH", str(tmp_path / "manual-existing.db"))
     client = TestClient(app)
-    old = "research-2026-09-16-0700-kst-r3"
+    old = "research-2026-09-17-0700-kst-r3"
     source_url = "https://kind.krx.co.kr/notice/doosan"
     announcement_at = "2026-09-15T10:43:20+09:00"
     payload = {"symbol": "336260", "name": "두산퓨얼셀", "title": "연료전지 시스템 공급 계약"}
@@ -591,7 +622,7 @@ def test_carried_discovery_manual_catch_up_existing_is_exact_atomic_and_idempote
     carried = client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"]
     assert len(carried) == 1 and carried[0]["original_announcement_at"] == announcement_at
 
-    key = "research-2026-09-17-0700-kst"
+    key = "research-2026-09-17-0700-kst-r4"
     contract, _ = commitment(key, [])
     contract.update({"schema_version": "giraffe-research-control-v2", "carry_forward": [{"identity": carried[0]["identity"], "kind": "discovery", **candidate}]})
     assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 200
