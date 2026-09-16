@@ -504,8 +504,28 @@ def _valid_discovery_carry(item: object) -> bool:
 
 
 def _seed_unfinished_research_backlog(db) -> None:
-    """Migrate old started/error commitments lazily so restart survives deploy."""
-    for row in db.execute("SELECT run_key,detail FROM scheduler_runs WHERE kind='research' AND status IN ('started','error')").fetchall():
+    """Carry only canonical unfinished research and quarantine legacy poison rows.
+
+    The caller owns the transaction so migration, normal seeding, and its
+    readback commit or rollback together.
+    """
+    audit_at = __import__('kr_stock_autotrader.decision_cards', fromlist=['now']).now()
+    for row in db.execute(
+        "SELECT identity,first_run_key FROM giraffe_research_backlog WHERE status='pending'"
+    ).fetchall():
+        if _RESEARCH_RUN_KEY.fullmatch(row['first_run_key']) is None:
+            db.execute(
+                "UPDATE giraffe_research_backlog "
+                "SET status='terminal',terminal_disposition='invalid_noncanonical_seed',"
+                "terminal_run_key=?,terminal_at=? WHERE identity=? AND status='pending'",
+                (row['first_run_key'], audit_at, row['identity']),
+            )
+    for row in db.execute(
+        "SELECT run_key,kind,status,detail FROM scheduler_runs "
+        "WHERE kind='research' AND status IN ('started','error')"
+    ).fetchall():
+        if not _is_research_run(row['run_key'], row['kind']) or row['status'] not in ('started', 'error'):
+            continue
         try: sources = json.loads(row['detail'])['control_commitment']['control_contract']['sources']
         except (KeyError, TypeError, ValueError): continue
         for source in sources:

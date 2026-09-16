@@ -566,3 +566,121 @@ def test_discovery_provenance_uses_the_run_date_cutoff_and_exact_payload():
     evidence["known_at"] = "2020-01-01T06:59:59+09:00"
     assert not api_module._discovery_evidence_matches_run(evidence, expected, run_key)
     assert not api_module._bounded_discovery_payload({"api_key": "secret", "blob": "x" * 2001})
+
+
+def test_backlog_seeding_skips_noncanonical_scheduler_rows_at_source():
+    """A legacy scheduler key cannot manufacture an unvalidated DART cursor."""
+    from kr_stock_autotrader.db import connect
+
+    bad_key = "incident-stale-packet-contract-2026-09-12-1747"
+    receipt_id = "20260912001747"
+    db = connect()
+    try:
+        db.execute(
+            "INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?,?,?,?)",
+            (bad_key, "research", "error", "2026-09-16T07:00:00+09:00", json.dumps({
+                "control_commitment": {"control_contract": {"sources": [{"rcp_no": receipt_id}]}}
+            })),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = TestClient(app).get("/api/internal/research-backlog", headers=CONTROL_HEADERS)
+    assert response.status_code == 200
+    assert all(item["identity"] != f"dart:{receipt_id}" for item in response.json()["items"])
+
+
+def test_backlog_readback_terminalizes_noncanonical_pending_and_preserves_119_canonical_rows_idempotently(monkeypatch, tmp_path):
+    import kr_stock_autotrader.db as db_module
+    from kr_stock_autotrader.db import connect
+
+    # A clean durable store models the RCA denominator without unrelated test
+    # rows: all 119 manager-validated canonical entries must remain readable.
+    monkeypatch.setattr(db_module, "DATABASE_PATH", str(tmp_path / "backlog.db"))
+    bad_key = "incident-stale-packet-contract-2026-09-12-1747"
+    bad_identity = "dart:20260912001747"
+    canonical_key = "research-2026-09-16-0700-kst-r1"
+    canonical_receipts = [f"20260915{number:06d}" for number in range(119)]
+    db = connect()
+    try:
+        db.execute(
+            "INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,created_at) VALUES(?,?,?,?,?)",
+            (bad_identity, "dart", json.dumps({"rcp_no": "20260912001747"}), bad_key,
+             "2026-09-16T07:00:00+09:00"),
+        )
+        for receipt_id in canonical_receipts:
+            source = {"rcp_no": receipt_id, "date": "20260915", "receipt_source_date": "20260915",
+                      "packet_path": f"/packets/20260915/{receipt_id}.json", "packet_sha256": "a" * 64}
+            db.execute(
+                "INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,created_at) VALUES(?,?,?,?,?)",
+                (f"dart:{receipt_id}", "dart", json.dumps(source), canonical_key, "2026-09-16T07:00:00+09:00"),
+            )
+        db.commit()
+    finally:
+        db.close()
+
+    client = TestClient(app)
+    first = client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS)
+    assert first.status_code == 200
+    items = first.json()["items"]
+    assert len(items) == 119
+    assert {item["identity"] for item in items} == {f"dart:{receipt_id}" for receipt_id in canonical_receipts}
+    assert all(item["first_run_key"] == canonical_key and item["payload"]["receipt_source_date"] == item["payload"]["rcp_no"][:8] for item in items)
+
+    db = connect()
+    try:
+        quarantined = db.execute(
+            "SELECT status,terminal_disposition,terminal_run_key,terminal_at FROM giraffe_research_backlog WHERE identity=?",
+            (bad_identity,),
+        ).fetchone()
+        assert dict(quarantined)["status"] == "terminal"
+        assert dict(quarantined)["terminal_disposition"] == "invalid_noncanonical_seed"
+        assert dict(quarantined)["terminal_run_key"] == bad_key
+        assert dict(quarantined)["terminal_at"]
+        first_audit = dict(quarantined)
+    finally:
+        db.close()
+
+    repeated = client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS)
+    assert repeated.status_code == 200 and repeated.json()["items"] == items
+    db = connect()
+    try:
+        repeated_audit = dict(db.execute(
+            "SELECT status,terminal_disposition,terminal_run_key,terminal_at FROM giraffe_research_backlog WHERE identity=?",
+            (bad_identity,),
+        ).fetchone())
+        assert repeated_audit == first_audit
+    finally:
+        db.close()
+
+
+def test_backlog_seed_cleanup_and_canonical_seed_rollback_together(monkeypatch):
+    from kr_stock_autotrader.db import connect
+
+    bad_key = "incident-stale-packet-contract-2026-09-12-1747"
+    db = connect()
+    try:
+        db.execute(
+            "INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,created_at) VALUES(?,?,?,?,?)",
+            ("dart:20260912009999", "dart", json.dumps({"rcp_no": "20260912009999"}), bad_key,
+             "2026-09-16T07:00:00+09:00"),
+        )
+        canonical_key = "research-2026-09-16-0700-kst-r1"
+        db.execute(
+            "INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?,?,?,?)",
+            (canonical_key, "research", "error", "2026-09-16T07:00:00+09:00", json.dumps({
+                "control_commitment": {"control_contract": {"sources": [{"rcp_no": "20260916009999"}]}}
+            })),
+        )
+        db.commit()
+        monkeypatch.setattr(api_module, "_enqueue_backlog", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("injected failure")))
+        try:
+            api_module._seed_unfinished_research_backlog(db)
+        except RuntimeError:
+            db.rollback()
+        else:
+            raise AssertionError("seed must surface the injected write failure")
+        assert db.execute("SELECT status FROM giraffe_research_backlog WHERE identity='dart:20260912009999'").fetchone()["status"] == "pending"
+    finally:
+        db.close()
