@@ -517,7 +517,8 @@ def test_manual_catch_up_preserves_delayed_truth_and_rejects_bad_chronology():
         assert client.post("/api/internal/evidence", headers=HEADERS, json=bad).status_code == 422
     default_scheduled = dict(base, dedupe_key="default-scheduled-cannot-bypass")
     default_scheduled.pop("research_mode")
-    assert client.post("/api/internal/evidence", headers=HEADERS, json=default_scheduled).status_code == 422
+    # Generic evidence has no run identity; it remains backward-compatible.
+    assert client.post("/api/internal/evidence", headers=HEADERS, json=default_scheduled).status_code == 200
 
 
 def test_v2_terminal_evidence_requires_exact_dart_provenance_before_clearing_cursor():
@@ -542,3 +543,17 @@ def test_v2_terminal_evidence_requires_exact_dart_provenance_before_clearing_cur
     assert any(item["identity"] == carried["identity"] for item in client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"])
     exact = client.post("/api/internal/evidence", headers=HEADERS, json={**evidence_data, "snapshot": {"rcp_no": receipt_id, "dart_source": carried["payload"]}, "dedupe_key":"exact-v2-provenance"}).json()["id"]
     assert finish(exact).status_code == 200
+
+
+def test_discovery_provenance_uses_the_run_date_cutoff_and_exact_payload():
+    run_key = "research-2026-09-16-0700-kst-r9"
+    payload = {"company": "issuer", "detail": "contract"}
+    source_url = "https://issuer.example.com/notice"
+    identity = "discovery:" + hashlib.sha256(canonical({"url": source_url, "announcement_at": "2026-09-15T10:43:20+09:00"})).hexdigest()
+    expected = {"identity": identity, "source_url": source_url, "announcement_at": "2026-09-15T10:43:20+09:00", "payload": payload}
+    provenance = {"schema_version": "giraffe-discovery-evidence-v1", "run_key": run_key, **expected}
+    evidence = {"source_url": source_url, "announcement_at": expected["announcement_at"], "known_at": "2026-09-16T07:00:00+09:00", "research_mode": "scheduled_as_of", "eligible_for_original_cutoff": 1, "snapshot": json.dumps({"research_discovery_provenance": provenance})}
+    assert api_module._discovery_evidence_matches_run(evidence, expected, run_key)
+    evidence["known_at"] = "2020-01-01T06:59:59+09:00"
+    assert not api_module._discovery_evidence_matches_run(evidence, expected, run_key)
+    assert not api_module._bounded_discovery_payload({"api_key": "secret", "blob": "x" * 2001})

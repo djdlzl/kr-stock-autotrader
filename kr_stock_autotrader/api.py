@@ -603,6 +603,41 @@ def _registered_research_detail(run_key: str, contract: object) -> dict:
     return {"kind": "research", "control_commitment": _research_commitment(run_key, contract)}
 
 
+def _discovery_evidence_matches_run(evidence: dict, expected: dict, run_key: str) -> bool:
+    """A discovery cursor may clear only against its own sealed research evidence."""
+    if evidence is None:
+        return False
+    try:
+        snapshot = json.loads(evidence['snapshot'])
+        provenance = snapshot.get('research_discovery_provenance')
+        announcement_at = _parse_timezone_aware_iso_timestamp(evidence['announcement_at'])
+        known_at = _parse_timezone_aware_iso_timestamp(evidence['known_at'])
+        cutoff = datetime.combine(_research_run_date(run_key), time(7), tzinfo=ZoneInfo('Asia/Seoul'))
+    except (KeyError, TypeError, ValueError):
+        return False
+    canonical = _canonical_coverage_url(expected['source_url'])
+    expected_provenance = {
+        'schema_version': 'giraffe-discovery-evidence-v1',
+        'run_key': run_key,
+        'identity': expected['identity'],
+        'source_url': canonical,
+        'announcement_at': expected['announcement_at'],
+        'payload': expected['payload'],
+    }
+    return (
+        provenance == expected_provenance
+        and _canonical_coverage_url(evidence['source_url']) == canonical
+        and announcement_at is not None and known_at is not None
+        and announcement_at.astimezone(ZoneInfo('UTC')) == _parse_timezone_aware_iso_timestamp(expected['announcement_at']).astimezone(ZoneInfo('UTC'))
+        and announcement_at.astimezone(ZoneInfo('UTC')) <= cutoff.astimezone(ZoneInfo('UTC'))
+        and known_at.astimezone(ZoneInfo('Asia/Seoul')).date() == _research_run_date(run_key)
+        and known_at.astimezone(ZoneInfo('UTC')) <= cutoff.astimezone(ZoneInfo('UTC'))
+        and known_at.astimezone(ZoneInfo('UTC')) >= announcement_at.astimezone(ZoneInfo('UTC'))
+        and evidence['research_mode'] == 'scheduled_as_of'
+        and evidence['eligible_for_original_cutoff'] == 1
+    )
+
+
 def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) -> None:
     """Delete nothing: terminal rows remain auditable; pending query is the cursor."""
     contract = commitment['control_contract']
@@ -620,10 +655,6 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
     # particular, a positive integer is not evidence, and a listed receipt is
     # not authority to clear an unrelated/missing backlog record.
     receipt = detail.get('completion_receipt', {})
-    terminal_counts = {name: sum(item['disposition'] == name for item in items) for name in allowed}
-    if (not isinstance(receipt, dict) or any(receipt.get(name, 0) != terminal_counts[name] for name in ('saved', 'existing', 'correction_stored'))
-            or receipt.get('rejected_after_evidence', 0) != terminal_counts['rejected'] + terminal_counts['hold']):
-        raise HTTPException(422, 'research terminal dispositions do not match receipt totals')
     sources = {source['rcp_no']: source for source in contract['sources']}
     for item in items:
         identity = _backlog_identity('dart', item['rcp_no'])
@@ -654,11 +685,19 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
                    or (item['disposition'] in {'saved','existing','correction_stored'} and (not isinstance(item['evidence_id'], int) or isinstance(item['evidence_id'], bool) or item['evidence_id'] <= 0))
                    or (item['disposition'] in {'rejected','hold'} and item['evidence_id'] is not None) for item in discovery)):
         raise HTTPException(422, 'research discovery terminal dispositions are not exact')
+    terminal_counts = {name: sum(item['disposition'] == name for item in [*items, *discovery]) for name in allowed}
+    if (not isinstance(receipt, dict) or any(receipt.get(name, 0) != terminal_counts[name] for name in ('saved', 'existing', 'correction_stored'))
+            or receipt.get('rejected_after_evidence', 0) != terminal_counts['rejected'] + terminal_counts['hold']):
+        raise HTTPException(422, 'research terminal dispositions do not match receipt totals')
     for item, expected_item in zip(discovery, discovery_expected):
         backlog = db.execute("SELECT payload,status,original_announcement_at FROM giraffe_research_backlog WHERE identity=?", (item['identity'],)).fetchone()
         if (backlog is None or backlog['status'] != 'pending' or backlog['original_announcement_at'] != expected_item['announcement_at']
                 or json.loads(backlog['payload']) != {'source_url': expected_item['source_url'], 'announcement_at': expected_item['announcement_at'], 'payload': expected_item['payload']}):
             raise HTTPException(422, 'research discovery terminal item was not actually pending for this run')
+        if item['disposition'] in _EVIDENCE_CANDIDATE_DISPOSITIONS:
+            evidence = db.execute("SELECT source_url,announcement_at,known_at,research_mode,eligible_for_original_cutoff,snapshot FROM material_evidence WHERE id=?", (item['evidence_id'],)).fetchone()
+            if evidence is None or not _discovery_evidence_matches_run(dict(evidence), expected_item, run_key):
+                raise HTTPException(422, 'research discovery evidence lacks matching run provenance')
         db.execute("UPDATE giraffe_research_backlog SET status='terminal',terminal_disposition=?,terminal_run_key=?,terminal_evidence_id=?,terminal_at=? WHERE identity=? AND status='pending'", (item['disposition'], run_key, item['evidence_id'], at, item['identity']))
         row = db.execute("SELECT status,terminal_disposition,terminal_run_key,terminal_evidence_id FROM giraffe_research_backlog WHERE identity=?", (item['identity'],)).fetchone()
         if row is None or dict(row) != {'status':'terminal','terminal_disposition':item['disposition'],'terminal_run_key':run_key,'terminal_evidence_id':item['evidence_id']}:
@@ -677,7 +716,7 @@ def _safe_research_scheduler_finish(db, run_key: str, start_detail: object, data
             if (not isinstance(candidate, dict) or set(candidate) != {'source_url','announcement_at','payload'}
                     or _canonical_coverage_url(candidate['source_url']) is None
                     or _parse_timezone_aware_iso_timestamp(candidate['announcement_at']) is None
-                    or not isinstance(candidate['payload'], dict)):
+                    or not _bounded_discovery_payload(candidate['payload'])):
                 raise HTTPException(422, 'invalid research carry-forward candidate')
             identity = __import__('hashlib').sha256(_canonical_json({'url': _canonical_coverage_url(candidate['source_url']), 'announcement_at': candidate['announcement_at']})).hexdigest()
             _enqueue_backlog(db, kind='discovery', identity=identity, payload=candidate, run_key=run_key, announcement_at=candidate['announcement_at'])
@@ -694,7 +733,8 @@ def _safe_research_scheduler_finish(db, run_key: str, start_detail: object, data
     if not _valid_candidate_evidence_bindings(db, receipt["coverage_lanes"], run_key, fields):
         raise HTTPException(422, "research candidate evidence bindings are not done-safe")
     terminal = sum(fields[name] for name in ("rejected_after_evidence", "saved", "existing", "correction_stored", "source_error", "store_error", "coverage_error"))
-    if (fields["control_count"] != control or fields["source_valid"] != control or fields["reviewed_unique"] != control or terminal != control or any(fields[name] for name in ("source_error", "store_error", "coverage_error")) or count != fields["saved"] + fields["correction_stored"]): raise HTTPException(422, "research completion receipt is not done-safe")
+    discovery_count = sum(item.get('kind') == 'discovery' for item in commitment['control_contract'].get('carry_forward', []))
+    if (fields["control_count"] != control or fields["source_valid"] != control or fields["reviewed_unique"] != control or terminal != control + discovery_count or any(fields[name] for name in ("source_error", "store_error", "coverage_error")) or count != fields["saved"] + fields["correction_stored"]): raise HTTPException(422, "research completion receipt is not done-safe")
     _terminalize_v2_backlog(db, run_key, commitment, data['detail'])
     return {"status": "done", "count": count, "detail": data["detail"], "control_commitment": commitment}
 

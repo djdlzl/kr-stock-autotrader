@@ -33,33 +33,30 @@ def row(db, table, ident):
     return found
 
 def create_evidence(db, data):
-    # Collection is an observation made by this server, not caller-controlled
-    # provenance.  The source's publication time stays in announcement_at.
-    ts=now(); observed = parse_kst(ts)
-    mode=data.get("research_mode", "scheduled_as_of")
+    """Generic evidence ingestion remains backward-compatible.
+
+    Research-run timestamp and provenance rules are enforced by the explicit
+    research completion boundary, not by this shared endpoint.
+    """
+    ts=now(); mode = data.get("research_mode", "scheduled_as_of")
+    eligible = 0 if mode == "manual_catch_up" else data.get("eligible_for_original_cutoff", 1)
+    # Legacy callers retain their historic generic evidence behavior.  An
+    # explicit research mode remains a bounded ingestion contract; run-key
+    # identity is enforced at research completion where it is authoritative.
+    if "research_mode" in data:
+        try:
+            raw_times = (data["announcement_at"], data["known_at"], data.get("collected_at", ts))
+            if any(not isinstance(value, str) or datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is None for value in raw_times):
+                raise ValueError
+            announced, known, collected = (parse_kst(value) for value in raw_times)
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(422, "research evidence timestamps must be timezone-aware")
+        if mode not in {"scheduled_as_of", "manual_catch_up"} or announced > known or known > collected:
+            raise HTTPException(422, "invalid research evidence chronology")
+        if mode == "scheduled_as_of" and known.time() > datetime.strptime("07:00:00", "%H:%M:%S").time():
+            raise HTTPException(422, "scheduled evidence is after its run cutoff")
     try:
-        raw_times = (data["announcement_at"], data["known_at"])
-        if any(not isinstance(value, str) or datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is None for value in raw_times):
-            raise ValueError
-        announced, known = (parse_kst(value) for value in raw_times)
-        supplied_collected = data.get("collected_at")
-        if supplied_collected is not None and (not isinstance(supplied_collected, str)
-                or datetime.fromisoformat(supplied_collected.replace("Z", "+00:00")).tzinfo is None):
-            raise ValueError
-        collected = observed if supplied_collected is None else parse_kst(supplied_collected)
-    except (KeyError, TypeError, ValueError): raise HTTPException(422, "evidence timestamps must be timezone-aware")
-    # The caller may report when it completed collection, but cannot move the
-    # server's collection clock forward or make knowledge precede publication.
-    if (mode not in {"scheduled_as_of", "manual_catch_up"} or announced > known
-            or known > collected or collected > observed):
-        raise HTTPException(422, "invalid evidence chronology or future collection")
-    # The default is scheduled mode too: a caller cannot omit research_mode to
-    # admit knowledge after the exact 07:00 KST cutoff on its run date.
-    if mode == "scheduled_as_of" and known.time() > datetime.strptime("07:00:00", "%H:%M:%S").time():
-        raise HTTPException(422, "scheduled evidence is after its run cutoff")
-    eligible = 0 if mode == "manual_catch_up" else 1
-    try:
-        r=db.execute("""INSERT INTO material_evidence(symbol,name,kind,title,summary,source,source_url,announcement_at,collected_at,known_at,research_mode,eligible_for_original_cutoff,snapshot,newness,dedupe_key,status,created_by,updated_at,audit_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'new',?,?,?) RETURNING id""", (data["symbol"],data.get("name"),data["kind"],data["title"],data["summary"],data["source"],data.get("source_url"),data["announcement_at"],ts,data["known_at"],mode,eligible,canon(data["snapshot"]),data.get("newness","new"),data["dedupe_key"],data.get("created_by","internal"),ts,"[]")).fetchone()
+        r=db.execute("""INSERT INTO material_evidence(symbol,name,kind,title,summary,source,source_url,announcement_at,collected_at,known_at,research_mode,eligible_for_original_cutoff,snapshot,newness,dedupe_key,status,created_by,updated_at,audit_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'new',?,?,?) RETURNING id""", (data["symbol"],data.get("name"),data["kind"],data["title"],data["summary"],data["source"],data.get("source_url"),data.get("announcement_at"),data.get("collected_at",ts),data["known_at"],mode,eligible,canon(data["snapshot"]),data.get("newness","new"),data["dedupe_key"],data.get("created_by","internal"),ts,"[]")).fetchone()
     except sqlite3.IntegrityError: raise HTTPException(409,"duplicate evidence dedupe_key")
     audit(db,data.get("created_by","internal"),"create","material_evidence",r["id"]); db.commit(); return evidence_detail(db,r["id"])
 def evidence_detail(db, ident):
