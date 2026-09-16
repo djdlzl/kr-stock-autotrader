@@ -115,7 +115,7 @@ def connect() -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS material_evidence (
       id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, name TEXT, kind TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL,
       source TEXT NOT NULL, source_url TEXT, announcement_at TEXT, collected_at TEXT NOT NULL, known_at TEXT NOT NULL,
-      research_mode TEXT NOT NULL DEFAULT 'scheduled_as_of', eligible_for_original_cutoff INTEGER NOT NULL DEFAULT 1 CHECK(eligible_for_original_cutoff IN (0,1)),
+      research_mode TEXT NOT NULL DEFAULT 'scheduled_as_of', research_run_key TEXT, eligible_for_original_cutoff INTEGER NOT NULL DEFAULT 1 CHECK(eligible_for_original_cutoff IN (0,1)),
       snapshot TEXT NOT NULL, newness TEXT NOT NULL, dedupe_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'new',
       created_by TEXT NOT NULL, updated_at TEXT NOT NULL, invalidated_at TEXT, audit_json TEXT NOT NULL DEFAULT '[]',
       version INTEGER NOT NULL DEFAULT 1
@@ -369,6 +369,7 @@ def connect() -> sqlite3.Connection:
     for table, column, ddl in (
         ("material_evidence", "version", "INTEGER NOT NULL DEFAULT 1"),
         ("material_evidence", "research_mode", "TEXT NOT NULL DEFAULT 'scheduled_as_of'"),
+        ("material_evidence", "research_run_key", "TEXT"),
         ("material_evidence", "eligible_for_original_cutoff", "INTEGER NOT NULL DEFAULT 1 CHECK(eligible_for_original_cutoff IN (0,1))"),
         ("deterministic_filter_results", "evidence_version", "INTEGER NOT NULL DEFAULT 1"),
         ("decision_cards", "schema_version", "INTEGER NOT NULL DEFAULT 1"),

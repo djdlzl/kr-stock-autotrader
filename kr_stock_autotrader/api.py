@@ -634,6 +634,7 @@ def _discovery_evidence_matches_run(evidence: dict, expected: dict, run_key: str
         and known_at.astimezone(ZoneInfo('UTC')) <= cutoff.astimezone(ZoneInfo('UTC'))
         and known_at.astimezone(ZoneInfo('UTC')) >= announcement_at.astimezone(ZoneInfo('UTC'))
         and evidence['research_mode'] == 'scheduled_as_of'
+        and evidence['research_run_key'] == run_key
         and evidence['eligible_for_original_cutoff'] == 1
     )
 
@@ -695,7 +696,7 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
                 or json.loads(backlog['payload']) != {'source_url': expected_item['source_url'], 'announcement_at': expected_item['announcement_at'], 'payload': expected_item['payload']}):
             raise HTTPException(422, 'research discovery terminal item was not actually pending for this run')
         if item['disposition'] in _EVIDENCE_CANDIDATE_DISPOSITIONS:
-            evidence = db.execute("SELECT source_url,announcement_at,known_at,research_mode,eligible_for_original_cutoff,snapshot FROM material_evidence WHERE id=?", (item['evidence_id'],)).fetchone()
+            evidence = db.execute("SELECT source_url,announcement_at,known_at,research_mode,research_run_key,eligible_for_original_cutoff,snapshot FROM material_evidence WHERE id=?", (item['evidence_id'],)).fetchone()
             if evidence is None or not _discovery_evidence_matches_run(dict(evidence), expected_item, run_key):
                 raise HTTPException(422, 'research discovery evidence lacks matching run provenance')
         db.execute("UPDATE giraffe_research_backlog SET status='terminal',terminal_disposition=?,terminal_run_key=?,terminal_evidence_id=?,terminal_at=? WHERE identity=? AND status='pending'", (item['disposition'], run_key, item['evidence_id'], at, item['identity']))
@@ -887,7 +888,7 @@ def _valid_candidate_evidence_bindings(db, coverage_lanes: dict, run_key: str, f
     if not evidence_dispositions:
         return True
     placeholders = ",".join("?" for _ in evidence_dispositions)
-    rows = db.execute(f"SELECT id,source_url,announcement_at,known_at FROM material_evidence WHERE id IN ({placeholders})", tuple(evidence_dispositions)).fetchall()
+    rows = db.execute(f"SELECT id,source_url,announcement_at,known_at,research_mode,research_run_key,eligible_for_original_cutoff FROM material_evidence WHERE id IN ({placeholders})", tuple(evidence_dispositions)).fetchall()
     evidence = {row["id"]: row for row in rows}
     if len(evidence) != len(evidence_dispositions):
         return False
@@ -901,6 +902,9 @@ def _valid_candidate_evidence_bindings(db, coverage_lanes: dict, run_key: str, f
         published_at = _parse_timezone_aware_iso_timestamp(source["published_at"])
         if (_canonical_coverage_url(row["source_url"]) != _canonical_coverage_url(source["url"])
                 or announcement_at is None or known_at is None or published_at is None
+                or row["research_run_key"] != run_key or row["research_mode"] not in {"scheduled_as_of", "manual_catch_up"}
+                or (row["research_mode"] == "scheduled_as_of" and row["eligible_for_original_cutoff"] != 1)
+                or (row["research_mode"] == "manual_catch_up" and row["eligible_for_original_cutoff"] != 0)
                 or announcement_at.astimezone(ZoneInfo("UTC")) > cutoff or known_at.astimezone(ZoneInfo("UTC")) > cutoff
                 or known_at.astimezone(ZoneInfo("UTC")) < announcement_at.astimezone(ZoneInfo("UTC"))
                 or announcement_at.astimezone(ZoneInfo("UTC")) != published_at.astimezone(ZoneInfo("UTC"))):

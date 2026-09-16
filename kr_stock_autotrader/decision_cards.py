@@ -9,6 +9,7 @@ from .decision_card_schema import SCHEMA_VERSION, validate_card
 from .db import FILTER_EVALUATOR_VERSION
 from .intraday_market_context import latest_market_context_for_card
 from .domain import Quote, fresh_quote, market_open, now_kst, parse_kst
+from .krx_calendar import CalendarError, admitted_backlog_dates
 
 PROMPT_PATH = Path(__file__).parents[1] / "prompts" / "decision-card-v1.md"
 SHORT_TERM_RISE_SESSIONS = 2
@@ -32,6 +33,12 @@ def row(db, table, ident):
     if not found: raise HTTPException(404, f"{table} not found")
     return found
 
+_RESEARCH_RUN_KEY = re.compile(r"^research-(\d{4}-\d{2}-\d{2})-0700-kst(?:-r[1-9]\d*)?$")
+def _research_run_cutoff(run_key):
+    match = _RESEARCH_RUN_KEY.fullmatch(run_key) if isinstance(run_key, str) else None
+    if not match: raise ValueError
+    return datetime.combine(datetime.strptime(match.group(1), "%Y-%m-%d").date(), datetime.strptime("07:00:00", "%H:%M:%S").time(), tzinfo=parse_kst("2026-01-01T00:00:00+09:00").tzinfo)
+
 def create_evidence(db, data):
     """Generic evidence ingestion remains backward-compatible.
 
@@ -40,23 +47,45 @@ def create_evidence(db, data):
     """
     ts=now(); mode = data.get("research_mode", "scheduled_as_of")
     eligible = 0 if mode == "manual_catch_up" else data.get("eligible_for_original_cutoff", 1)
-    # Legacy callers retain their historic generic evidence behavior.  An
-    # explicit research mode remains a bounded ingestion contract; run-key
-    # identity is enforced at research completion where it is authoritative.
+    run_key = data.get("research_run_key")
+    # Generic callers retain their historic behavior. Explicit research evidence
+    # is immutable run-bound at ingestion and rechecked at completion.
     if "research_mode" in data:
         try:
             raw_times = (data["announcement_at"], data["known_at"], data.get("collected_at", ts))
             if any(not isinstance(value, str) or datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is None for value in raw_times):
                 raise ValueError
             announced, known, collected = (parse_kst(value) for value in raw_times)
+            cutoff = _research_run_cutoff(run_key)
+            server_now = parse_kst(ts)
         except (KeyError, TypeError, ValueError):
-            raise HTTPException(422, "research evidence timestamps must be timezone-aware")
+            raise HTTPException(422, "research evidence requires a valid run key and timezone-aware timestamps")
         if mode not in {"scheduled_as_of", "manual_catch_up"} or announced > known or known > collected:
             raise HTTPException(422, "invalid research evidence chronology")
-        if mode == "scheduled_as_of" and known.time() > datetime.strptime("07:00:00", "%H:%M:%S").time():
-            raise HTTPException(422, "scheduled evidence is after its run cutoff")
+        if collected > server_now:
+            raise HTTPException(422, "research evidence cannot be after server observation time")
+        if mode == "scheduled_as_of" and (known > cutoff or known.date() != cutoff.date()):
+            raise HTTPException(422, "scheduled evidence is outside its run cutoff")
+        if mode == "scheduled_as_of":
+            try:
+                if announced.strftime("%Y%m%d") not in admitted_backlog_dates(cutoff.date()):
+                    raise HTTPException(422, "scheduled evidence announcement is outside its run chronology")
+            except CalendarError as exc:
+                raise HTTPException(422, "scheduled evidence calendar admission failed") from exc
+        if mode == "manual_catch_up" and eligible != 0:
+            raise HTTPException(422, "manual catch-up is ineligible for the original cutoff")
+    elif run_key is not None:
+        raise HTTPException(422, "research_run_key requires explicit research_mode")
+    elif data.get("announcement_at") is not None:
+        # Generic callers are not research candidates, but also must not store
+        # a stale implicit-as-of record that could be mistaken for this run.
+        try:
+            if parse_kst(ts) - parse_kst(data["known_at"]) > timedelta(days=366):
+                raise HTTPException(422, "dated generic evidence cannot bypass a research run cutoff")
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(422, "generic evidence timestamps must be timezone-aware")
     try:
-        r=db.execute("""INSERT INTO material_evidence(symbol,name,kind,title,summary,source,source_url,announcement_at,collected_at,known_at,research_mode,eligible_for_original_cutoff,snapshot,newness,dedupe_key,status,created_by,updated_at,audit_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'new',?,?,?) RETURNING id""", (data["symbol"],data.get("name"),data["kind"],data["title"],data["summary"],data["source"],data.get("source_url"),data.get("announcement_at"),data.get("collected_at",ts),data["known_at"],mode,eligible,canon(data["snapshot"]),data.get("newness","new"),data["dedupe_key"],data.get("created_by","internal"),ts,"[]")).fetchone()
+        r=db.execute("""INSERT INTO material_evidence(symbol,name,kind,title,summary,source,source_url,announcement_at,collected_at,known_at,research_mode,research_run_key,eligible_for_original_cutoff,snapshot,newness,dedupe_key,status,created_by,updated_at,audit_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'new',?,?,?) RETURNING id""", (data["symbol"],data.get("name"),data["kind"],data["title"],data["summary"],data["source"],data.get("source_url"),data.get("announcement_at"),data.get("collected_at",ts),data["known_at"],mode,run_key,eligible,canon(data["snapshot"]),data.get("newness","new"),data["dedupe_key"],data.get("created_by","internal"),ts,"[]")).fetchone()
     except sqlite3.IntegrityError: raise HTTPException(409,"duplicate evidence dedupe_key")
     audit(db,data.get("created_by","internal"),"create","material_evidence",r["id"]); db.commit(); return evidence_detail(db,r["id"])
 def evidence_detail(db, ident):

@@ -284,7 +284,8 @@ def test_coverage_candidate_terminal_evidence_binding_and_cross_lane_dedupe():
         "symbol": "005930", "kind": "news", "title": "candidate evidence", "summary": "material",
         "source": "issuer", "source_url": "https://example.com/kind_krx",
         "announcement_at": "2026-09-16T06:00:00+09:00", "collected_at": "2026-09-16T07:00:00+09:00",
-        "known_at": "2026-09-16T06:00:00+09:00", "snapshot": {}, "dedupe_key": "candidate-terminal-binding",
+        "known_at": "2026-09-16T06:00:00+09:00", "research_mode": "scheduled_as_of", "research_run_key": key,
+        "snapshot": {}, "dedupe_key": "candidate-terminal-binding",
     })
     assert evidence.status_code == 200
     saved = receipt(key, digest, ["20260916000001"], rejected_after_evidence=0, saved=1)
@@ -324,7 +325,7 @@ def test_candidate_evidence_known_at_is_cutoff_bound_and_chronological():
         "symbol": "005930", "kind": "news", "title": "known-at cutoff evidence", "summary": "material",
         "source": "issuer", "source_url": "https://example.com/known-at-cutoff",
         "announcement_at": "2026-09-16T06:00:00+09:00", "collected_at": "2026-09-16T07:00:00+09:00",
-        "known_at": "2026-09-16T06:00:00+09:00", "snapshot": {}, "dedupe_key": "candidate-known-at-cutoff",
+        "known_at": "2026-09-16T06:00:00+09:00", "research_mode": "scheduled_as_of", "research_run_key": "research-2026-09-16-0700-kst-r2", "snapshot": {}, "dedupe_key": "candidate-known-at-cutoff",
     })
     assert evidence.status_code == 200
 
@@ -344,8 +345,8 @@ def test_candidate_evidence_known_at_is_cutoff_bound_and_chronological():
         return client.post(f"/api/internal/scheduler-runs/{key}/finish", json={"status": "done", "count": 1, "detail": {"completion_receipt": value}}, headers=HEADERS)
 
     assert finish(2, "2026-09-16T07:00:00+09:00").status_code == 200
-    assert finish(3, "2026-09-15T22:00:00Z").status_code == 200
-    for version, known_at in ((4, "2026-09-16T07:00:01+09:00"), (5, "2026-09-16T07:00:00"), (6, "not-a-timestamp"), (7, "2026-09-16T05:59:59+09:00")):
+    # An evidence row is sealed to its exact rerun, not merely the calendar day.
+    for version, known_at in ((3, "2026-09-15T22:00:00Z"), (4, "2026-09-16T07:00:01+09:00"), (5, "2026-09-16T07:00:00"), (6, "not-a-timestamp"), (7, "2026-09-16T05:59:59+09:00")):
         assert finish(version, known_at).status_code == 422
 
 
@@ -503,7 +504,7 @@ def test_manual_catch_up_preserves_delayed_truth_and_rejects_bad_chronology():
     base = {"symbol":"336260", "kind":"news", "title":"두산퓨얼셀 계약", "summary":"3222억원", "source":"KIND",
             "source_url":"https://issuer.example.com/doosan", "announcement_at":"2026-09-15T10:43:20+09:00",
             "known_at":"2026-09-16T12:00:00+09:00", "collected_at":"2026-09-16T12:01:00+09:00", "snapshot":{},
-            "dedupe_key":"doosan-manual-catch-up", "research_mode":"manual_catch_up"}
+            "dedupe_key":"doosan-manual-catch-up", "research_mode":"manual_catch_up", "research_run_key":"research-2026-09-16-0700-kst"}
     created = client.post("/api/internal/evidence", headers=HEADERS, json=base)
     assert created.status_code == 200
     detail = client.get(f"/api/internal/evidence/{created.json()['id']}", headers=HEADERS).json()
@@ -512,13 +513,21 @@ def test_manual_catch_up_preserves_delayed_truth_and_rejects_bad_chronology():
     assert client.post("/api/internal/evidence", headers=HEADERS, json=base).status_code == 409
     scheduled = dict(base, dedupe_key="doosan-scheduled-late", research_mode="scheduled_as_of")
     assert client.post("/api/internal/evidence", headers=HEADERS, json=scheduled).status_code == 422
+    stale_announcement = dict(base, dedupe_key="scheduled-stale-announcement", research_mode="scheduled_as_of",
+                              announcement_at="2020-01-01T06:00:00+09:00", known_at="2026-09-16T06:59:00+09:00",
+                              collected_at="2026-09-16T06:59:00+09:00")
+    assert client.post("/api/internal/evidence", headers=HEADERS, json=stale_announcement).status_code == 422
     for field, value in (("known_at", "2026-09-15T10:00:00+09:00"), ("known_at", "2026-09-16T12:02:00+09:00"), ("known_at", "2026-09-16T12:00:00")):
         bad = dict(base, dedupe_key="bad-" + field + value, **{field: value})
         assert client.post("/api/internal/evidence", headers=HEADERS, json=bad).status_code == 422
     default_scheduled = dict(base, dedupe_key="default-scheduled-cannot-bypass")
     default_scheduled.pop("research_mode")
-    # Generic evidence has no run identity; it remains backward-compatible.
+    default_scheduled.pop("research_run_key")
+    # Dated generic callers remain accepted but cannot finish a research run.
     assert client.post("/api/internal/evidence", headers=HEADERS, json=default_scheduled).status_code == 200
+    generic = dict(default_scheduled, dedupe_key="generic-no-research-provenance")
+    generic.pop("announcement_at")
+    assert client.post("/api/internal/evidence", headers=HEADERS, json=generic).status_code == 200
 
 
 def test_v2_terminal_evidence_requires_exact_dart_provenance_before_clearing_cursor():
@@ -537,7 +546,7 @@ def test_v2_terminal_evidence_requires_exact_dart_provenance_before_clearing_cur
         candidate.update({"url": "https://dart.fss.or.kr", "outcome": "candidate", "economic_disposition": "saved", "economic_reason": "DART source stored", "evidence_id": evidence_id})
         value["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
         return client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json={"status": "done", "count": 1, "detail": {"completion_receipt": value, "control_terminal_dispositions": [{"rcp_no": receipt_id, "disposition": "saved", "evidence_id": evidence_id}]}})
-    evidence_data = {"symbol":"005930", "kind":"news", "title":"DART", "summary":"x", "source":"dart", "source_url":"https://dart.fss.or.kr", "announcement_at":"2026-09-16T06:00:00+09:00", "known_at":"2026-09-16T06:00:00+09:00", "snapshot":{"rcp_no": receipt_id}, "dedupe_key":"wrong-v2-provenance"}
+    evidence_data = {"symbol":"005930", "kind":"news", "title":"DART", "summary":"x", "source":"dart", "source_url":"https://dart.fss.or.kr", "announcement_at":"2026-09-16T06:00:00+09:00", "known_at":"2026-09-16T06:00:00+09:00", "snapshot":{"rcp_no": receipt_id}, "research_mode":"scheduled_as_of", "research_run_key":key, "dedupe_key":"wrong-v2-provenance"}
     wrong = client.post("/api/internal/evidence", headers=HEADERS, json=evidence_data).json()["id"]
     assert finish(wrong).status_code == 422
     assert any(item["identity"] == carried["identity"] for item in client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"])
@@ -552,7 +561,7 @@ def test_discovery_provenance_uses_the_run_date_cutoff_and_exact_payload():
     identity = "discovery:" + hashlib.sha256(canonical({"url": source_url, "announcement_at": "2026-09-15T10:43:20+09:00"})).hexdigest()
     expected = {"identity": identity, "source_url": source_url, "announcement_at": "2026-09-15T10:43:20+09:00", "payload": payload}
     provenance = {"schema_version": "giraffe-discovery-evidence-v1", "run_key": run_key, **expected}
-    evidence = {"source_url": source_url, "announcement_at": expected["announcement_at"], "known_at": "2026-09-16T07:00:00+09:00", "research_mode": "scheduled_as_of", "eligible_for_original_cutoff": 1, "snapshot": json.dumps({"research_discovery_provenance": provenance})}
+    evidence = {"source_url": source_url, "announcement_at": expected["announcement_at"], "known_at": "2026-09-16T07:00:00+09:00", "research_mode": "scheduled_as_of", "research_run_key": run_key, "eligible_for_original_cutoff": 1, "snapshot": json.dumps({"research_discovery_provenance": provenance})}
     assert api_module._discovery_evidence_matches_run(evidence, expected, run_key)
     evidence["known_at"] = "2020-01-01T06:59:59+09:00"
     assert not api_module._discovery_evidence_matches_run(evidence, expected, run_key)
