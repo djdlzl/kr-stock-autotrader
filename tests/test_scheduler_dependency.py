@@ -1,4 +1,5 @@
 """07:00 research completion gate contracts for the 08:00 card scheduler."""
+import json
 from pathlib import Path
 
 
@@ -60,3 +61,46 @@ def test_research_latest_ignores_newer_same_day_generic_run():
     assert client.post(f"/api/internal/scheduler-runs/{generic}/finish", json={"status":"done","count":0,"detail":{"legacy":True}}, headers=headers).status_code == 200
     # No canonical validated 07:00 run exists, so the generic record cannot satisfy 08:00.
     assert client.get("/api/internal/scheduler-runs/latest?kind=research&date=2026-09-15", headers=headers).status_code == 404
+
+
+def test_research_latest_selects_highest_versioned_same_day_run_not_newest_row(monkeypatch, tmp_path):
+    import os
+    from fastapi.testclient import TestClient
+    import kr_stock_autotrader.db as db_module
+    from kr_stock_autotrader.db import connect
+    from app import app
+
+    monkeypatch.setattr(db_module, "DATABASE_PATH", str(tmp_path / "latest-research.db"))
+    db = connect()
+    try:
+        # Insert a newer generic/manual row last: date lookup must use the
+        # closed canonical grammar and numeric rerun order, not row recency.
+        for key in (
+            "research-2026-09-17-0700-kst",
+            "research-2026-09-17-0700-kst-r2",
+            "research-2026-09-17-0700-kst-r10",
+            "research-2026-09-17-manual",
+            "research-2026-09-17-0700-kst-r0",
+            "research-2026-09-17-0700-kst-manual",
+        ):
+            db.execute(
+                "INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?,?,?,?)",
+                (key, "research", "error", "2026-09-17T07:00:00+09:00", json.dumps({"key": key})),
+            )
+        db.commit()
+    finally:
+        db.close()
+
+    headers = {"X-Internal-API-Key": os.environ["INTERNAL_API_KEY"]}
+    response = TestClient(app).get(
+        "/api/internal/scheduler-runs/latest?kind=research&date=2026-09-17", headers=headers
+    )
+    assert response.status_code == 200
+    assert response.json()["run_key"] == "research-2026-09-17-0700-kst-r10"
+
+
+def test_07_prompts_define_contract_hash_as_canonical_parsed_json_only():
+    root = Path(__file__).parents[1]
+    required = "canonical JSON of parsed `control_contract`"
+    assert required in (root / "prompts/giraffe-material-discovery-v1.md").read_text(encoding="utf-8")
+    assert required in (root / "ops/giraffe-cron-07-prompt.txt").read_text(encoding="utf-8")

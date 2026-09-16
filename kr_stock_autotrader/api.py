@@ -1933,7 +1933,18 @@ def scheduler_latest(kind: str, date: str | None = None, _: None = Depends(requi
     try:
         if kind == 'research' and date:
             if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date): raise HTTPException(422,'invalid research date')
-            item=db.execute("SELECT * FROM scheduler_runs WHERE run_key=? AND kind='research'", (f'research-{date}-0700-kst',)).fetchone()
+            # A date lookup is an ordering lookup over the closed canonical
+            # grammar, not a row-recency lookup.  This deliberately excludes
+            # generic/manual same-day records and orders -rN numerically.
+            candidates = []
+            for row in db.execute(
+                "SELECT * FROM scheduler_runs WHERE kind='research' AND run_key LIKE ?",
+                (f"research-{date}-0700-kst%",),
+            ).fetchall():
+                order = _research_run_order(row['run_key'])
+                if order is not None and order[0].isoformat() == date:
+                    candidates.append((order[1], row))
+            item = max(candidates, key=lambda candidate: candidate[0])[1] if candidates else None
         else:
             query="SELECT * FROM scheduler_runs WHERE kind=?"; params=[kind]
             if date: query+=" AND (substr(started_at,1,10)=? OR run_key LIKE ?)"; params.extend([date,f"%{date}%"])

@@ -41,6 +41,7 @@ Giraffe는 paper-only이고 `LIVE_TRADING=False`다. 이 작업은 주문·자�
 
 - `run_key`는 절대로 재구성하지 않는다. prehook stdout의 `control_contract.run_key`만 authority다. 기본 scheduled run은 `research-YYYY-MM-DD-0700-kst`이고, 명시적 correction rerun만 prehook env `GIRAFFE_RESEARCH_RERUN_VERSION`의 strict positive integer에 따라 `...-rN`이다. 누락/빈 값은 기본 key, `0`·leading zero·부호·소수·임의 문자열은 prehook error이며 agent가 보정하지 않는다.
 - deterministic prehook은 완전한 source capture와 atomic control contract 뒤, 별도 `RESEARCH_CONTROL_KEY` capability로 canonical research run을 등록한다. 이 capability는 prehook에만 속하며 LLM scheduler caller의 `INTERNAL_API_KEY`에는 속하지 않는다.
+- `control_contract_sha256`는 canonical JSON of parsed `control_contract` (UTF-8, `ensure_ascii=False`, `sort_keys=True`, `separators=(',', ':')`)에 대한 SHA-256이다. artifact file의 raw bytes 해시가 아니며, 파일 공백·줄바꿈·키 순서와 비교하지 않는다.
 - agent는 `python -m kr_stock_autotrader.cli scheduler-start "$run_key" research`만 호출해 이미 prehook-registered 상태를 idempotent readback한다. control contract/path/hash를 scheduler-start에 제출하거나 canonical research run을 새로 만들 수 없다.
 - 같은 injected `run_key`가 이미 완료됐다면 중복 실행으로 새 evidence를 만들지 말고 기존 결과를 readback한다. versioned rerun은 원 terminal run을 덮어쓰지 않는 별도 identity다.
 - 주말 또는 공식 KRX 휴장일이어도 기업 공시는 발생할 수 있으므로 조사는 수행한다. 다만 휴장 여부를 기록하고, 08:00 카드/주문 시각을 거래 신호로 해석하지 않는다.

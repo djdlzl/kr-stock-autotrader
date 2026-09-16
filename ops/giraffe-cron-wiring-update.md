@@ -7,11 +7,11 @@ Do **not** run these commands until this commit is deployed at the 08:00 job's `
 ```bash
 export GIRAFFE_DEPLOYED_REPO=/Users/jaewoo/kr-stock-autotrader
 export HERMES_HOME=${HERMES_HOME:-$HOME/.hermes}
-export GIRAFFE_07_PROMPT_SHA256=d6454659697510e0667026378423d8b9a7972672bca2257656272d6fab8c3f4d
+export GIRAFFE_07_PROMPT_SHA256=bc3e8a6fb17d441faa7fa285ab2ec9fd114f7dd9b4628ec3f44bf806a39d4c14
 export GIRAFFE_08_SCHEDULER_PROMPT_SHA256=287972a1b03bc986905cb86e62575451ecde11893bbe786c0a2fc216826dfb38
 ```
 
-The 07:00 source file is tracked at `ops/giraffe-cron-07-prompt.txt` (introduced by `f2e6b726`) and its required SHA-256 is `d6454659697510e0667026378423d8b9a7972672bca2257656272d6fab8c3f4d`. Do not regenerate it.
+The 07:00 source file is tracked at `ops/giraffe-cron-07-prompt.txt` (introduced by `f2e6b726`) and its required SHA-256 is `bc3e8a6fb17d441faa7fa285ab2ec9fd114f7dd9b4628ec3f44bf806a39d4c14`. Do not regenerate it.
 
 ## 1. Install the deployed 08:00 prehook and read it back
 
