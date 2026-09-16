@@ -13,6 +13,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -41,6 +42,86 @@ def check_card_prompt() -> None:
 
 def canonical_bytes(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def canonical_discovery_url(value: object) -> str | None:
+    """Mirror the control API's canonical coverage URL authority."""
+    if (not isinstance(value, str) or not value or len(value) > 2000
+            or any(ord(char) <= 32 or ord(char) == 127 for char in value)):
+        return None
+    try:
+        parsed = urlsplit(value); host, port = parsed.hostname, parsed.port
+    except ValueError:
+        return None
+    if (parsed.scheme != "https" or host is None or parsed.username is not None
+            or parsed.password is not None or parsed.fragment):
+        return None
+    try:
+        canonical_host = host.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+    if not canonical_host:
+        return None
+    if ":" in canonical_host:
+        canonical_host = "[" + canonical_host + "]"
+    def normalized_percent(component: str) -> str | None:
+        pieces, index = [], 0
+        while index < len(component):
+            character = component[index]
+            if character != "%":
+                pieces.append(character); index += 1; continue
+            if index + 2 >= len(component) or re.fullmatch(r"[0-9A-Fa-f]{2}", component[index + 1:index + 3]) is None:
+                return None
+            code = int(component[index + 1:index + 3], 16); decoded = chr(code)
+            pieces.append(decoded if decoded.isascii() and (decoded.isalnum() or decoded in "-._~") else "%" + component[index + 1:index + 3].upper())
+            index += 3
+        return "".join(pieces)
+    path, query = normalized_percent(parsed.path), normalized_percent(parsed.query)
+    if path is None or query is None:
+        return None
+    hostport = canonical_host if port in (None, 443) else canonical_host + ":" + str(port)
+    return urlunsplit(("https", hostport, "" if path in ("", "/") else path, query, ""))
+
+
+def valid_discovery_timestamp(value: object) -> bool:
+    if (not isinstance(value, str) or not value or len(value) > 64
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def valid_research_run_key(value: object) -> bool:
+    match = re.fullmatch(r"research-(\d{4}-\d{2}-\d{2})-0700-kst(?:-r([1-9]\d*))?", value) if isinstance(value, str) else None
+    if match is None:
+        return False
+    try:
+        datetime.strptime(match.group(1), "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def bounded_discovery_payload(value: object) -> bool:
+    forbidden = re.compile(r"(?:secret|password|token|api[_-]?key|authorization)", re.I)
+    def valid(item: object, depth: int = 0) -> bool:
+        if depth > 4:
+            return False
+        if item is None or isinstance(item, bool) or isinstance(item, (int, float)):
+            return not isinstance(item, float) or item == item and abs(item) != float("inf")
+        if isinstance(item, str):
+            return len(item) <= 2000 and not any(ord(char) < 32 for char in item)
+        if isinstance(item, list):
+            return len(item) <= 32 and all(valid(child, depth + 1) for child in item)
+        if isinstance(item, dict):
+            return (len(item) <= 32 and all(isinstance(key, str) and 0 < len(key) <= 100
+                    and forbidden.search(key) is None and valid(child, depth + 1)
+                    for key, child in item.items()))
+        return False
+    return isinstance(value, dict) and valid(value)
 
 
 def fetch_research_backlog() -> list[dict]:
@@ -125,16 +206,22 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
             sources_by_receipt[payload["rcp_no"]] = payload
             carry_items.append({"identity": identity, "kind": "dart", "payload": payload})
         else:
-            source_url, announced = item.get("source_url"), item.get("original_announcement_at")
-            if (set(item) - {"identity", "kind", "payload", "source_url", "original_announcement_at", "first_run_key"}
-                    or not isinstance(source_url, str) or not source_url.startswith("https://")
-                    or not isinstance(announced, str) or not isinstance(payload, dict)):
+            if set(item) != {"identity", "kind", "payload", "original_announcement_at", "first_run_key"}:
                 raise ManifestError("durable discovery backlog provenance invalid")
-            expected = hashlib.sha256(canonical_bytes({"url": source_url, "announcement_at": announced})).hexdigest()
+            envelope = payload
+            if not isinstance(envelope, dict) or set(envelope) != {"source_url", "announcement_at", "payload"}:
+                raise ManifestError("durable discovery backlog provenance invalid")
+            source_url, announced, nested_payload = envelope["source_url"], envelope["announcement_at"], envelope["payload"]
+            canonical_url = canonical_discovery_url(source_url)
+            if (canonical_url is None or not valid_discovery_timestamp(announced)
+                    or item["original_announcement_at"] != announced or not valid_research_run_key(item["first_run_key"])
+                    or not bounded_discovery_payload(nested_payload)):
+                raise ManifestError("durable discovery backlog provenance invalid")
+            expected = hashlib.sha256(canonical_bytes({"url": canonical_url, "announcement_at": announced})).hexdigest()
             if identity != "discovery:" + expected:
                 raise ManifestError("durable discovery backlog identity invalid")
-            carry_items.append({"identity": identity, "kind": "discovery", "source_url": source_url,
-                                "announcement_at": announced, "payload": payload})
+            carry_items.append({"identity": identity, "kind": "discovery", "source_url": canonical_url,
+                                "announcement_at": announced, "payload": nested_payload})
     sources = list(sources_by_receipt.values())
     sources.sort(key=lambda item: item["rcp_no"])
     receipts = [item["rcp_no"] for item in sources]

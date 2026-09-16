@@ -278,6 +278,34 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                 with self.assertRaisesRegex(self.gate.ManifestError, "candidate/packet|duplicate"):
                     self.gate.control_contract("research-2026-09-15-0700-kst", [summary])
 
+    def test_production_shaped_discovery_backlog_is_normalized_and_hostile_shapes_fail_closed(self):
+        announced = "2026-09-15T10:43:20+09:00"
+        source_url = "https://KIND.KRX.CO.KR:443/notice/doosan"
+        canonical_url = "https://kind.krx.co.kr/notice/doosan"
+        identity = "discovery:" + hashlib.sha256(self.gate.canonical_bytes({"url": canonical_url, "announcement_at": announced})).hexdigest()
+        envelope = {"source_url": source_url, "announcement_at": announced, "payload": {"symbol": "336260", "name": "두산퓨얼셀", "title": "공급 계약", "source": "KIND", "reason": "material"}}
+        row = {"identity": identity, "kind": "discovery", "original_announcement_at": announced,
+               "first_run_key": "research-2026-09-15-0700-kst-r1", "payload": envelope}
+        contract = self.gate.control_contract("research-2026-09-16-0700-kst", [], [row])
+        self.assertEqual(contract["carry_forward"], [{"identity": identity, "kind": "discovery", "source_url": canonical_url,
+                                                        "announcement_at": announced, "payload": envelope["payload"]}])
+        for mutate in (
+            lambda item: item.update(source_url=source_url),  # legacy flattened outer shape
+            lambda item: item.update(payload={**envelope, "extra": True}),
+            lambda item: item.update(original_announcement_at="2026-09-15T10:43:21+09:00"),
+            lambda item: item["payload"].update(source_url="https://kind.krx.co.kr/other"),
+            lambda item: item["payload"]["payload"].update(api_key="secret"),
+            lambda item: item["payload"]["payload"].update(score=float("nan")),
+            lambda item: item.update(first_run_key="research-2026-02-29-0700-kst"),
+            lambda item: item.update(identity="discovery:" + "0" * 64),
+        ):
+            bad = json.loads(json.dumps(row))
+            mutate(bad)
+            with self.subTest(mutate=mutate), self.assertRaisesRegex(self.gate.ManifestError, "durable discovery backlog"):
+                self.gate.control_contract("research-2026-09-16-0700-kst", [], [bad])
+        with self.assertRaisesRegex(self.gate.ManifestError, "durable research backlog item invalid"):
+            self.gate.control_contract("research-2026-09-16-0700-kst", [], [row, dict(row)])
+
     def test_gate_reuses_correction_checkpoint_in_control_directory_without_refetch(self):
         receipt, control_date = "20260914000432", "20260915"
         def fake_collect(date):

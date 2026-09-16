@@ -488,6 +488,58 @@ def test_v2_backlog_unions_prior_error_dedupes_and_only_terminal_readback_clears
     assert client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"] == []
 
 
+def test_production_shaped_discovery_backlog_normalizes_into_registerable_v2_contract(monkeypatch, tmp_path):
+    """The prehook must consume the API's DB-row envelope, not a legacy flattened shape."""
+    import importlib.util
+    import sys
+    import kr_stock_autotrader.db as db_module
+    from kr_stock_autotrader.db import connect
+
+    monkeypatch.setattr(db_module, "DATABASE_PATH", str(tmp_path / "prehook-contract.db"))
+    scripts = Path(__file__).parents[1] / "scripts"
+    prior_manifest = sys.modules.get("giraffe_dart_manifest")
+    sys.path.insert(0, str(scripts))
+    try:
+        manifest_spec = importlib.util.spec_from_file_location("giraffe_dart_manifest_e2e", scripts / "giraffe_dart_manifest.py")
+        assert manifest_spec and manifest_spec.loader
+        manifest = importlib.util.module_from_spec(manifest_spec)
+        sys.modules[manifest_spec.name] = manifest; manifest_spec.loader.exec_module(manifest)
+        sys.modules["giraffe_dart_manifest"] = manifest
+        gate_spec = importlib.util.spec_from_file_location("giraffe_dart_manifest_gate_e2e", scripts / "giraffe_dart_manifest_gate.py")
+        assert gate_spec and gate_spec.loader
+        gate = importlib.util.module_from_spec(gate_spec)
+        sys.modules[gate_spec.name] = gate; gate_spec.loader.exec_module(gate)
+        announced, source_url = "2026-09-15T10:43:20+09:00", "https://KIND.KRX.CO.KR:443/notice/doosan"
+        canonical_url = "https://kind.krx.co.kr/notice/doosan"
+        identity = hashlib.sha256(canonical({"url": canonical_url, "announcement_at": announced})).hexdigest()
+        envelope = {"source_url": source_url, "announcement_at": announced, "payload": {"symbol": "336260", "name": "두산퓨얼셀", "title": "공급 계약", "source": "KIND", "reason": "material"}}
+        db = connect()
+        try:
+            api_module._enqueue_backlog(db, kind="discovery", identity=identity, payload=envelope,
+                                        run_key="research-2026-09-15-0700-kst-r1", announcement_at=announced)
+            db.commit()
+        finally:
+            db.close()
+        client = TestClient(app)
+        backlog = client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS)
+        assert backlog.status_code == 200
+        contract, _ = commitment("research-2026-09-16-0700-kst", [])
+        contract.update({"schema_version": "giraffe-research-control-v2", "carry_forward": gate.control_contract(contract["run_key"], [], backlog.json()["items"])["carry_forward"]})
+        registered = client.post(f"/api/internal/research-runs/{contract['run_key']}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS)
+        assert registered.status_code == 200
+        readback = client.get(f"/api/internal/scheduler-runs/{contract['run_key']}", headers=CONTROL_HEADERS)
+        assert readback.status_code == 200
+        assert readback.json()["detail"]["control_commitment"]["control_contract"]["carry_forward"] == [{"identity": "discovery:" + identity, "kind": "discovery", "source_url": canonical_url, "announcement_at": announced, "payload": envelope["payload"]}]
+    finally:
+        sys.path.remove(str(scripts))
+        sys.modules.pop("giraffe_dart_manifest_e2e", None)
+        sys.modules.pop("giraffe_dart_manifest_gate_e2e", None)
+        if prior_manifest is None:
+            sys.modules.pop("giraffe_dart_manifest", None)
+        else:
+            sys.modules["giraffe_dart_manifest"] = prior_manifest
+
+
 def test_error_discovery_candidate_is_durable_with_original_time_and_deduped():
     client = TestClient(app); key = "research-2026-09-16-0700-kst-r2"
     start(client, key, [])
