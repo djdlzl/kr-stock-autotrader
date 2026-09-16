@@ -219,6 +219,22 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             with self.assertRaisesRegex(self.gate.ManifestError, "duplicate DART receipt"):
                 self.gate.control_contract("research-2026-09-15-0700-kst", summaries)
 
+    def test_control_contract_requires_each_summary_candidate_packet_exact_set(self):
+        receipt_one, receipt_two, control_date = "20260915000001", "20260915000002", "20260915"
+        candidates = [{"rcp_no": receipt_one, "rcept_dt": control_date}, {"rcp_no": receipt_two, "rcept_dt": control_date}]
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            first = self.gate.write_packet(valid_source_packet(self.gate, receipt_one), root / "one" / control_date)
+            duplicate_receipt = self.gate.write_packet(valid_source_packet(self.gate, receipt_one), root / "two" / control_date)
+            for summary in (
+                {"date": control_date, "material_candidate_records": candidates, "source_packet_paths": [str(first)]},
+                {"date": control_date, "material_candidate_records": [], "source_packet_paths": [str(first)]},
+                {"date": control_date, "material_candidate_records": [{"rcp_no": receipt_one, "rcept_dt": control_date}], "source_packet_paths": [str(first), str(first)]},
+                {"date": control_date, "material_candidate_records": [{"rcp_no": receipt_one, "rcept_dt": control_date}], "source_packet_paths": [str(first), str(duplicate_receipt)]},
+            ):
+                with self.assertRaisesRegex(self.gate.ManifestError, "candidate/packet|duplicate"):
+                    self.gate.control_contract("research-2026-09-15-0700-kst", [summary])
+
     def test_gate_reuses_correction_checkpoint_in_control_directory_without_refetch(self):
         receipt, control_date = "20260914000432", "20260915"
         def fake_collect(date):

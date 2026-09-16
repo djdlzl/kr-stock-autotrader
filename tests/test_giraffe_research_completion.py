@@ -21,16 +21,18 @@ def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
 
 
-def commitment(run_key, receipts, source_root=None):
+def commitment(run_key, receipts, source_root=None, source_control_dates=None):
     from kr_stock_autotrader.krx_calendar import admitted_backlog_dates
 
     run_date = datetime.strptime(run_key.removeprefix("research-").removesuffix("-0700-kst"), "%Y-%m-%d")
     dates = admitted_backlog_dates(run_date.date())
     source_root = source_root or Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
+    source_control_dates = source_control_dates or {}
     sources = [{
         "rcp_no": rcp_no,
-        "date": rcp_no[:8],
-        "packet_path": str(source_root / rcp_no[:8] / f"{rcp_no}.json"),
+        "date": source_control_dates.get(rcp_no, rcp_no[:8]),
+        "receipt_source_date": rcp_no[:8],
+        "packet_path": str(source_root / source_control_dates.get(rcp_no, rcp_no[:8]) / f"{rcp_no}.json"),
         "packet_sha256": "a" * 64,
     } for rcp_no in sorted(receipts)]
     contract = {
@@ -45,15 +47,15 @@ def commitment(run_key, receipts, source_root=None):
     return contract, hashlib.sha256(canonical(contract)).hexdigest()
 
 
-def register(client, key, receipts=(), headers=CONTROL_HEADERS):
-    contract, digest = commitment(key, receipts)
+def register(client, key, receipts=(), headers=CONTROL_HEADERS, **commitment_kwargs):
+    contract, digest = commitment(key, receipts, **commitment_kwargs)
     response = client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=headers)
     assert response.status_code == 200
     return contract, digest
 
 
-def start(client, key, receipts=()):
-    contract, digest = register(client, key, receipts)
+def start(client, key, receipts=(), **commitment_kwargs):
+    contract, digest = register(client, key, receipts, **commitment_kwargs)
     response = client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research"}, headers=HEADERS)
     assert response.status_code == 200 and response.json()["idempotent"] is True
     return contract, digest
@@ -133,6 +135,32 @@ def test_registration_uses_explicit_packet_root_when_container_home_differs(monk
         headers=CONTROL_HEADERS,
     )
     assert response.status_code == 200
+
+
+def test_correction_contract_registers_and_completes_with_control_date_packet_path():
+    client = TestClient(app); key = "research-2026-09-15-0700-kst"
+    receipt_id = "20260914000432"
+    contract, digest = start(client, key, [receipt_id], source_control_dates={receipt_id: "20260915"})
+    assert contract["sources"] == [{
+        "rcp_no": receipt_id, "date": "20260915", "receipt_source_date": "20260914",
+        "packet_path": str(Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets" / "20260915" / f"{receipt_id}.json"),
+        "packet_sha256": "a" * 64,
+    }]
+    done = {"status": "done", "count": 0, "detail": {"completion_receipt": receipt(key, digest, [receipt_id])}}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=done, headers=HEADERS).status_code == 200
+
+
+def test_registration_rejects_legacy_or_forged_correction_source_schema():
+    client = TestClient(app); key = "research-2026-09-15-0700-kst"; receipt_id = "20260914000432"
+    contract, _ = commitment(key, [receipt_id], source_control_dates={receipt_id: "20260915"})
+    variants = [
+        dict(contract, sources=[{key: value for key, value in contract["sources"][0].items() if key != "receipt_source_date"}]),
+        dict(contract, sources=[dict(contract["sources"][0], receipt_source_date="20260915")]),
+        dict(contract, sources=[dict(contract["sources"][0], date="20260913", packet_path=str(Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets" / "20260913" / f"{receipt_id}.json"))]),
+        dict(contract, sources=[dict(contract["sources"][0], packet_path="/untrusted/20260915/20260914000432.json")]),
+    ]
+    for bad in variants:
+        assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": bad}, headers=CONTROL_HEADERS).status_code == 422
 
 
 def test_registration_rejects_contract_date_shrink_expand_reorder_and_cross_date_receipts():

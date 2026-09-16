@@ -472,9 +472,12 @@ def _research_commitment(run_key: str, contract: object) -> dict:
     source_ids = []
     for source in sources:
         rcp_no = source.get("rcp_no") if isinstance(source, dict) else None
-        expected_packet_path = str(packet_root / rcp_no[:8] / f"{rcp_no}.json") if isinstance(rcp_no, str) and re.fullmatch(r"\d{14}", rcp_no) else None
-        if (not isinstance(source, dict) or set(source) != {"rcp_no", "date", "packet_path", "packet_sha256"}
-                or rcp_no not in expected or source.get("date") != rcp_no[:8] or source["date"] not in expected_dates
+        control_date = source.get("date") if isinstance(source, dict) else None
+        receipt_source_date = source.get("receipt_source_date") if isinstance(source, dict) else None
+        expected_packet_path = str(packet_root / control_date / f"{rcp_no}.json") if (isinstance(rcp_no, str) and re.fullmatch(r"\d{14}", rcp_no) and isinstance(control_date, str)) else None
+        if (not isinstance(source, dict) or set(source) != {"rcp_no", "date", "receipt_source_date", "packet_path", "packet_sha256"}
+                or rcp_no not in expected or not isinstance(control_date, str) or control_date not in expected_dates
+                or receipt_source_date != rcp_no[:8]
                 or source.get("packet_path") != expected_packet_path or not isinstance(source.get("packet_sha256"), str)
                 or not re.fullmatch(r"[0-9a-f]{64}", source["packet_sha256"])):
             raise HTTPException(422, "invalid research source commitment")

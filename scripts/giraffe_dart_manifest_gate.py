@@ -49,7 +49,7 @@ def control_contract(run_key: str, summaries: list[dict]) -> dict:
         control_date = summary.get("date")
         candidates = summary.get("material_candidate_records")
         if (not isinstance(control_date, str) or not re.fullmatch(r"\d{8}", control_date)
-                or not isinstance(candidates, list)):
+                or not isinstance(candidates, list) or not isinstance(summary.get("source_packet_paths"), list)):
             raise ManifestError("DART source summary is invalid")
         candidate_receipts = set()
         for candidate in candidates:
@@ -60,21 +60,33 @@ def control_contract(run_key: str, summaries: list[dict]) -> dict:
                     or rcp_no in candidate_receipts):
                 raise ManifestError("DART manifest candidate does not bind to the control date")
             candidate_receipts.add(rcp_no)
+        packet_receipts, packet_paths = set(), set()
         for packet_path in summary["source_packet_paths"]:
+            if not isinstance(packet_path, str):
+                raise ManifestError("DART source packet path is invalid")
             path = Path(packet_path)
+            path_identity = str(path.resolve())
+            if path_identity in packet_paths:
+                raise ManifestError("duplicate DART source packet path")
+            packet_paths.add(path_identity)
             if path.parent.name != control_date:
                 raise ManifestError("DART source packet path does not bind to the control date")
             rcp_no = path.stem
+            if rcp_no in packet_receipts:
+                raise ManifestError("duplicate DART source packet receipt")
+            packet_receipts.add(rcp_no)
             metadata = completed_packet(path, rcp_no, expected_control_date=control_date)
             if metadata is None:
                 raise ManifestError("DART source packet is incomplete or invalid")
             source_date = metadata.get("source_date")
-            if rcp_no not in candidate_receipts or source_date != rcp_no[:8]:
+            if source_date != rcp_no[:8]:
                 raise ManifestError("DART source packet date does not match the control window")
             raw = path.read_bytes()
             sources.append({"rcp_no": rcp_no, "date": control_date, "packet_path": packet_path,
                             "packet_sha256": hashlib.sha256(raw).hexdigest(),
                             "receipt_source_date": source_date})
+        if packet_receipts != candidate_receipts:
+            raise ManifestError("DART candidate/packet receipt sets do not match")
     sources.sort(key=lambda item: item["rcp_no"])
     receipts = [item["rcp_no"] for item in sources]
     if len(receipts) != len(set(receipts)):
