@@ -476,7 +476,7 @@ def test_v2_backlog_unions_prior_error_dedupes_and_only_terminal_readback_clears
 
     key = "research-2026-09-16-0700-kst"
     contract, digest = commitment(key, ["20260915000271"])
-    contract.update({"schema_version": "giraffe-research-control-v2", "carry_forward": [item["identity"]]})
+    contract.update({"schema_version": "giraffe-research-control-v2", "carry_forward": [{"identity": item["identity"], "kind": "dart", "payload": item["payload"]}]})
     assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 200
     assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research"}, headers=HEADERS).status_code == 200
     digest = hashlib.sha256(canonical(contract)).hexdigest()
@@ -515,3 +515,30 @@ def test_manual_catch_up_preserves_delayed_truth_and_rejects_bad_chronology():
     for field, value in (("known_at", "2026-09-15T10:00:00+09:00"), ("known_at", "2026-09-16T12:02:00+09:00"), ("known_at", "2026-09-16T12:00:00")):
         bad = dict(base, dedupe_key="bad-" + field + value, **{field: value})
         assert client.post("/api/internal/evidence", headers=HEADERS, json=bad).status_code == 422
+    default_scheduled = dict(base, dedupe_key="default-scheduled-cannot-bypass")
+    default_scheduled.pop("research_mode")
+    assert client.post("/api/internal/evidence", headers=HEADERS, json=default_scheduled).status_code == 422
+
+
+def test_v2_terminal_evidence_requires_exact_dart_provenance_before_clearing_cursor():
+    client = TestClient(app); old = "research-2026-09-15-0700-kst-r8"; receipt_id = "20260915000888"
+    start(client, old, [receipt_id])
+    assert client.post(f"/api/internal/scheduler-runs/{old}/finish", json={"status": "error", "count": 0, "detail": {}}, headers=HEADERS).status_code == 200
+    pending = client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"]
+    carried = next(item for item in pending if item["identity"] == "dart:" + receipt_id)
+    key = "research-2026-09-16-0700-kst-r8"; contract, _ = commitment(key, [receipt_id])
+    contract.update({"schema_version": "giraffe-research-control-v2", "carry_forward": [{"identity": carried["identity"], "kind": "dart", "payload": carried["payload"]}]})
+    assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 200
+    digest = hashlib.sha256(canonical(contract)).hexdigest()
+    def finish(evidence_id):
+        value = receipt(key, digest, [receipt_id], rejected_after_evidence=0, saved=1)
+        candidate = value["coverage_lanes"]["kind_krx"]["checked_sources"][0]
+        candidate.update({"url": "https://dart.fss.or.kr", "outcome": "candidate", "economic_disposition": "saved", "economic_reason": "DART source stored", "evidence_id": evidence_id})
+        value["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
+        return client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json={"status": "done", "count": 1, "detail": {"completion_receipt": value, "control_terminal_dispositions": [{"rcp_no": receipt_id, "disposition": "saved", "evidence_id": evidence_id}]}})
+    evidence_data = {"symbol":"005930", "kind":"news", "title":"DART", "summary":"x", "source":"dart", "source_url":"https://dart.fss.or.kr", "announcement_at":"2026-09-16T06:00:00+09:00", "known_at":"2026-09-16T06:00:00+09:00", "snapshot":{"rcp_no": receipt_id}, "dedupe_key":"wrong-v2-provenance"}
+    wrong = client.post("/api/internal/evidence", headers=HEADERS, json=evidence_data).json()["id"]
+    assert finish(wrong).status_code == 422
+    assert any(item["identity"] == carried["identity"] for item in client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"])
+    exact = client.post("/api/internal/evidence", headers=HEADERS, json={**evidence_data, "snapshot": {"rcp_no": receipt_id, "dart_source": carried["payload"]}, "dedupe_key":"exact-v2-provenance"}).json()["id"]
+    assert finish(exact).status_code == 200

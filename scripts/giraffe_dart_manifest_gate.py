@@ -105,19 +105,37 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
         if packet_receipts != candidate_receipts:
             raise ManifestError("DART candidate/packet receipt sets do not match")
     carry_forward = carry_forward or []
-    carry_identities = []
+    carry_items = []
+    sources_by_receipt = {item["rcp_no"]: item for item in sources}
+    if len(sources_by_receipt) != len(sources):
+        raise ManifestError("duplicate DART receipt across control dates")
     for item in carry_forward:
         identity, kind, payload = item.get("identity"), item.get("kind"), item.get("payload")
-        if not isinstance(identity, str) or identity in carry_identities or kind not in {"dart", "discovery"}:
+        if not isinstance(identity, str) or any(identity == prior["identity"] for prior in carry_items) or kind not in {"dart", "discovery"}:
             raise ManifestError("durable research backlog item invalid")
-        carry_identities.append(identity)
         if kind == "dart":
             if not isinstance(payload, dict) or set(payload) != {"rcp_no", "date", "receipt_source_date", "packet_path", "packet_sha256"}:
                 raise ManifestError("durable DART backlog source invalid")
             metadata = completed_packet(Path(payload["packet_path"]), payload["rcp_no"], expected_control_date=payload["date"])
-            if metadata is None or payload["rcp_no"] in {item["rcp_no"] for item in sources}:
+            if metadata is None or identity != "dart:" + payload["rcp_no"]:
                 raise ManifestError("durable DART backlog packet unavailable")
-            sources.append(payload)
+            current = sources_by_receipt.get(payload["rcp_no"])
+            if current is not None and current != payload:
+                raise ManifestError("conflicting current and carried DART provenance")
+            sources_by_receipt[payload["rcp_no"]] = payload
+            carry_items.append({"identity": identity, "kind": "dart", "payload": payload})
+        else:
+            source_url, announced = item.get("source_url"), item.get("original_announcement_at")
+            if (set(item) - {"identity", "kind", "payload", "source_url", "original_announcement_at", "first_run_key"}
+                    or not isinstance(source_url, str) or not source_url.startswith("https://")
+                    or not isinstance(announced, str) or not isinstance(payload, dict)):
+                raise ManifestError("durable discovery backlog provenance invalid")
+            expected = hashlib.sha256(canonical_bytes({"url": source_url, "announcement_at": announced})).hexdigest()
+            if identity != "discovery:" + expected:
+                raise ManifestError("durable discovery backlog identity invalid")
+            carry_items.append({"identity": identity, "kind": "discovery", "source_url": source_url,
+                                "announcement_at": announced, "payload": payload})
+    sources = list(sources_by_receipt.values())
     sources.sort(key=lambda item: item["rcp_no"])
     receipts = [item["rcp_no"] for item in sources]
     if len(receipts) != len(set(receipts)):
@@ -125,7 +143,7 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
     return {"schema_version": "giraffe-research-control-v2", "run_key": run_key,
             "dates": [item["date"] for item in summaries], "source_valid": True,
             "expected_rcp_nos": receipts, "control_count": len(receipts), "sources": sources,
-            "carry_forward": sorted(carry_identities)}
+            "carry_forward": sorted(carry_items, key=lambda item: item["identity"])}
 
 
 def rerun_suffix(version: str) -> str:

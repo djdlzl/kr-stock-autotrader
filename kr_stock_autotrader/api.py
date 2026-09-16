@@ -475,6 +475,34 @@ def _enqueue_backlog(db, *, kind: str, identity: str, payload: dict, run_key: st
         __import__('kr_stock_autotrader.decision_cards', fromlist=['now']).now()))
 
 
+def _bounded_discovery_payload(value: object) -> bool:
+    """Keep carried discovery input auditable and incapable of carrying secrets."""
+    forbidden = re.compile(r"(?:secret|password|token|api[_-]?key|authorization)", re.I)
+    def valid(item: object, depth: int = 0) -> bool:
+        if depth > 4:
+            return False
+        if item is None or isinstance(item, bool) or isinstance(item, (int, float)):
+            return not isinstance(item, float) or item == item and abs(item) != float('inf')
+        if isinstance(item, str):
+            return len(item) <= 2000 and not any(ord(char) < 32 for char in item)
+        if isinstance(item, list):
+            return len(item) <= 32 and all(valid(child, depth + 1) for child in item)
+        if isinstance(item, dict):
+            return (len(item) <= 32 and all(isinstance(key, str) and 0 < len(key) <= 100
+                    and forbidden.search(key) is None and valid(child, depth + 1)
+                    for key, child in item.items()))
+        return False
+    return isinstance(value, dict) and valid(value)
+
+
+def _valid_discovery_carry(item: object) -> bool:
+    return (isinstance(item, dict) and set(item) == {'identity', 'kind', 'source_url', 'announcement_at', 'payload'}
+            and isinstance(item['identity'], str) and re.fullmatch(r'discovery:[0-9a-f]{64}', item['identity']) is not None
+            and item['kind'] == 'discovery' and _canonical_coverage_url(item['source_url']) is not None
+            and _parse_timezone_aware_iso_timestamp(item['announcement_at']) is not None
+            and _bounded_discovery_payload(item['payload']))
+
+
 def _seed_unfinished_research_backlog(db) -> None:
     """Migrate old started/error commitments lazily so restart survives deploy."""
     for row in db.execute("SELECT run_key,detail FROM scheduler_runs WHERE kind='research' AND status IN ('started','error')").fetchall():
@@ -493,9 +521,31 @@ def _research_commitment(run_key: str, contract: object) -> dict:
         if set(contract) != v1_required | {"carry_forward"} or contract.get("run_key") != run_key:
             raise HTTPException(422, "invalid research control commitment")
         carried = contract["carry_forward"]
-        if (not isinstance(carried, list) or carried != sorted(carried) or len(carried) != len(set(carried))
-                or any(not isinstance(item, str) or not re.fullmatch(r"(?:dart:\d{14}|discovery:[0-9a-f]{64})", item) for item in carried)):
+        if not isinstance(carried, list):
             raise HTTPException(422, "invalid research carry-forward set")
+        identities = [item.get('identity') if isinstance(item, dict) else None for item in carried]
+        if (not all(isinstance(identity, str) for identity in identities) or identities != sorted(identities)
+                or len({item.get('identity') for item in carried if isinstance(item, dict)}) != len(carried)):
+            raise HTTPException(422, "invalid research carry-forward set")
+        carried_dart = {}
+        for item in carried:
+            if _valid_discovery_carry(item):
+                continue
+            if (not isinstance(item, dict) or set(item) != {'identity', 'kind', 'payload'}
+                    or item.get('kind') != 'dart' or not isinstance(item.get('identity'), str)
+                    or re.fullmatch(r'dart:\d{14}', item['identity']) is None
+                    or not isinstance(item.get('payload'), dict) or item['payload'].get('rcp_no') != item['identity'][5:]):
+                raise HTTPException(422, "invalid research carry-forward set")
+            carried_dart[item['identity'][5:]] = item['payload']
+        sources_by_receipt = {source.get('rcp_no'): source for source in contract.get('sources', []) if isinstance(source, dict)}
+        if len(sources_by_receipt) != len(contract.get('sources', [])) or any(sources_by_receipt.get(rcp_no) != source for rcp_no, source in carried_dart.items()):
+            raise HTTPException(422, "carried DART provenance does not match the immutable source")
+        for item in carried:
+            if item.get('kind') == 'discovery':
+                canonical = _canonical_coverage_url(item['source_url'])
+                identity = __import__('hashlib').sha256(_canonical_json({'url': canonical, 'announcement_at': item['announcement_at']})).hexdigest()
+                if item['identity'] != _backlog_identity('discovery', identity):
+                    raise HTTPException(422, "discovery carry identity does not match provenance")
         # Validate the ordinary current control invariant unchanged, then permit
         # only listed historical DART source packets to extend it.
         current = dict(contract); current["schema_version"] = "giraffe-research-control-v1"; current.pop("carry_forward")
@@ -508,7 +558,6 @@ def _research_commitment(run_key: str, contract: object) -> dict:
                     or contract.get("control_count") != len(expected) or contract.get("source_valid") is not True
                     or not isinstance(sources, list) or len(sources) != len(expected)):
                 raise
-            carried_dart = {item.removeprefix("dart:") for item in carried if item.startswith("dart:")}
             if any(not isinstance(rcp, str) or not re.fullmatch(r"\d{14}", rcp) for rcp in expected): raise
             for source in sources:
                 if (not isinstance(source, dict) or set(source) != {"rcp_no", "date", "receipt_source_date", "packet_path", "packet_sha256"}
@@ -517,6 +566,7 @@ def _research_commitment(run_key: str, contract: object) -> dict:
                         or not isinstance(source.get("packet_path"), str) or not isinstance(source.get("packet_sha256"), str)
                         or not re.fullmatch(r"[0-9a-f]{64}", source["packet_sha256"])): raise
                 if source["date"] not in contract["dates"] and source["rcp_no"] not in carried_dart: raise
+                if source['rcp_no'] in carried_dart and source != carried_dart[source['rcp_no']]: raise
             return {"control_contract": contract, "control_contract_sha256": _sha256(contract)}
     required = v1_required
     if (set(contract) != required or contract.get("schema_version") != "giraffe-research-control-v1"
@@ -566,20 +616,49 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
                    or (item['disposition'] in {'saved','existing','correction_stored'} and (not isinstance(item['evidence_id'], int) or isinstance(item['evidence_id'], bool) or item['evidence_id'] <= 0))
                    or (item['disposition'] in {'rejected','hold'} and item['evidence_id'] is not None) for item in items)):
         raise HTTPException(422, 'research control terminal dispositions are not exact')
+    # Validate every requested transition before changing a cursor row.  In
+    # particular, a positive integer is not evidence, and a listed receipt is
+    # not authority to clear an unrelated/missing backlog record.
+    receipt = detail.get('completion_receipt', {})
+    terminal_counts = {name: sum(item['disposition'] == name for item in items) for name in allowed}
+    if (not isinstance(receipt, dict) or any(receipt.get(name, 0) != terminal_counts[name] for name in ('saved', 'existing', 'correction_stored'))
+            or receipt.get('rejected_after_evidence', 0) != terminal_counts['rejected'] + terminal_counts['hold']):
+        raise HTTPException(422, 'research terminal dispositions do not match receipt totals')
+    sources = {source['rcp_no']: source for source in contract['sources']}
+    for item in items:
+        identity = _backlog_identity('dart', item['rcp_no'])
+        backlog = db.execute("SELECT payload,status FROM giraffe_research_backlog WHERE identity=?", (identity,)).fetchone()
+        if backlog is None or backlog['status'] != 'pending' or json.loads(backlog['payload']) != sources[item['rcp_no']]:
+            raise HTTPException(422, 'research terminal item was not actually pending for this run')
+        if item['disposition'] in {'saved', 'existing', 'correction_stored'}:
+            evidence = db.execute("SELECT snapshot FROM material_evidence WHERE id=?", (item['evidence_id'],)).fetchone()
+            try:
+                snapshot = json.loads(evidence['snapshot']) if evidence else {}
+                provenance = snapshot.get('dart_source', snapshot.get('control_provenance', {}))
+                receipt_no = snapshot.get('rcp_no')
+            except (TypeError, ValueError):
+                receipt_no = None
+                provenance = {}
+            if receipt_no != item['rcp_no'] or provenance != sources[item['rcp_no']]:
+                raise HTTPException(422, 'research terminal evidence lacks matching receipt provenance')
     at = __import__('kr_stock_autotrader.decision_cards', fromlist=['now']).now()
     for item in items:
         db.execute("UPDATE giraffe_research_backlog SET status='terminal',terminal_disposition=?,terminal_run_key=?,terminal_evidence_id=?,terminal_at=? WHERE identity=? AND status='pending'", (item['disposition'], run_key, item['evidence_id'], at, _backlog_identity('dart', item['rcp_no'])))
         row = db.execute("SELECT status,terminal_disposition,terminal_run_key,terminal_evidence_id FROM giraffe_research_backlog WHERE identity=?", (_backlog_identity('dart', item['rcp_no']),)).fetchone()
         if row is None or dict(row) != {'status':'terminal','terminal_disposition':item['disposition'],'terminal_run_key':run_key,'terminal_evidence_id':item['evidence_id']}:
             raise HTTPException(422, 'research terminal backlog readback failed')
-    discovery_expected = [item for item in contract['carry_forward'] if item.startswith('discovery:')]
+    discovery_expected = [item for item in contract['carry_forward'] if item['kind'] == 'discovery']
     discovery = detail.get('discovery_terminal_dispositions', [])
-    if (not isinstance(discovery, list) or [item.get('identity') if isinstance(item, dict) else None for item in discovery] != discovery_expected
+    if (not isinstance(discovery, list) or [item.get('identity') if isinstance(item, dict) else None for item in discovery] != [item['identity'] for item in discovery_expected]
             or any(not isinstance(item, dict) or set(item) != {'identity','disposition','evidence_id'} or item['disposition'] not in allowed
                    or (item['disposition'] in {'saved','existing','correction_stored'} and (not isinstance(item['evidence_id'], int) or isinstance(item['evidence_id'], bool) or item['evidence_id'] <= 0))
                    or (item['disposition'] in {'rejected','hold'} and item['evidence_id'] is not None) for item in discovery)):
         raise HTTPException(422, 'research discovery terminal dispositions are not exact')
-    for item in discovery:
+    for item, expected_item in zip(discovery, discovery_expected):
+        backlog = db.execute("SELECT payload,status,original_announcement_at FROM giraffe_research_backlog WHERE identity=?", (item['identity'],)).fetchone()
+        if (backlog is None or backlog['status'] != 'pending' or backlog['original_announcement_at'] != expected_item['announcement_at']
+                or json.loads(backlog['payload']) != {'source_url': expected_item['source_url'], 'announcement_at': expected_item['announcement_at'], 'payload': expected_item['payload']}):
+            raise HTTPException(422, 'research discovery terminal item was not actually pending for this run')
         db.execute("UPDATE giraffe_research_backlog SET status='terminal',terminal_disposition=?,terminal_run_key=?,terminal_evidence_id=?,terminal_at=? WHERE identity=? AND status='pending'", (item['disposition'], run_key, item['evidence_id'], at, item['identity']))
         row = db.execute("SELECT status,terminal_disposition,terminal_run_key,terminal_evidence_id FROM giraffe_research_backlog WHERE identity=?", (item['identity'],)).fetchone()
         if row is None or dict(row) != {'status':'terminal','terminal_disposition':item['disposition'],'terminal_run_key':run_key,'terminal_evidence_id':item['evidence_id']}:
