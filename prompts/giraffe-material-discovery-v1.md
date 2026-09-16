@@ -38,18 +38,20 @@ Giraffe는 paper-only이고 `LIVE_TRADING=False`다. 이 작업은 주문·자�
 - DART `control_count=0`은 `NO_NEW_DART_FILING`일 뿐 전체 조사 0건이나 `NO_DISCOVERY`가 아니다. DART와 독립적으로 KIND/한국거래소, 회사 공식 IR·뉴스룸, 신뢰 가능한 언론의 discovery lane을 실제로 각각 실행·완료한 뒤에만 `done`, `count=0`을 쓸 수 있다. 각 lane의 query/대상·원문 확인 결과를 receipt에 남긴다.
 - 독립 lane의 검색엔진·WAF·원문 접근 실패는 `NO_DISCOVERY`로 분류하지 않는다. 실패 lane과 접근 불가 원문은 `coverage_error` 또는 `error`로 종료한다. source-valid 원문을 실제로 확인한 lane만 후보 0건을 `NO_DISCOVERY`로 결론낼 수 있으며, 이 규칙은 발표시각·`known_at`·원문 검증 요구를 완화하지 않는다.
 
-- KST 실행일 `YYYY-MM-DD`와 `run_key=research-YYYY-MM-DD-0700-kst`를 만든다.
+- `run_key`는 절대로 재구성하지 않는다. prehook stdout의 `control_contract.run_key`만 authority다. 기본 scheduled run은 `research-YYYY-MM-DD-0700-kst`이고, 명시적 correction rerun만 prehook env `GIRAFFE_RESEARCH_RERUN_VERSION`의 strict positive integer에 따라 `...-rN`이다. 누락/빈 값은 기본 key, `0`·leading zero·부호·소수·임의 문자열은 prehook error이며 agent가 보정하지 않는다.
 - deterministic prehook은 완전한 source capture와 atomic control contract 뒤, 별도 `RESEARCH_CONTROL_KEY` capability로 canonical research run을 등록한다. 이 capability는 prehook에만 속하며 LLM scheduler caller의 `INTERNAL_API_KEY`에는 속하지 않는다.
 - agent는 `python -m kr_stock_autotrader.cli scheduler-start "$run_key" research`만 호출해 이미 prehook-registered 상태를 idempotent readback한다. control contract/path/hash를 scheduler-start에 제출하거나 canonical research run을 새로 만들 수 없다.
-- 같은 `run_key`가 이미 완료됐다면 중복 실행으로 새 evidence를 만들지 말고 기존 결과를 readback한다.
+- 같은 injected `run_key`가 이미 완료됐다면 중복 실행으로 새 evidence를 만들지 말고 기존 결과를 readback한다. versioned rerun은 원 terminal run을 덮어쓰지 않는 별도 identity다.
 - 주말 또는 공식 KRX 휴장일이어도 기업 공시는 발생할 수 있으므로 조사는 수행한다. 다만 휴장 여부를 기록하고, 08:00 카드/주문 시각을 거래 신호로 해석하지 않는다.
 
 ## 조사 원칙
 
 ### 시간·신규성
 
-- `run_at_kst` 이후 공개된 정보는 사용하지 않는다.
-- 원문 발표시각, 수집시각, `known_at`을 분리한다.
+- `run_at_kst` 이후 공개된 정보는 사용하지 않는다. 이 07:00 run의 cutoff는 `cutoff_at_kst`다.
+- `announcement_at`은 선택한 `source_url` 원문 자체에서 확인한 `published_at`일 때만 그 값으로 쓴다. 언론 기사 시각을 issuer/DART 시각이라고 부르지 않는다. 원문 published-at을 검증하지 못하면 ISO timestamp를 만들지 않는다.
+- DART `rcept_dt`는 date-only이며 ISO timestamp로 꾸미지 않는다. DART packet은 경제 사실의 공식 근거로 `snapshot.evidence_refs`에 연결한다.
+- `known_at`은 first known/세계 최초 공개 시각이 아니라, 이 실행에서 source-valid evidence를 확인한 시각이다. cutoff 뒤 정보는 사용하지 않는다.
 - 오늘 기사라도 과거 공시·IR의 재보도면 신규 사건으로 저장하지 않는다.
 - 발표시각을 확인하지 못했거나 원문에 접근하지 못하면 저장하지 않고 `INSUFFICIENT_EVIDENCE`로 집계한다.
 - 정정공시는 원 사건과 연결하고 무엇이 바뀌었는지 기록한다.
@@ -133,6 +135,15 @@ Giraffe는 paper-only이고 `LIVE_TRADING=False`다. 이 작업은 주문·자�
     "economic_terms": {
       "expected_price_inputs": "optional giraffe-expected-price-input-v1 object; omit when no qualifying issuer/event-specific fields are verified"
     },
+    "timing_provenance": {
+      "source_published_at": "selected source_url's verified KST ISO-8601 published_at",
+      "source_publisher": "selected source_url publisher",
+      "timestamp_precision": "minute",
+      "timestamp_kind": "evidence_source_published_at",
+      "cutoff_at_kst": "this run's 07:00 KST cutoff",
+      "before_cutoff": true,
+      "dart_rcept_dt": "YYYYMMDD date-only or null"
+    },
     "evidence_refs": [],
     "official_document_id": "공식 문서 ID 또는 null",
     "retrieved_at_kst": "KST ISO-8601"
@@ -144,6 +155,8 @@ Giraffe는 paper-only이고 `LIVE_TRADING=False`다. 이 작업은 주문·자�
 ```
 
 - 확인되지 않은 숫자·URL·시각·종목코드를 만들지 않는다.
+- `timing_provenance`는 closed-ish contract다: `timestamp_precision`은 정확히 `minute`, `timestamp_kind`는 정확히 `evidence_source_published_at`, `source_published_at`은 선택한 `source_url`에서 검증된 값, `before_cutoff=true`일 때만 저장한다. DART `rcept_dt`는 날짜 문자열 그대로이며 발표시각 대용이 아니다.
+- 각 DART control candidate는 발표시각 결과와 별개로 `economic_disposition`을 정확히 하나 남긴다: `qualifying_A_or_better|below_threshold|negative_risk|timing_unresolved|error`. 추출한 경제조건, 조건부/확정성, 반대근거, material grade 또는 reject reason을 receipt에 남긴다. 발표시각 미확인은 경제 검토 생략 사유가 아니다: `TIMING_UNRESOLVED`와 경제판정은 병행한다. 113개 exact review는 유지하되 material-grade 심층검토는 report class와 DART 경제 사실로 deterministic하게 좁힌 material candidates에 집중한다. 미래 가격 반응은 사용 금지다.
 - `economic_terms.expected_price_inputs`는 선택사항이며, 제공할 때는 `giraffe-expected-price-input-v1` 전체 객체를 원문 그대로 저장한다. 09:05 평가자는 이 중첩 객체와 08:00 baseline만 읽으므로 root `expected_price`로 복사하거나 문자열 요약으로 바꾸지 않는다.
 - 이 패키지의 각 값은 해당 issuer/event의 `official_exact`, 재현 가능한 식·원문 reference가 있는 `official_derived`, 또는 `approved_scenarios`와 `approval_ref`를 갖춘 명시 승인 `assumption`만 허용한다. 근거가 없으면 필드를 생략하거나 `unavailable`/`not_searched`로 남긴다.
 - 마진, 이행확률, 세율, 할인율, 연도별 배분, peer multiple, normalized FCF, 희석주식수 및 기타 숫자를 추정·보완·평균·역산하지 않는다. 없는 값은 09:05에서 정확한 `HOLD_MISSING_INPUT`으로 남긴다.
@@ -178,7 +191,9 @@ POST 성공만으로 완료라고 하지 않는다. 필수 evidence 일부가 �
 
 ## scheduler 종료
 
-- `done`에는 `detail.completion_receipt`로 `schema_version=giraffe-research-completion-v1`, `control_count`, `source_valid`, `reviewed_unique`, `source_error`, `store_error`, `coverage_error`, `rejected_after_evidence`, `saved`, `existing`, `correction_stored`를 모두 명시한다. terminal semantic counts의 합은 control_count와 같아야 한다.
+- `done`에는 `detail.completion_receipt`로 `schema_version=giraffe-research-completion-v1`, `control_count`, `source_valid`, `reviewed_unique`, `source_error`, `store_error`, `coverage_error`, `rejected_after_evidence`, `saved`, `existing`, `correction_stored`, 그리고 closed `coverage_lanes`를 모두 명시한다. terminal semantic counts의 합은 control_count와 같아야 한다. `coverage_lanes` 후보 수는 DART terminal count와 합산하지 않는다.
+- `coverage_lanes`는 정확히 `kind_krx`, `issuer_ir_newsroom`, `reputable_media`만 가진다. 각 lane은 정확히 `{executed:boolean, query_count:int>=0, checked_url_count:int>=0, source_valid_count:int>=0, candidate_count:int>=0, coverage_error_count:int>=0}`다. `done`은 세 lane 모두 `executed=true`, `query_count>0`, `coverage_error_count=0`, 그리고 top-level `coverage_error=0`일 때만 가능하다. checked URL/source-valid 0은 실제로 query를 실행해 결과가 없었을 때만 허용하며 접근 실패를 no discovery로 바꾸지 않는다. missing/malformed/extra lane, 미실행, query 0, coverage error는 `error` 종료다.
+- receipt example: `"coverage_lanes":{"kind_krx":{"executed":true,"query_count":1,"checked_url_count":0,"source_valid_count":0,"candidate_count":0,"coverage_error_count":0},"issuer_ir_newsroom":{"executed":true,"query_count":1,"checked_url_count":0,"source_valid_count":0,"candidate_count":0,"coverage_error_count":0},"reputable_media":{"executed":true,"query_count":1,"checked_url_count":0,"source_valid_count":0,"candidate_count":0,"coverage_error_count":0}}`.
 - 모든 저장 대상이 `STORED`, `EXISTING`, `CORRECTION_STORED`이고 readback이 일치하며 `source_error=store_error=coverage_error=0`일 때만 `scheduler-finish ... done`.
 - DART가 빈 manifest(`control_count=0`)여도 위 독립 discovery lanes의 실제 완료 전에는 `done`, count=0이 불가하다. 모든 lane이 source-valid 원문 확인으로 후보 0건을 결론낸 경우에만 위 receipt의 모든 count=0으로 `done`, count=0 가능하다. source-valid 후보가 하나라도 있으면 그 후보별 semantic terminal result 없이 done을 호출하지 않는다.
 - 하나라도 `STORE_UNVERIFIED` 또는 `STORE_FAILED`면 `scheduler-finish ... error`.

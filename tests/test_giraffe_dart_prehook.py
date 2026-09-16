@@ -186,6 +186,26 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(contract["expected_rcp_nos"], [receipt])
         self.assertEqual(contract["sources"][0]["date"], "20260914")
 
+    def test_versioned_rerun_key_is_strict_and_default_is_unchanged(self):
+        with patch.dict(os.environ, {"GIRAFFE_RESEARCH_RERUN_VERSION": ""}, clear=False):
+            self.assertEqual(self.gate.research_run_key("20260916"), "research-2026-09-16-0700-kst")
+        with patch.dict(os.environ, {"GIRAFFE_RESEARCH_RERUN_VERSION": "1"}, clear=False):
+            self.assertEqual(self.gate.research_run_key("20260916"), "research-2026-09-16-0700-kst-r1")
+        for invalid in ("0", "01", "+1", "-1", "1.0", "one"):
+            with patch.dict(os.environ, {"GIRAFFE_RESEARCH_RERUN_VERSION": invalid}, clear=False):
+                with self.assertRaisesRegex(self.gate.ManifestError, "positive integer"):
+                    self.gate.research_run_key("20260916")
+
+    def test_research_prompt_preserves_coverage_timing_and_economic_review_contract(self):
+        prompt = (ROOT / "prompts" / "giraffe-material-discovery-v1.md").read_text(encoding="utf-8")
+        for required in (
+            "control_contract.run_key", "GIRAFFE_RESEARCH_RERUN_VERSION", "coverage_lanes",
+            "kind_krx", "issuer_ir_newsroom", "reputable_media", "source_published_at",
+            "evidence_source_published_at", "DART `rcept_dt`는 date-only", "economic_disposition",
+            "발표시각 미확인은 경제 검토 생략 사유가 아니다", "미래 가격 반응은 사용 금지",
+        ):
+            self.assertIn(required, prompt)
+
     def test_correction_receipt_uses_manifest_control_date_and_rejects_unsafe_bindings(self):
         receipt, control_date = "20260914000432", "20260915"
         candidate = {"rcp_no": receipt, "rcept_dt": control_date}

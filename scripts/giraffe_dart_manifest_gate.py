@@ -96,6 +96,18 @@ def control_contract(run_key: str, summaries: list[dict]) -> dict:
             "expected_rcp_nos": receipts, "control_count": len(receipts), "sources": sources}
 
 
+def research_run_key(today: str) -> str:
+    """Return canonical run identity, with an explicit strict correction suffix only."""
+    if not isinstance(today, str) or re.fullmatch(r"\d{8}", today) is None:
+        raise ManifestError("invalid research run date")
+    version = os.environ.get("GIRAFFE_RESEARCH_RERUN_VERSION", "")
+    if version == "":
+        return f"research-{today[:4]}-{today[4:6]}-{today[6:]}-0700-kst"
+    if re.fullmatch(r"[1-9]\d*", version) is None:
+        raise ManifestError("GIRAFFE_RESEARCH_RERUN_VERSION must be a strict positive integer")
+    return f"research-{today[:4]}-{today[4:6]}-{today[6:]}-0700-kst-r{version}"
+
+
 
 def register_research_run(run_key: str, contract: dict) -> None:
     """Register the immutable canonical run before any agent/LLM work begins."""
@@ -202,7 +214,7 @@ def main() -> int:
         print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": False, "error": str(exc)}, ensure_ascii=False))
         return 2
     today = summaries[-1]["date"]
-    run_key = f"research-{today[:4]}-{today[4:6]}-{today[6:]}-0700-kst"
+    run_key = research_run_key(today)
     contract = control_contract(run_key, summaries)
     digest = hashlib.sha256(canonical_bytes(contract)).hexdigest()
     CONTROL_ROOT.mkdir(parents=True, exist_ok=True)

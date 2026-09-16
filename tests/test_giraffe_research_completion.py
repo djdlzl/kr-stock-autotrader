@@ -24,7 +24,7 @@ def canonical(value):
 def commitment(run_key, receipts, source_root=None, source_control_dates=None):
     from kr_stock_autotrader.krx_calendar import admitted_backlog_dates
 
-    run_date = datetime.strptime(run_key.removeprefix("research-").removesuffix("-0700-kst"), "%Y-%m-%d")
+    run_date = datetime.strptime(run_key.removeprefix("research-").split("-0700-kst", 1)[0], "%Y-%m-%d")
     dates = admitted_backlog_dates(run_date.date())
     source_root = source_root or Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
     source_control_dates = source_control_dates or {}
@@ -70,9 +70,49 @@ def receipt(run_key, digest, receipts, **extra):
         "reviewed_rcp_nos": sorted(receipts), "source_error": 0, "store_error": 0,
         "coverage_error": 0, "rejected_after_evidence": control, "saved": 0,
         "existing": 0, "correction_stored": 0,
+        "coverage_lanes": {
+            name: {"executed": True, "query_count": 1, "checked_url_count": 0,
+                   "source_valid_count": 0, "candidate_count": 0, "coverage_error_count": 0}
+            for name in ("kind_krx", "issuer_ir_newsroom", "reputable_media")
+        },
     }
     value.update(extra)
     return value
+
+
+def test_versioned_research_run_registers_starts_and_finishes_but_arbitrary_suffix_rejects():
+    client = TestClient(app); key = "research-2026-09-16-0700-kst-r1"
+    contract, digest = start(client, key, ["20260916000001"])
+    assert contract["run_key"] == key
+    done = {"status": "done", "count": 0, "detail": {"completion_receipt": receipt(key, digest, ["20260916000001"])}}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=done, headers=HEADERS).status_code == 200
+    bad = "research-2026-09-16-0700-kst-correction"
+    contract, _ = commitment(bad, [])
+    assert client.post(f"/api/internal/research-runs/{bad}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 422
+
+
+def test_research_done_requires_exact_coverage_lanes():
+    client = TestClient(app); key = "research-2026-09-16-0700-kst"
+    _, digest = start(client, key, [])
+    cases = [
+        {},
+        {"kind_krx": {}},
+        {"kind_krx": {"executed": False, "query_count": 1, "checked_url_count": 0, "source_valid_count": 0, "candidate_count": 0, "coverage_error_count": 0},
+         "issuer_ir_newsroom": {"executed": True, "query_count": 1, "checked_url_count": 0, "source_valid_count": 0, "candidate_count": 0, "coverage_error_count": 0},
+         "reputable_media": {"executed": True, "query_count": 1, "checked_url_count": 0, "source_valid_count": 0, "candidate_count": 0, "coverage_error_count": 0}},
+    ]
+    valid = receipt(key, digest, [])
+    for lanes in cases:
+        invalid = receipt(key, digest, [], coverage_lanes=lanes)
+        payload = {"status": "done", "count": 0, "detail": {"completion_receipt": invalid}}
+        assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 422
+    for field, value in (("query_count", 0), ("coverage_error_count", 1)):
+        invalid = receipt(key, digest, [])
+        invalid["coverage_lanes"]["kind_krx"][field] = value
+        payload = {"status": "done", "count": 0, "detail": {"completion_receipt": invalid}}
+        assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 422
+    payload = {"status": "done", "count": 0, "detail": {"completion_receipt": valid}}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 200
 
 
 def test_exact_observed_forged_done_control_exploit_is_rejected_and_keeps_started():

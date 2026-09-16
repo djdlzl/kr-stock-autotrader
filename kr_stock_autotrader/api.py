@@ -406,7 +406,7 @@ app = FastAPI(title="Giraffe — Paper Only")
 
 
 _PREMARKET_RUN_KEY = re.compile(r"^card-\d{4}-\d{2}-\d{2}-0800-kst$")
-_RESEARCH_RUN_KEY = re.compile(r"^research-\d{4}-\d{2}-\d{2}-0700-kst$")
+_RESEARCH_RUN_KEY = re.compile(r"^research-(\d{4}-\d{2}-\d{2})-0700-kst(?:-r([1-9]\d*))?$")
 _PREMARKET_DIAGNOSTIC_CATEGORIES = frozenset({
     "provider", "auth", "http", "kis_rt_cd_msg_cd", "output_shape",
     "listed_shares", "bar_count", "date_range", "alignment", "local_validation",
@@ -434,6 +434,17 @@ def _is_research_run(run_key: str, kind: object) -> bool:
     return kind == "research" and _RESEARCH_RUN_KEY.fullmatch(run_key) is not None
 
 
+def _research_run_date(run_key: str) -> date:
+    """Extract only the calendar date admitted by the closed research key grammar."""
+    match = _RESEARCH_RUN_KEY.fullmatch(run_key)
+    if match is None:
+        raise HTTPException(422, "invalid research run key")
+    try:
+        return datetime.strptime(match.group(1), "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise HTTPException(422, "invalid research run key") from exc
+
+
 def _canonical_json(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -458,10 +469,9 @@ def _research_commitment(run_key: str, contract: object) -> dict:
     if (set(contract) != required or contract.get("schema_version") != "giraffe-research-control-v1"
             or contract.get("run_key") != run_key): raise HTTPException(422, "invalid research control commitment")
     expected, dates, sources = contract["expected_rcp_nos"], contract["dates"], contract["sources"]
-    try: run_date = datetime.strptime(run_key.removeprefix("research-").removesuffix("-0700-kst"), "%Y-%m-%d")
-    except ValueError: raise HTTPException(422, "invalid research run key")
+    run_date = _research_run_date(run_key)
     from .krx_calendar import CalendarError, admitted_backlog_dates
-    try: expected_dates = admitted_backlog_dates(run_date.date())
+    try: expected_dates = admitted_backlog_dates(run_date)
     except CalendarError as exc: raise HTTPException(422, "KRX calendar admission failed") from exc
     packet_root = _research_packet_root()
     if (not isinstance(expected, list) or expected != sorted(expected) or len(expected) != len(set(expected))
@@ -497,11 +507,12 @@ def _safe_research_scheduler_finish(run_key: str, start_detail: object, data: ob
     if count is None or not isinstance(data.get("detail"), dict) or not isinstance(commitment, dict): raise HTTPException(422, "invalid research scheduler detail")
     if data["status"] == "error": return {"status": "error", "count": count, "detail": data["detail"], "control_commitment": commitment}
     receipt = data["detail"].get("completion_receipt")
-    required = {"schema_version", "run_key", "control_contract_sha256", "control_count", "source_valid", "reviewed_unique", "reviewed_rcp_nos", "source_error", "store_error", "coverage_error", "rejected_after_evidence", "saved", "existing", "correction_stored"}
+    required = {"schema_version", "run_key", "control_contract_sha256", "control_count", "source_valid", "reviewed_unique", "reviewed_rcp_nos", "source_error", "store_error", "coverage_error", "coverage_lanes", "rejected_after_evidence", "saved", "existing", "correction_stored"}
     if not isinstance(receipt, dict) or set(receipt) != required or receipt.get("schema_version") != "giraffe-research-completion-v1": raise HTTPException(422, "invalid research completion receipt")
-    fields = {name: _nonnegative_int(receipt[name]) for name in required - {"schema_version", "run_key", "control_contract_sha256", "reviewed_rcp_nos"}}
+    fields = {name: _nonnegative_int(receipt[name]) for name in required - {"schema_version", "run_key", "control_contract_sha256", "reviewed_rcp_nos", "coverage_lanes"}}
     reviewed = receipt.get("reviewed_rcp_nos"); expected = commitment["control_contract"]["expected_rcp_nos"]
-    if (any(value is None for value in fields.values()) or receipt["run_key"] != run_key or receipt["control_contract_sha256"] != commitment["control_contract_sha256"]
+    if (any(value is None for value in fields.values()) or not _valid_coverage_lanes(receipt["coverage_lanes"])
+            or receipt["run_key"] != run_key or receipt["control_contract_sha256"] != commitment["control_contract_sha256"]
             or not isinstance(reviewed, list) or reviewed != expected or reviewed != sorted(reviewed) or len(reviewed) != len(set(reviewed))): raise HTTPException(422, "research completion does not match start commitment")
     fields = {name: int(value) for name, value in fields.items()}; control = len(expected)
     terminal = sum(fields[name] for name in ("rejected_after_evidence", "saved", "existing", "correction_stored", "source_error", "store_error", "coverage_error"))
@@ -511,6 +522,22 @@ def _safe_research_scheduler_finish(run_key: str, start_detail: object, data: ob
 
 def _nonnegative_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _valid_coverage_lanes(value: object) -> bool:
+    """Require independent discovery evidence; a failed lane cannot become no discovery."""
+    lane_names = {"kind_krx", "issuer_ir_newsroom", "reputable_media"}
+    lane_fields = {"executed", "query_count", "checked_url_count", "source_valid_count", "candidate_count", "coverage_error_count"}
+    if not isinstance(value, dict) or set(value) != lane_names:
+        return False
+    for lane in value.values():
+        if not isinstance(lane, dict) or set(lane) != lane_fields or lane.get("executed") is not True:
+            return False
+        if any(_nonnegative_int(lane.get(field)) is None for field in lane_fields - {"executed"}):
+            return False
+        if lane["query_count"] <= 0 or lane["coverage_error_count"] != 0:
+            return False
+    return True
 
 
 def _safe_premarket_scheduler_finish(data: object) -> dict:
