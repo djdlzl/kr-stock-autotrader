@@ -124,7 +124,7 @@ def bounded_discovery_payload(value: object) -> bool:
     return isinstance(value, dict) and valid(value)
 
 
-def fetch_research_backlog() -> list[dict]:
+def fetch_research_backlog_state() -> tuple[list[dict], list[dict]]:
     """Read the pending cursor before constructing this run's immutable union."""
     base, key = os.environ.get("GIRAFFE_URL", "").strip().rstrip("/"), os.environ.get("RESEARCH_CONTROL_KEY", "")
     if not base or not key:
@@ -138,10 +138,51 @@ def fetch_research_backlog() -> list[dict]:
     if (not isinstance(items, list) or any(not isinstance(item, dict) or not isinstance(item.get("identity"), str) for item in items)
             or [item["identity"] for item in items] != sorted(item["identity"] for item in items)):
         raise ManifestError("durable research backlog response invalid")
+    return items, []
+
+
+def fetch_terminal_history(receipts: list[str]) -> list[dict]:
+    """Request only the exact current OpenDART set; never scan terminal history."""
+    if (not isinstance(receipts, list) or not 0 < len(receipts) <= 200 or receipts != sorted(receipts)
+            or len(receipts) != len(set(receipts)) or any(re.fullmatch(r'\d{14}', item) is None for item in receipts)):
+        raise ManifestError('invalid bounded terminal lookup request')
+    base, key = os.environ.get("GIRAFFE_URL", "").strip().rstrip("/"), os.environ.get("RESEARCH_CONTROL_KEY", "")
+    if not base or not key:
+        raise ManifestError("GIRAFFE_URL and RESEARCH_CONTROL_KEY are required for durable backlog")
+    request = urllib.request.Request(base + '/api/internal/research-backlog/terminal-items', data=canonical_bytes({'rcp_nos': receipts}), method='POST', headers={'Content-Type': 'application/json', 'X-Research-Control-Key': key})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response: value = json.load(response)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as exc:
+        raise ManifestError('bounded terminal lookup failed') from exc
+    items = value.get('items') if isinstance(value, dict) and value.get('schema_version') == 'giraffe-research-terminal-items-v1' and value.get('requested_rcp_nos') == receipts else None
+    returned = [(item.get('payload', {}).get('rcp_no'), item.get('identity')) if isinstance(item, dict) and isinstance(item.get('payload'), dict) else (None, None) for item in items] if isinstance(items, list) else []
+    if (not isinstance(items, list) or len(items) > 2 * len(receipts) or returned != sorted(returned)
+            or len({identity for _, identity in returned}) != len(returned)
+            or any(rcp_no not in receipts or not isinstance(identity, str) for rcp_no, identity in returned)):
+        raise ManifestError('bounded terminal lookup response invalid')
     return items
 
 
-def control_contract(run_key: str, summaries: list[dict], carry_forward: list[dict] | None = None) -> dict:
+def fetch_research_backlog() -> tuple[list[dict], list[dict]]:
+    """Read pending work plus terminal audit history for v3 contract assembly."""
+    return fetch_research_backlog_state()
+
+
+def _report_class(record: dict) -> tuple[str, str]:
+    """Carry OpenDART's immutable classification into the control contract."""
+    name = record.get('report_nm')
+    if not isinstance(name, str):
+        # Old persisted fixtures have no authoritative listing metadata.  They
+        # remain readable here, but v3 registration rejects their omission.
+        return ('legacy_unclassified', 'legacy OpenDART report metadata unavailable')
+    if not 0 < len(name) <= 500:
+        raise ManifestError('OpenDART candidate report name invalid')
+    canonical = ''.join(char for char in name if not char.isspace() and char not in {'ㆍ', '·', '/'})
+    return ('dart_single_sale_supply_contract' if canonical == '단일판매공급계약체결' else 'other', name)
+
+
+def control_contract(run_key: str, summaries: list[dict], carry_forward: list[dict] | None = None,
+                     terminal_history: list[dict] | None = None, correction_receipts: list[str] | None = None) -> dict:
     sources = []
     for summary in summaries:
         control_date = summary.get("date")
@@ -149,7 +190,7 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
         if (not isinstance(control_date, str) or not re.fullmatch(r"\d{8}", control_date)
                 or not isinstance(candidates, list) or not isinstance(summary.get("source_packet_paths"), list)):
             raise ManifestError("DART source summary is invalid")
-        candidate_receipts = set()
+        candidate_receipts, candidate_metadata = set(), {}
         for candidate in candidates:
             rcp_no = candidate.get("rcp_no") if isinstance(candidate, dict) else None
             rcept_dt = candidate.get("rcept_dt") if isinstance(candidate, dict) else None
@@ -158,6 +199,7 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
                     or rcp_no in candidate_receipts):
                 raise ManifestError("DART manifest candidate does not bind to the control date")
             candidate_receipts.add(rcp_no)
+            candidate_metadata[rcp_no] = _report_class(candidate)
         packet_receipts, packet_paths = set(), set()
         for packet_path in summary["source_packet_paths"]:
             if not isinstance(packet_path, str):
@@ -179,13 +221,19 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
             source_date = metadata.get("source_date")
             if source_date != rcp_no[:8]:
                 raise ManifestError("DART source packet date does not match the control window")
+            if rcp_no not in candidate_metadata:
+                raise ManifestError("DART candidate/packet receipt sets do not match")
             raw = path.read_bytes()
-            sources.append({"rcp_no": rcp_no, "date": control_date, "packet_path": packet_path,
-                            "packet_sha256": hashlib.sha256(raw).hexdigest(),
-                            "receipt_source_date": source_date})
+            report_class, report_name = candidate_metadata[rcp_no]
+            source = {"rcp_no": rcp_no, "date": control_date, "packet_path": packet_path,
+                      "packet_sha256": hashlib.sha256(raw).hexdigest(), "receipt_source_date": source_date}
+            if report_class != 'legacy_unclassified':
+                source.update({"report_class": report_class, "report_name": report_name})
+            sources.append(source)
         if packet_receipts != candidate_receipts:
             raise ManifestError("DART candidate/packet receipt sets do not match")
     carry_forward = carry_forward or []
+    terminal_history = terminal_history or []
     carry_items = []
     sources_by_receipt = {item["rcp_no"]: item for item in sources}
     if len(sources_by_receipt) != len(sources):
@@ -222,15 +270,53 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
                 raise ManifestError("durable discovery backlog identity invalid")
             carry_items.append({"identity": identity, "kind": "discovery", "source_url": canonical_url,
                                 "announcement_at": announced, "payload": nested_payload})
+    correction_receipts = correction_receipts or []
+    if (not isinstance(correction_receipts, list) or correction_receipts != sorted(correction_receipts)
+            or len(correction_receipts) != len(set(correction_receipts))
+            or any(not isinstance(rcp, str) or re.fullmatch(r'\d{14}', rcp) is None for rcp in correction_receipts)):
+        raise ManifestError('invalid correction receipt selection')
+    terminal_by_receipt, correction_history = {}, {}
+    for item in terminal_history:
+        required = {"identity", "kind", "payload", "terminal_disposition", "terminal_run_key", "terminal_evidence_id", "terminal_at"}
+        payload = item.get("payload") if isinstance(item, dict) else None
+        rcp_no = payload.get("rcp_no") if isinstance(payload, dict) else None
+        if (not isinstance(item, dict) or set(item) != required or item.get("kind") != "dart"
+                or not isinstance(rcp_no, str) or not isinstance(item.get("identity"), str)
+                or not (item["identity"] == "dart:" + rcp_no or item["identity"].startswith("dart:correction:"))
+                or item.get("terminal_disposition") not in {"saved", "existing", "correction_stored", "rejected", "hold"}
+                or not valid_research_run_key(item.get("terminal_run_key")) or not valid_discovery_timestamp(item.get("terminal_at"))
+                or (item.get("terminal_disposition") in {"saved", "existing", "correction_stored"} and (not isinstance(item.get("terminal_evidence_id"), int) or isinstance(item.get("terminal_evidence_id"), bool) or item["terminal_evidence_id"] <= 0))
+                or (item.get("terminal_disposition") in {"rejected", "hold"} and item.get("terminal_evidence_id") is not None)):
+            raise ManifestError("durable terminal research history invalid")
+        if item['identity'] == 'dart:' + rcp_no:
+            if rcp_no in terminal_by_receipt:
+                raise ManifestError("duplicate durable terminal research receipt")
+            terminal_by_receipt[rcp_no] = item
+        elif rcp_no in correction_history:
+            raise ManifestError("duplicate durable terminal research receipt")
+        else:
+            correction_history[rcp_no] = item
+    missing_corrections = [rcp for rcp in correction_receipts if rcp not in terminal_by_receipt]
+    if (missing_corrections or any(terminal_by_receipt[rcp]['terminal_disposition'] not in {'rejected', 'hold'} for rcp in correction_receipts)
+            or any(rcp in correction_history for rcp in correction_receipts)):
+        raise ManifestError('selected correction receipt is not a rejected/hold terminal audit')
+    exclusions = [terminal_by_receipt[rcp] for rcp in sorted((set(sources_by_receipt) & set(terminal_by_receipt)) - set(correction_receipts))]
+    corrections = [terminal_by_receipt[rcp] for rcp in correction_receipts]
+    for item in [*exclusions, *corrections]:
+        if sources_by_receipt[item["payload"]["rcp_no"]] != item["payload"]:
+            raise ManifestError("terminal research history conflicts with current DART provenance")
+    for item in exclusions:
+        del sources_by_receipt[item["payload"]["rcp_no"]]
     sources = list(sources_by_receipt.values())
     sources.sort(key=lambda item: item["rcp_no"])
     receipts = [item["rcp_no"] for item in sources]
     if len(receipts) != len(set(receipts)):
         raise ManifestError("duplicate DART receipt across control dates")
-    return {"schema_version": "giraffe-research-control-v2", "run_key": run_key,
+    return {"schema_version": "giraffe-research-control-v3", "run_key": run_key,
             "dates": [item["date"] for item in summaries], "source_valid": True,
             "expected_rcp_nos": receipts, "control_count": len(receipts), "sources": sources,
-            "carry_forward": sorted(carry_items, key=lambda item: item["identity"])}
+            "carry_forward": sorted(carry_items, key=lambda item: item["identity"]),
+            "terminal_exclusions": exclusions, "correction_of": corrections}
 
 
 def rerun_suffix(version: str) -> str:
@@ -306,9 +392,28 @@ def record_recovery_invocation(dates: list[str]) -> None:
         path.write_bytes(canonical_bytes(payload) + b"\n")
 
 
-def main() -> int:
+def invocation_args(argv: list[str]) -> tuple[str, list[str]]:
+    """One-shot correction capability: explicit rerun plus exact receipts only."""
+    rerun, selected = None, []
+    index = 0
+    while index < len(argv):
+        if argv[index] == '--rerun-version' and index + 1 < len(argv) and rerun is None:
+            rerun = argv[index + 1]; index += 2; continue
+        if argv[index] == '--correction-rcp-no' and index + 1 < len(argv):
+            selected.extend(part for part in argv[index + 1].split(',') if part); index += 2; continue
+        raise ManifestError('invalid prehook invocation arguments')
+    if selected and rerun is None:
+        raise ManifestError('correction selection requires explicit --rerun-version')
+    if selected and (len(selected) != len(set(selected)) or any(re.fullmatch(r'\d{14}', item) is None for item in selected)):
+        raise ManifestError('invalid correction receipt selection')
+    if rerun is None:
+        return rerun_suffix(os.environ.get('GIRAFFE_RESEARCH_RERUN_VERSION', '')), []
+    return rerun_suffix(rerun), sorted(selected)
+
+
+def main(argv: list[str] | None = None) -> int:
     try:
-        rerun = rerun_suffix(os.environ.get("GIRAFFE_RESEARCH_RERUN_VERSION", ""))
+        rerun, selected_corrections = invocation_args([] if argv is None else argv)
     except ManifestError as exc:
         print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": False, "error": str(exc)}, ensure_ascii=False))
         return 2
@@ -362,11 +467,18 @@ def main() -> int:
     today = summaries[-1]["date"]
     run_key = research_run_key(today, rerun)
     try:
-        carry_forward = fetch_research_backlog()
+        backlog = fetch_research_backlog()
+        carry_forward = backlog[0] if isinstance(backlog, tuple) else backlog
+        current_receipts = sorted(record['rcp_no'] for summary in summaries for record in summary['material_candidate_records'])
+        terminal_history = fetch_terminal_history(current_receipts) if isinstance(backlog, tuple) and current_receipts else []
     except ManifestError as exc:
         print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": False, "error": str(exc)}, ensure_ascii=False))
         return 2
-    contract = control_contract(run_key, summaries, carry_forward)
+    try:
+        contract = control_contract(run_key, summaries, carry_forward, terminal_history, selected_corrections)
+    except ManifestError as exc:
+        print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": False, "error": str(exc)}, ensure_ascii=False))
+        return 2
     digest = hashlib.sha256(canonical_bytes(contract)).hexdigest()
     CONTROL_ROOT.mkdir(parents=True, exist_ok=True)
     contract_path = CONTROL_ROOT / f"{run_key}.json"
@@ -385,4 +497,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

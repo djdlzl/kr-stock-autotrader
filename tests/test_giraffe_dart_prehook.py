@@ -5,6 +5,7 @@ import io
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -225,7 +226,7 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             "kind_krx", "issuer_ir_newsroom", "reputable_media", "source_published_at",
             "evidence_source_published_at", "DART `rcept_dt`는 date-only", "economic_disposition",
             "발표시각 미확인은 경제 검토 생략 사유가 아니다", "미래 가격 반응은 사용 금지",
-            "단일 `web_search` backend 오류로 lane을 즉시 닫지 않는다", "최소 3회", "direct-domain",
+            "단일 `web_search` backend 오류로 lane을 즉시 닫지 않는다", "최소 3회", "direct-domain", "전년도 매출 대비 50% 이상",
         ):
             self.assertIn(required, prompt)
 
@@ -278,6 +279,66 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                 with self.assertRaisesRegex(self.gate.ManifestError, "candidate/packet|duplicate"):
                     self.gate.control_contract("research-2026-09-15-0700-kst", [summary])
 
+    def test_one_shot_correction_arguments_are_strict_and_fail_closed(self):
+        self.assertEqual(self.gate.invocation_args(['--rerun-version', '8', '--correction-rcp-no', '20260916900230']), ('-r8', ['20260916900230']))
+        for argv in (['--correction-rcp-no', '20260916900230'], ['--rerun-version', '0', '--correction-rcp-no', '20260916900230'], ['--rerun-version', '8', '--correction-rcp-no', 'bad'], ['--rerun-version', '8', '--correction-rcp-no', '20260916900230,20260916900230']):
+            with self.assertRaises(self.gate.ManifestError):
+                self.gate.invocation_args(argv)
+
+    def test_real_wrapper_forwards_explicit_rerun_and_drops_env_authority(self):
+        """An exact temporary wrapper copy proves argv is the only correction authority."""
+        wrapper = pathlib.Path("/Users/jaewoo/.hermes/scripts/giraffe_dart_manifest_gate.sh")
+        installed = wrapper.read_text(encoding="utf-8")
+        self.assertIn("source /Users/jaewoo/.hermes/.env", installed)
+        self.assertNotIn("GIRAFFE_DART_GATE_ENV_PATH", installed)
+        self.assertNotIn("GIRAFFE_CORRECTION_RCP_NO", installed.split("unset ", 1)[0])
+        with tempfile.TemporaryDirectory() as temp:
+            env_file = pathlib.Path(temp) / ".env"
+            env_file.write_text("OPENDART_API_KEY=\nGIRAFFE_RESEARCH_RERUN_VERSION=66\nGIRAFFE_CORRECTION_RCP_NO=20260916900230\n", encoding="utf-8")
+            trace, fake_python, harness = pathlib.Path(temp) / "trace", pathlib.Path(temp) / "python", pathlib.Path(temp) / "gate.sh"
+            fake_python.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$GATE_TRACE\"\nprintf 'rerun=%s correction=%s\\n' \"${GIRAFFE_RESEARCH_RERUN_VERSION-unset}\" \"${GIRAFFE_CORRECTION_RCP_NO-unset}\" >> \"$GATE_TRACE\"\n", encoding="utf-8")
+            fake_python.chmod(0o755)
+            harness.write_text(installed.replace("/Users/jaewoo/.hermes/.env", str(env_file)).replace("/usr/local/bin/python3", str(fake_python)), encoding="utf-8")
+            harness.chmod(0o755)
+            environment = {**os.environ, "GIRAFFE_DART_GATE_ENV_PATH": str(env_file),
+                           "GIRAFFE_RESEARCH_RERUN_VERSION": "77", "GIRAFFE_CORRECTION_RCP_NO": "20260916900230", "GATE_TRACE": str(trace)}
+            explicit = subprocess.run([str(harness), "--rerun-version", "9", "--correction-rcp-no", "20260916900230"], env=environment, text=True, capture_output=True)
+            self.assertEqual(explicit.returncode, 0, explicit.stderr)
+            self.assertEqual(trace.read_text(encoding="utf-8").splitlines(), ["scripts/giraffe_dart_manifest_gate.py", "--rerun-version", "9", "--correction-rcp-no", "20260916900230", "rerun=unset correction=unset"])
+            base = subprocess.run([str(harness)], env=environment, text=True, capture_output=True)
+            self.assertEqual(base.returncode, 0, base.stderr)
+            self.assertEqual(trace.read_text(encoding="utf-8").splitlines(), ["scripts/giraffe_dart_manifest_gate.py", "rerun=unset correction=unset"])
+
+    def test_terminal_dart_receipts_are_excluded_with_their_immutable_audit(self):
+        receipt, control_date = "20260916900230", "20260917"
+        with tempfile.TemporaryDirectory() as temp:
+            packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), pathlib.Path(temp) / control_date)
+            source = {"rcp_no": receipt, "date": control_date, "receipt_source_date": "20260916",
+                      "packet_path": str(packet), "packet_sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
+            history = [{"identity": "dart:" + receipt, "kind": "dart", "payload": source,
+                        "terminal_disposition": "rejected", "terminal_run_key": "research-2026-09-16-0700-kst-r7",
+                        "terminal_evidence_id": None, "terminal_at": "2026-09-16T07:00:00+09:00"}]
+            contract = self.gate.control_contract("research-2026-09-17-0700-kst-r8", [{"date": control_date,
+                "material_candidate_records": [{"rcp_no": receipt, "rcept_dt": control_date}], "source_packet_paths": [str(packet)]}], terminal_history=history)
+        self.assertEqual(contract["schema_version"], "giraffe-research-control-v3")
+        self.assertEqual(contract["expected_rcp_nos"], [])
+        self.assertEqual(contract["terminal_exclusions"], history)
+
+    def test_prehook_correction_selection_moves_only_rejected_hold_audit(self):
+        receipt, control_date = "20260916900230", "20260917"
+        with tempfile.TemporaryDirectory() as temp:
+            packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), pathlib.Path(temp) / control_date)
+            source = {"rcp_no": receipt, "date": control_date, "receipt_source_date": "20260916", "packet_path": str(packet), "packet_sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
+            prior = {"identity": "dart:" + receipt, "kind": "dart", "payload": source, "terminal_disposition": "hold", "terminal_run_key": "research-2026-09-16-0700-kst-r7", "terminal_evidence_id": None, "terminal_at": "2026-09-16T07:00:00+09:00"}
+            summary = [{"date": control_date, "material_candidate_records": [{"rcp_no": receipt, "rcept_dt": control_date}], "source_packet_paths": [str(packet)]}]
+            contract = self.gate.control_contract("research-2026-09-17-0700-kst-r8", summary, terminal_history=[prior], correction_receipts=[receipt])
+            self.assertEqual(contract["expected_rcp_nos"], [receipt])
+            self.assertEqual(contract["terminal_exclusions"], [])
+            self.assertEqual(contract["correction_of"], [prior])
+            for history, selected in (([], [receipt]), ([{**prior, "terminal_disposition": "saved", "terminal_evidence_id": 1}], [receipt]), ([prior, prior], [receipt]), ([prior], ["bad"])):
+                with self.assertRaises(self.gate.ManifestError):
+                    self.gate.control_contract("research-2026-09-17-0700-kst-r8", summary, terminal_history=history, correction_receipts=selected)
+
     def test_production_shaped_discovery_backlog_is_normalized_and_hostile_shapes_fail_closed(self):
         announced = "2026-09-15T10:43:20+09:00"
         source_url = "https://KIND.KRX.CO.KR:443/notice/doosan"
@@ -324,7 +385,7 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                 "declared_total": 1, "declared_pages": 1, "pages_collected": 1,
                 "page_counts": [1], "unique_receipts": 1,
                 "material_candidate_count": 1,
-                "material_candidate_records": [{"rcp_no": date + "000001", "rcept_dt": date, "row_text": "단일판매ㆍ공급계약체결"}],
+                "material_candidate_records": [{"rcp_no": date + "000001", "rcept_dt": date, "report_nm": "단일판매ㆍ공급계약체결"}],
                 "complete": True, "date": date,
             }
 

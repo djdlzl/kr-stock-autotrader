@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 import tempfile
@@ -914,3 +915,170 @@ def test_backlog_seed_requires_a_real_calendar_date_and_preserves_valid_reruns(m
         assert "dart:20260916999999" not in statuses
     finally:
         db.close()
+
+
+def test_v3_terminal_exclusion_and_beautyskin_append_only_correction(monkeypatch, tmp_path):
+    """A prior rejected terminal row is excluded normally and recoverable only by a new correction cursor."""
+    import kr_stock_autotrader.db as db_module
+    from kr_stock_autotrader.db import connect
+    monkeypatch.setattr(db_module, "DATABASE_PATH", str(tmp_path / "beautyskin.db"))
+    client = TestClient(app)
+    old, key, rcp = "research-2026-09-16-0700-kst-r7", "research-2026-09-17-0700-kst-r8", "20260916900230"
+    source = commitment(key, [rcp])[0]["sources"][0]
+    source.update({'report_class': 'dart_single_sale_supply_contract', 'report_name': '단일판매ㆍ공급계약체결'})
+    db = connect()
+    try:
+        db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,finished_at,detail) VALUES(?,?,?,?,?,?)", (old, "research", "done", "2026-09-16T07:00:00+09:00", "2026-09-16T07:01:00+09:00", "{}"))
+        db.execute("INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,status,terminal_disposition,terminal_run_key,terminal_evidence_id,created_at,terminal_at) VALUES(?,?,?,?,?,?,?,?,?,?)", ("dart:" + rcp, "dart", json.dumps(source, sort_keys=True), old, "terminal", "rejected", old, None, "2026-09-16T07:00:00+09:00", "2026-09-16T07:01:00+09:00"))
+        db.commit()
+        original = dict(db.execute("SELECT identity,kind,payload,terminal_disposition,terminal_run_key,terminal_evidence_id,terminal_at FROM giraffe_research_backlog WHERE identity=?", ("dart:" + rcp,)).fetchone())
+        original["payload"] = json.loads(original["payload"])
+    finally:
+        db.close()
+
+    excluded, _ = commitment(key, [])
+    excluded.update({"schema_version": "giraffe-research-control-v3", "carry_forward": [], "terminal_exclusions": [original], "correction_of": []})
+    response = client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": excluded}, headers=CONTROL_HEADERS)
+    assert response.status_code == 200, response.text
+    excluded_digest = hashlib.sha256(canonical(excluded)).hexdigest()
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json={"status": "done", "count": 0, "detail": {"completion_receipt": receipt(key, excluded_digest, []), "control_terminal_dispositions": [], "discovery_terminal_dispositions": []}}).status_code == 200
+
+    correction_key = "research-2026-09-17-0700-kst-r9"; contract, _ = commitment(correction_key, [rcp])
+    contract['sources'][0].update({'report_class': 'dart_single_sale_supply_contract', 'report_name': '단일판매ㆍ공급계약체결'})
+    contract.update({"schema_version": "giraffe-research-control-v3", "carry_forward": [], "terminal_exclusions": [], "correction_of": [original]})
+    assert client.post(f"/api/internal/research-runs/{correction_key}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 200
+    evidence = client.post("/api/internal/evidence", headers=HEADERS, json={"symbol": "406820", "name": "뷰티스킨", "kind": "contract", "title": "공급계약", "summary": "30bn KRW China contract", "source": "DART", "source_url": "https://dart.fss.or.kr/beautyskin", "announcement_at": "2026-09-17T06:00:00+09:00", "known_at": "2026-09-17T13:19:00+09:00", "research_mode": "manual_catch_up", "research_run_key": correction_key, "snapshot": {"rcp_no": rcp, "dart_source": source}, "dedupe_key": "beautyskin-append-only-correction"})
+    assert evidence.status_code == 200
+    stored_correction = client.get(f"/api/internal/evidence/{evidence.json()['id']}", headers=HEADERS)
+    assert stored_correction.status_code == 200
+    assert stored_correction.json()["research_mode"] == "manual_catch_up"
+    assert stored_correction.json()["eligible_for_original_cutoff"] == 0
+    assert stored_correction.json()["known_at"] == "2026-09-17T13:19:00+09:00"
+    digest = hashlib.sha256(canonical(contract)).hexdigest()
+    result = receipt(correction_key, digest, [rcp], rejected_after_evidence=0, correction_stored=1)
+    candidate = result["coverage_lanes"]["kind_krx"]["checked_sources"][0]
+    candidate.update({"url": "https://dart.fss.or.kr/beautyskin", "outcome": "candidate", "economic_disposition": "correction_stored", "economic_reason": "KRW 30bn, 54.62% prior revenue, China, 5% advance", "evidence_id": evidence.json()["id"]})
+    result["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
+    audit = {'economic_disposition': 'qualifying_A_or_better', 'economic_reason': 'binding contract is 54.62% of prior revenue', 'economic_facts': {'binding_contract': True, 'contract_amount': 30000000000, 'prior_revenue': 54920000000, 'ratio_percent': 54.62, 'term': '2026-09-17 to 2027-09-16'}}
+    done = {"status": "done", "count": 1, "detail": {"completion_receipt": result, "control_terminal_dispositions": [{"rcp_no": rcp, "disposition": "correction_stored", "evidence_id": evidence.json()["id"], **audit}]}}
+    assert client.post(f"/api/internal/scheduler-runs/{correction_key}/finish", headers=HEADERS, json=done).status_code == 200
+
+    # The second contract is assembled through the actual prehook terminal-lookup
+    # path.  Its correction selection fails before registration because the
+    # lookup exposes both the immutable original and the terminal correction.
+    import importlib.util
+    import sys
+    scripts = Path(__file__).parents[1] / 'scripts'
+    sys.path.insert(0, str(scripts))
+    try:
+        spec = importlib.util.spec_from_file_location('giraffe_dart_manifest_gate_replay', scripts / 'giraffe_dart_manifest_gate.py')
+        assert spec and spec.loader
+        gate = importlib.util.module_from_spec(spec); sys.modules[spec.name] = gate; spec.loader.exec_module(gate)
+        class LocalResponse(io.BytesIO):
+            def __init__(self, request):
+                response = client.post('/api/internal/research-backlog/terminal-items', content=request.data,
+                                       headers={'X-Research-Control-Key': CONTROL_HEADERS['X-Research-Control-Key'], 'Content-Type': 'application/json'})
+                assert response.status_code == 200, response.text
+                super().__init__(response.content); self.status = response.status_code
+            def __enter__(self): return self
+            def __exit__(self, *_): self.close()
+        monkeypatch.setenv('GIRAFFE_URL', 'http://giraffe.test')
+        monkeypatch.setenv('RESEARCH_CONTROL_KEY', CONTROL_HEADERS['X-Research-Control-Key'])
+        monkeypatch.setattr(gate.urllib.request, 'urlopen', lambda request, timeout: LocalResponse(request))
+        terminal_history = gate.fetch_terminal_history([rcp])
+        assert original in terminal_history
+        assert len([item for item in terminal_history if item['identity'].startswith('dart:correction:')]) == 1
+        with __import__('pytest').raises(gate.ManifestError, match='selected correction receipt'):
+            gate.control_contract('research-2026-09-17-0700-kst-r10', [], terminal_history=terminal_history, correction_receipts=[rcp])
+    finally:
+        sys.path.remove(str(scripts)); sys.modules.pop('giraffe_dart_manifest_gate_replay', None)
+    assert client.get('/api/internal/scheduler-runs/research-2026-09-17-0700-kst-r10', headers=CONTROL_HEADERS).status_code == 404
+    db = connect()
+    try:
+        preserved = dict(db.execute("SELECT identity,kind,payload,terminal_disposition,terminal_run_key,terminal_evidence_id,terminal_at FROM giraffe_research_backlog WHERE identity=?", ("dart:" + rcp,)).fetchone()); preserved["payload"] = json.loads(preserved["payload"])
+        assert preserved == original
+        correction_rows = db.execute("SELECT identity,terminal_disposition,terminal_run_key,terminal_evidence_id FROM giraffe_research_backlog WHERE identity LIKE 'dart:correction:%' ORDER BY identity").fetchall()
+        assert len(correction_rows) == 1
+        assert dict(correction_rows[0]) == {"identity": correction_rows[0]["identity"], "terminal_disposition": "correction_stored", "terminal_run_key": correction_key, "terminal_evidence_id": evidence.json()["id"]}
+    finally:
+        db.close()
+
+
+def test_v3_registration_derives_contract_class_from_exact_authoritative_report_name():
+    client = TestClient(app); rcp = '20260917000002'
+    for number, name, supplied, expected in (
+        (1, '단일판매ㆍ공급계약체결', 'other', 422),
+        (2, '단일판매 · 공급계약 / 체결', 'other', 422),
+        (3, '단일판매ㆍ공급계약체결(자율공시)', 'dart_single_sale_supply_contract', 422),
+        (4, '단일판매ㆍ공급계약체결', 'dart_single_sale_supply_contract', 200),
+        (5, None, None, 422),
+        (6, '   ', 'other', 422),
+        (7, '기타경영사항', None, 422),
+    ):
+        key = f'research-2026-09-17-0700-kst-r{number}'
+        contract, _ = commitment(key, [rcp])
+        contract['sources'][0].update({'report_class': supplied, 'report_name': name})
+        contract.update({'schema_version': 'giraffe-research-control-v3', 'carry_forward': [], 'terminal_exclusions': [], 'correction_of': []})
+        response = client.post(f'/api/internal/research-runs/{key}/register', json={'control_contract': contract}, headers=CONTROL_HEADERS)
+        assert response.status_code == expected, response.text
+        if expected == 422:
+            assert client.get(f'/api/internal/scheduler-runs/{key}', headers=CONTROL_HEADERS).status_code == 404
+        else:
+            stored = client.get(f'/api/internal/scheduler-runs/{key}', headers=CONTROL_HEADERS).json()
+            assert stored['detail']['control_commitment']['control_contract']['sources'][0]['report_class'] == 'dart_single_sale_supply_contract'
+
+
+def test_v3_economic_audit_rejects_bare_malformed_and_qualifying_rejected_hold_then_accepts_saved():
+    client = TestClient(app); rcp = "20260917000001"
+
+    def v3_started(key):
+        contract, _ = commitment(key, [rcp])
+        source = contract["sources"][0]
+        source.update({"report_class": "dart_single_sale_supply_contract", "report_name": "단일판매ㆍ공급계약체결"})
+        contract.update({"schema_version": "giraffe-research-control-v3", "carry_forward": [], "terminal_exclusions": [], "correction_of": []})
+        assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 200
+        registered = client.get(f"/api/internal/scheduler-runs/{key}", headers=CONTROL_HEADERS)
+        assert registered.status_code == 200
+        assert registered.json()["detail"]["control_commitment"]["control_contract"]["sources"] == [source]
+        assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research"}, headers=HEADERS).status_code == 200
+        return contract
+
+    audit = {"economic_disposition": "qualifying_A_or_better", "economic_reason": "binding contract exceeds half of prior revenue", "economic_facts": {"binding_contract": True, "contract_amount": 50, "prior_revenue": 100, "ratio_percent": 50, "term": "2026-09-19 to 2027-09-18"}}
+    stale_ratio = {**audit, "economic_facts": {**audit["economic_facts"], "ratio_percent": 49.99}}
+    for number, disposition, extra in ((1, "rejected", {}), (2, "hold", {}), (3, "rejected", {"economic_reason": ""}), (4, "rejected", {"economic_reason": "x" * 1001}), (5, "rejected", {"economic_facts": {}}), (6, "rejected", {"economic_disposition": None, "economic_reason": None, "economic_facts": None}), (7, "rejected", stale_ratio), (8, "rejected", {"report_class": "other"})):
+        key = f"research-2026-09-17-0700-kst-r{number}"; contract = v3_started(key)
+        item = {"rcp_no": rcp, "disposition": disposition, "evidence_id": None, **audit, **extra}
+        done = {"status": "done", "count": 0, "detail": {"completion_receipt": receipt(key, hashlib.sha256(canonical(contract)).hexdigest(), [rcp]), "control_terminal_dispositions": [item]}}
+        assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done).status_code == 422
+
+    key = "research-2026-09-17-0700-kst-r7"; contract = v3_started(key); source = contract["sources"][0]
+    evidence = client.post("/api/internal/evidence", headers=HEADERS, json={"symbol": "406820", "kind": "contract", "title": "공급계약", "summary": "binding contract", "source": "DART", "source_url": "https://dart.fss.or.kr/qualifying", "announcement_at": "2026-09-17T06:00:00+09:00", "known_at": "2026-09-17T06:30:00+09:00", "research_mode": "scheduled_as_of", "research_run_key": key, "snapshot": {"rcp_no": rcp, "dart_source": source}, "dedupe_key": "v3-qualifying-saved"})
+    assert evidence.status_code == 200, evidence.text
+    value = receipt(key, hashlib.sha256(canonical(contract)).hexdigest(), [rcp], rejected_after_evidence=0, saved=1)
+    candidate = value["coverage_lanes"]["kind_krx"]["checked_sources"][0]
+    candidate.update({"url": "https://dart.fss.or.kr/qualifying", "outcome": "candidate", "economic_disposition": "saved", "economic_reason": "binding contract stored", "evidence_id": evidence.json()["id"]})
+    value["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
+    done = {"status": "done", "count": 1, "detail": {"completion_receipt": value, "control_terminal_dispositions": [{"rcp_no": rcp, "disposition": "saved", "evidence_id": evidence.json()["id"], **audit}]}}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done).status_code == 200
+
+
+def test_v3_terminal_lookup_is_bounded_canonical_and_exact(monkeypatch, tmp_path):
+    import kr_stock_autotrader.db as db_module
+    from kr_stock_autotrader.db import connect
+    monkeypatch.setattr(db_module, "DATABASE_PATH", str(tmp_path / "terminal-lookup.db"))
+    requested, unrequested = "20260919900001", "20260919900002"
+    db = connect()
+    try:
+        for rcp in (requested, unrequested):
+            payload = {"rcp_no": rcp, "date": "20260919"}
+            db.execute("INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,status,terminal_disposition,terminal_run_key,terminal_evidence_id,created_at,terminal_at) VALUES(?,?,?,?,?,?,?,?,?,?)", ("dart:" + rcp, "dart", json.dumps(payload, sort_keys=True), "research-2026-09-17-0700-kst-r1", "terminal", "hold", "research-2026-09-17-0700-kst-r1", None, "2026-09-19T07:00:00+09:00", "2026-09-19T07:01:00+09:00"))
+        db.commit()
+    finally:
+        db.close()
+    client = TestClient(app)
+    response = client.post("/api/internal/research-backlog/terminal-items", headers=CONTROL_HEADERS, json={"rcp_nos": [requested]})
+    assert response.status_code == 200
+    assert response.json()["requested_rcp_nos"] == [requested]
+    assert [item["payload"]["rcp_no"] for item in response.json()["items"]] == [requested]
+    for bad in ([], [requested] * 2, [unrequested, requested], ["bad"], [f"20260919{i:06d}" for i in range(201)]):
+        assert client.post("/api/internal/research-backlog/terminal-items", headers=CONTROL_HEADERS, json={"rcp_nos": bad}).status_code == 422
