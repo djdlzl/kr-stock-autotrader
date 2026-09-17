@@ -901,9 +901,11 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
         identity = _correction_backlog_identity(sources[item['rcp_no']], corrections[item['rcp_no']]) if item['rcp_no'] in corrections else _backlog_identity('dart', item['rcp_no'])
         backlog = db.execute("SELECT payload,status FROM giraffe_research_backlog WHERE identity=?", (identity,)).fetchone()
         pending_payload = json.loads(backlog['payload']) if backlog is not None else None
-        payload_matches = (_carried_dart_matches_source(pending_payload, sources[item['rcp_no']], v3=v3)
-                           if item['rcp_no'] in carried_dart and item['rcp_no'] not in corrections
-                           else pending_payload == sources[item['rcp_no']])
+        payload_matches = (_terminal_dart_matches_source(pending_payload, sources[item['rcp_no']])
+                           if v3 and item['rcp_no'] in carried_dart and item['rcp_no'] not in corrections
+                           else (_carried_dart_matches_source(pending_payload, sources[item['rcp_no']], v3=v3)
+                                 if item['rcp_no'] in carried_dart and item['rcp_no'] not in corrections
+                                 else pending_payload == sources[item['rcp_no']]))
         if backlog is None or backlog['status'] != 'pending' or not payload_matches:
             raise HTTPException(422, 'research terminal item was not actually pending for this run')
         if item['disposition'] in {'saved', 'existing', 'correction_stored'}:
