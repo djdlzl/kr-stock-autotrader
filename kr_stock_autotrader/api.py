@@ -563,6 +563,32 @@ def _seed_unfinished_research_backlog(db) -> None:
                 _enqueue_backlog(db, kind='dart', identity=source['rcp_no'], payload=source, run_key=row['run_key'])
 
 
+_DART_CORE_PROVENANCE_FIELDS = frozenset({"rcp_no", "date", "receipt_source_date", "packet_path", "packet_sha256"})
+
+
+def _same_dart_core_provenance(left: object, right: object) -> bool:
+    """Compare immutable DART packet provenance independently of v3 classification."""
+    return (isinstance(left, dict) and isinstance(right, dict)
+            and all(left.get(field) == right.get(field) for field in _DART_CORE_PROVENANCE_FIELDS))
+
+
+def _carried_dart_matches_source(carried: object, source: object, *, v3: bool) -> bool:
+    """Keep v2 equality strict while allowing v2 carry into enriched v3 sources."""
+    if not isinstance(carried, dict) or not isinstance(source, dict):
+        return False
+    return (set(carried) == _DART_CORE_PROVENANCE_FIELDS and _same_dart_core_provenance(carried, source)) if v3 else carried == source
+
+
+def _terminal_dart_matches_source(terminal: object, source: object) -> bool:
+    """Permit only exact legacy provenance or an exact classified terminal payload."""
+    if not isinstance(terminal, dict) or not isinstance(source, dict):
+        return False
+    terminal_fields = set(terminal)
+    if terminal_fields == _DART_CORE_PROVENANCE_FIELDS:
+        return _same_dart_core_provenance(terminal, source)
+    return terminal_fields == _DART_CORE_PROVENANCE_FIELDS | {'report_class', 'report_name'} and terminal == source
+
+
 def _research_commitment(run_key: str, contract: object) -> dict:
     """Validate the deterministic prehook contract before it becomes immutable state."""
     if not isinstance(contract, dict): raise HTTPException(422, "research control commitment required")
@@ -590,7 +616,9 @@ def _research_commitment(run_key: str, contract: object) -> dict:
                 raise HTTPException(422, "invalid research carry-forward set")
             carried_dart[item['identity'][5:]] = item['payload']
         sources_by_receipt = {source.get('rcp_no'): source for source in contract.get('sources', []) if isinstance(source, dict)}
-        if len(sources_by_receipt) != len(contract.get('sources', [])) or any(sources_by_receipt.get(rcp_no) != source for rcp_no, source in carried_dart.items()):
+        if (len(sources_by_receipt) != len(contract.get('sources', []))
+                or any(not _carried_dart_matches_source(carried, sources_by_receipt.get(rcp_no), v3=v3)
+                       for rcp_no, carried in carried_dart.items())):
             raise HTTPException(422, "carried DART provenance does not match the immutable source")
         for item in carried:
             if item.get('kind') == 'discovery':
@@ -613,7 +641,7 @@ def _research_commitment(run_key: str, contract: object) -> dict:
                     or not isinstance(sources, list) or len(sources) != len(expected)):
                 raise
             if any(not isinstance(rcp, str) or not re.fullmatch(r"\d{14}", rcp) for rcp in expected): raise
-            source_fields = {"rcp_no", "date", "receipt_source_date", "packet_path", "packet_sha256"} | ({"report_class", "report_name"} if v3 else set())
+            source_fields = _DART_CORE_PROVENANCE_FIELDS | ({"report_class", "report_name"} if v3 else set())
             for source in sources:
                 if (not isinstance(source, dict) or set(source) != source_fields
                         or source.get("rcp_no") not in expected or not isinstance(source.get("date"), str)
@@ -628,7 +656,7 @@ def _research_commitment(run_key: str, contract: object) -> dict:
                             or source['report_class'] != _authoritative_report_class(source['report_name'])
                         ))): raise
                 if source["date"] not in contract["dates"] and source["rcp_no"] not in carried_dart: raise
-                if source['rcp_no'] in carried_dart and source != carried_dart[source['rcp_no']]: raise
+                if source['rcp_no'] in carried_dart and not _carried_dart_matches_source(carried_dart[source['rcp_no']], source, v3=v3): raise
             return {"control_contract": contract, "control_contract_sha256": _sha256(contract)}
     required = v1_required
     if (set(contract) != required or contract.get("schema_version") != "giraffe-research-control-v1"
@@ -724,7 +752,8 @@ def _terminal_dart_history(db, contract: dict) -> dict[str, dict]:
     if excluded != sorted(excluded) or corrected != sorted(corrected) or set(excluded) & set(corrected):
         raise HTTPException(422, 'terminal DART history is not canonical')
     sources = {source['rcp_no']: source for source in contract['sources']}
-    if any(rcp in sources for rcp in excluded) or any(rcp not in sources or sources[rcp] != history[rcp]['payload'] for rcp in corrected):
+    if (any(rcp in sources for rcp in excluded)
+            or any(rcp not in sources or not _terminal_dart_matches_source(history[rcp]['payload'], sources[rcp]) for rcp in corrected)):
         raise HTTPException(422, 'terminal DART history does not match control sources')
     for rcp in corrected:
         prior = history[rcp]

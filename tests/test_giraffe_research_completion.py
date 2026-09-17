@@ -926,15 +926,18 @@ def test_v3_terminal_exclusion_and_beautyskin_append_only_correction(monkeypatch
     old, key, rcp = "research-2026-09-16-0700-kst-r7", "research-2026-09-17-0700-kst-r8", "20260916900230"
     source = commitment(key, [rcp])[0]["sources"][0]
     source.update({'report_class': 'dart_single_sale_supply_contract', 'report_name': '단일판매ㆍ공급계약체결'})
+    # Historical terminal payload predates v3 classification and must remain unchanged.
+    legacy_terminal_source = {field: source[field] for field in ('rcp_no', 'date', 'receipt_source_date', 'packet_path', 'packet_sha256')}
     db = connect()
     try:
         db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,finished_at,detail) VALUES(?,?,?,?,?,?)", (old, "research", "done", "2026-09-16T07:00:00+09:00", "2026-09-16T07:01:00+09:00", "{}"))
-        db.execute("INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,status,terminal_disposition,terminal_run_key,terminal_evidence_id,created_at,terminal_at) VALUES(?,?,?,?,?,?,?,?,?,?)", ("dart:" + rcp, "dart", json.dumps(source, sort_keys=True), old, "terminal", "rejected", old, None, "2026-09-16T07:00:00+09:00", "2026-09-16T07:01:00+09:00"))
+        db.execute("INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,status,terminal_disposition,terminal_run_key,terminal_evidence_id,created_at,terminal_at) VALUES(?,?,?,?,?,?,?,?,?,?)", ("dart:" + rcp, "dart", json.dumps(legacy_terminal_source, sort_keys=True), old, "terminal", "rejected", old, None, "2026-09-16T07:00:00+09:00", "2026-09-16T07:01:00+09:00"))
         db.commit()
         original = dict(db.execute("SELECT identity,kind,payload,terminal_disposition,terminal_run_key,terminal_evidence_id,terminal_at FROM giraffe_research_backlog WHERE identity=?", ("dart:" + rcp,)).fetchone())
         original["payload"] = json.loads(original["payload"])
     finally:
         db.close()
+    assert original['payload'] == legacy_terminal_source
 
     excluded, _ = commitment(key, [])
     excluded.update({"schema_version": "giraffe-research-control-v3", "carry_forward": [], "terminal_exclusions": [original], "correction_of": []})
@@ -1026,6 +1029,39 @@ def test_v3_registration_derives_contract_class_from_exact_authoritative_report_
         else:
             stored = client.get(f'/api/internal/scheduler-runs/{key}', headers=CONTROL_HEADERS).json()
             assert stored['detail']['control_commitment']['control_contract']['sources'][0]['report_class'] == 'dart_single_sale_supply_contract'
+
+
+def test_v3_registration_accepts_legacy_dart_carry_only_for_exact_immutable_core():
+    client = TestClient(app); rcp = '20260917000002'
+    source_contract, _ = commitment('research-2026-09-17-0700-kst-r11', [rcp])
+    source = source_contract['sources'][0]
+    source.update({'report_class': 'dart_single_sale_supply_contract', 'report_name': '단일판매ㆍ공급계약체결'})
+    legacy = {field: source[field] for field in ('rcp_no', 'date', 'receipt_source_date', 'packet_path', 'packet_sha256')}
+    contract = {**source_contract, 'schema_version': 'giraffe-research-control-v3',
+                'carry_forward': [{'identity': 'dart:' + rcp, 'kind': 'dart', 'payload': legacy}],
+                'terminal_exclusions': [], 'correction_of': []}
+    response = client.post('/api/internal/research-runs/research-2026-09-17-0700-kst-r11/register', json={'control_contract': contract}, headers=CONTROL_HEADERS)
+    assert response.status_code == 200, response.text
+    stored = client.get('/api/internal/scheduler-runs/research-2026-09-17-0700-kst-r11', headers=CONTROL_HEADERS).json()
+    stored_contract = stored['detail']['control_commitment']['control_contract']
+    assert stored_contract['carry_forward'][0]['payload'] == legacy
+    assert stored_contract['sources'][0] == source
+
+    for number, field, value in ((12, 'packet_sha256', 'b' * 64), (13, 'packet_path', source['packet_path'] + '.other'),
+                                 (14, 'date', '20260916'), (15, 'receipt_source_date', '20260916')):
+        key = f'research-2026-09-17-0700-kst-r{number}'
+        bad = json.loads(json.dumps(contract)); bad['run_key'] = key
+        bad['carry_forward'][0]['payload'][field] = value
+        response = client.post(f'/api/internal/research-runs/{key}/register', json={'control_contract': bad}, headers=CONTROL_HEADERS)
+        assert response.status_code == 422, response.text
+
+    # Carry-forward payloads are legacy five-field provenance only; they cannot
+    # introduce a caller-selected classification that downgrades the v3 source.
+    key = 'research-2026-09-17-0700-kst-r16'
+    classified = json.loads(json.dumps(contract)); classified['run_key'] = key
+    classified['carry_forward'][0]['payload']['report_class'] = 'other'
+    response = client.post(f'/api/internal/research-runs/{key}/register', json={'control_contract': classified}, headers=CONTROL_HEADERS)
+    assert response.status_code == 422, response.text
 
 
 def test_v3_economic_audit_rejects_bare_malformed_and_qualifying_rejected_hold_then_accepts_saved():

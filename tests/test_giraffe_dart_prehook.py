@@ -339,6 +339,54 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                 with self.assertRaises(self.gate.ManifestError):
                     self.gate.control_contract("research-2026-09-17-0700-kst-r8", summary, terminal_history=history, correction_receipts=selected)
 
+    def test_v2_pending_dart_payloads_keep_immutable_core_while_v3_sources_remain_authoritative(self):
+        """The r9-shaped pending set may overlap enriched v3/current sources."""
+        control_date = "20260917"
+        pending_receipts = [f"20260916{number:06d}" for number in range(1, 37)]
+        correction_receipt = "20260916900230"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            receipts = [*pending_receipts, correction_receipt]
+            paths = {receipt: self.gate.write_packet(valid_source_packet(self.gate, receipt), root / control_date)
+                     for receipt in receipts}
+            summary = [{"date": control_date, "material_candidate_records": [
+                {"rcp_no": receipt, "rcept_dt": control_date, "report_nm": "단일판매ㆍ공급계약체결"}
+                for receipt in receipts], "source_packet_paths": [str(paths[receipt]) for receipt in receipts]}]
+            legacy = [{"identity": "dart:" + receipt, "kind": "dart", "payload": {
+                "rcp_no": receipt, "date": control_date, "receipt_source_date": "20260916",
+                "packet_path": str(paths[receipt]), "packet_sha256": hashlib.sha256(paths[receipt].read_bytes()).hexdigest(),
+            }} for receipt in pending_receipts]
+            # The production BeautySkin correction was terminalized under v2:
+            # retain that five-field payload verbatim while the current source is v3.
+            correction_payload = {"rcp_no": correction_receipt, "date": control_date, "receipt_source_date": "20260916",
+                                  "packet_path": str(paths[correction_receipt]), "packet_sha256": hashlib.sha256(paths[correction_receipt].read_bytes()).hexdigest()}
+            correction = {"identity": "dart:" + correction_receipt, "kind": "dart", "payload": correction_payload,
+                          "terminal_disposition": "hold", "terminal_run_key": "research-2026-09-16-0700-kst-r8",
+                          "terminal_evidence_id": None, "terminal_at": "2026-09-17T07:00:00+09:00"}
+            contract = self.gate.control_contract("research-2026-09-17-0700-kst-r9", summary, legacy, [correction], [correction_receipt])
+            self.assertEqual(contract["carry_forward"], legacy)
+            self.assertEqual(contract["correction_of"], [correction])
+            self.assertEqual(contract["correction_of"][0]["payload"], correction_payload)
+            self.assertEqual(contract["expected_rcp_nos"], sorted(receipts))
+            self.assertTrue(all(set(source) == {"rcp_no", "date", "receipt_source_date", "packet_path", "packet_sha256", "report_class", "report_name"}
+                                for source in contract["sources"]))
+            self.assertTrue(all(source["report_class"] == "dart_single_sale_supply_contract" for source in contract["sources"]))
+            broken = json.loads(json.dumps(legacy))
+            broken[0]["payload"]["packet_sha256"] = "b" * 64
+            with self.assertRaisesRegex(self.gate.ManifestError, "conflicting current and carried DART provenance"):
+                self.gate.control_contract("research-2026-09-17-0700-kst-r10", summary, broken, [correction], [correction_receipt])
+            for field, value in (("packet_sha256", "b" * 64), ("packet_path", "/other.json"),
+                                 ("date", "20260916"), ("receipt_source_date", "20260917"),
+                                 ("rcp_no", "20260916900998")):
+                invalid = json.loads(json.dumps(correction))
+                invalid["payload"][field] = value
+                with self.subTest(terminal_legacy_field=field), self.assertRaises(self.gate.ManifestError):
+                    self.gate.control_contract("research-2026-09-17-0700-kst-r10", summary, legacy, [invalid], [correction_receipt])
+            classified = json.loads(json.dumps(correction))
+            classified["payload"].update({"report_class": "other", "report_name": "기타경영사항"})
+            with self.assertRaisesRegex(self.gate.ManifestError, "terminal research history conflicts"):
+                self.gate.control_contract("research-2026-09-17-0700-kst-r10", summary, legacy, [classified], [correction_receipt])
+
     def test_production_shaped_discovery_backlog_is_normalized_and_hostile_shapes_fail_closed(self):
         announced = "2026-09-15T10:43:20+09:00"
         source_url = "https://KIND.KRX.CO.KR:443/notice/doosan"
