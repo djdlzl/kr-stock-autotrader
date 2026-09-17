@@ -1106,6 +1106,53 @@ def test_v3_finish_accepts_pending_legacy_carry_without_rewriting_its_payload(mo
         db.close()
 
 
+def test_v3_finish_terminalizes_normalized_core_carry_against_authoritative_classified_backlog(monkeypatch, tmp_path):
+    import kr_stock_autotrader.db as db_module
+    from kr_stock_autotrader.db import connect
+    monkeypatch.setattr(db_module, 'DATABASE_PATH', str(tmp_path / 'classified-carry-finish.db'))
+    client = TestClient(app)
+
+    def finish_with_backlog(number, mutation, expected_status):
+        key = f'research-2026-09-17-0700-kst-r{number}'
+        rcp = f'202609160004{number:02d}'
+        contract, _ = commitment(key, [rcp])
+        source = contract['sources'][0]
+        source.update({'report_class': 'other', 'report_name': '주요사항보고서(유상증자결정)'})
+        stored_source = {**source, **mutation}
+        core = {field: source[field] for field in ('rcp_no', 'date', 'receipt_source_date', 'packet_path', 'packet_sha256')}
+        contract.update({'schema_version': 'giraffe-research-control-v3',
+                         'carry_forward': [{'identity': 'dart:' + rcp, 'kind': 'dart', 'payload': core}],
+                         'terminal_exclusions': [], 'correction_of': []})
+        assert client.post(f'/api/internal/research-runs/{key}/register', json={'control_contract': contract}, headers=CONTROL_HEADERS).status_code == 200
+        db = connect()
+        try:
+            existing = db.execute('SELECT payload,status FROM giraffe_research_backlog WHERE identity=?', ('dart:' + rcp,)).fetchone()
+            assert json.loads(existing['payload']) == source and existing['status'] == 'pending'
+            db.execute('UPDATE giraffe_research_backlog SET payload=? WHERE identity=?',
+                       (json.dumps(stored_source, sort_keys=True), 'dart:' + rcp))
+            db.commit()
+        finally:
+            db.close()
+        done = {'status': 'done', 'count': 0, 'detail': {'completion_receipt': receipt(key, hashlib.sha256(canonical(contract)).hexdigest(), [rcp]),
+                'control_terminal_dispositions': [{'rcp_no': rcp, 'disposition': 'rejected', 'evidence_id': None,
+                                                   'economic_disposition': 'negative_risk', 'economic_reason': 'dilutive financing risk',
+                                                   'economic_facts': None}]}}
+        response = client.post(f'/api/internal/scheduler-runs/{key}/finish', headers=HEADERS, json=done)
+        assert response.status_code == expected_status, response.text
+        db = connect()
+        try:
+            row = db.execute('SELECT payload,status,terminal_run_key FROM giraffe_research_backlog WHERE identity=?', ('dart:' + rcp,)).fetchone()
+            assert json.loads(row['payload']) == stored_source
+            assert row['status'] == ('terminal' if expected_status == 200 else 'pending')
+            assert row['terminal_run_key'] == (key if expected_status == 200 else None)
+        finally:
+            db.close()
+
+    finish_with_backlog(66, {}, 200)
+    for field, value in (('report_class', 'dart_single_sale_supply_contract'), ('report_name', '변경된 보고서명')):
+        finish_with_backlog(67 if field == 'report_class' else 68, {field: value}, 422)
+
+
 def test_v3_economic_audit_rejects_bare_malformed_and_qualifying_rejected_hold_then_accepts_saved():
     client = TestClient(app); rcp = "20260917000001"
 
