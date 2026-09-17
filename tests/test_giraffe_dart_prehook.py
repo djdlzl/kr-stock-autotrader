@@ -462,6 +462,33 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             with self.assertRaisesRegex(self.gate.ManifestError, "terminal research history conflicts"):
                 self.gate.control_contract("research-2026-09-17-0700-kst-r10", summary, legacy, [classified], [correction_receipt])
 
+    def test_persisted_classified_dart_backlog_normalizes_only_exact_authoritative_metadata(self):
+        receipt, control_date, report_name = "20260916900230", "20260917", "단일판매ㆍ공급계약체결"
+        with tempfile.TemporaryDirectory() as temp:
+            packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), pathlib.Path(temp) / control_date)
+            core = {"rcp_no": receipt, "date": control_date, "receipt_source_date": "20260916",
+                    "packet_path": str(packet), "packet_sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
+            summary = [{"date": control_date, "material_candidate_records": [
+                {"rcp_no": receipt, "rcept_dt": control_date, "report_nm": report_name}],
+                "source_packet_paths": [str(packet)]}]
+            classified = {**core, "report_class": "dart_single_sale_supply_contract", "report_name": report_name}
+            row = {"identity": "dart:" + receipt, "kind": "dart", "payload": classified}
+            contract = self.gate.control_contract("research-2026-09-17-0700-kst-r9", summary, [row])
+            self.assertEqual(contract["carry_forward"], [{"identity": "dart:" + receipt, "kind": "dart", "payload": core}])
+            self.assertEqual(contract["sources"][0], classified)
+            for mutate in (
+                lambda payload: payload.update(unexpected=True),
+                lambda payload: payload.pop("report_name"),
+                lambda payload: payload.update(report_name="기타경영사항"),
+                lambda payload: payload.update(report_class="other"),
+                lambda payload: payload.update(packet_sha256="b" * 64),
+                lambda payload: payload.update(report_name=" "),
+            ):
+                bad = json.loads(json.dumps(row))
+                mutate(bad["payload"])
+                with self.subTest(mutate=mutate), self.assertRaisesRegex(self.gate.ManifestError, "durable DART backlog|conflicting current"):
+                    self.gate.control_contract("research-2026-09-17-0700-kst-r9", summary, [bad])
+
     def test_authoritative_contract_classifier_accepts_only_bare_or_exact_correction_prefix(self):
         for name in ("단일판매ㆍ공급계약체결", "[기재정정]단일판매ㆍ공급계약체결", "[기재정정] 단일판매 · 공급계약 / 체결"):
             with self.subTest(name=name):
