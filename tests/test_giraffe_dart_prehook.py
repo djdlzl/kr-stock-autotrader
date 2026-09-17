@@ -324,6 +324,81 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(contract["expected_rcp_nos"], [])
         self.assertEqual(contract["terminal_exclusions"], history)
 
+    def test_terminal_other_report_class_promotes_for_exact_authoritative_name_and_core(self):
+        report_name = "[기재정정]단일판매ㆍ공급계약체결" + " " * 14
+        current = {
+            "rcp_no": "20260917800210",
+            "date": "20260918",
+            "receipt_source_date": "20260917",
+            "packet_path": "/packets/20260918/20260917800210.json",
+            "packet_sha256": "a" * 64,
+            "report_class": "dart_single_sale_supply_contract",
+            "report_name": report_name,
+        }
+        terminal = {**current, "report_class": "other"}
+
+        self.assertTrue(self.gate.terminal_dart_matches_current(terminal, current))
+
+    def test_terminal_report_class_promotion_rejects_all_other_changes(self):
+        report_name = "[기재정정]단일판매ㆍ공급계약체결" + " " * 14
+        current = {
+            "rcp_no": "20260917800210",
+            "date": "20260918",
+            "receipt_source_date": "20260917",
+            "packet_path": "/packets/20260918/20260917800210.json",
+            "packet_sha256": "a" * 64,
+            "report_class": "dart_single_sale_supply_contract",
+            "report_name": report_name,
+        }
+        terminal = {**current, "report_class": "other"}
+
+        reverse_terminal = {**current, "report_class": "dart_single_sale_supply_contract"}
+        reverse_current = {**current, "report_class": "other"}
+        self.assertFalse(self.gate.terminal_dart_matches_current(reverse_terminal, reverse_current))
+
+        different_name = {**current, "report_name": report_name.rstrip()}
+        self.assertFalse(self.gate.terminal_dart_matches_current(terminal, different_name))
+
+        changed_core_values = {
+            "rcp_no": "20260917800211",
+            "date": "20260919",
+            "receipt_source_date": "20260918",
+            "packet_path": "/packets/20260918/different.json",
+            "packet_sha256": "b" * 64,
+        }
+        for field, value in changed_core_values.items():
+            with self.subTest(changed_core_field=field):
+                self.assertFalse(
+                    self.gate.terminal_dart_matches_current({**terminal, field: value}, current)
+                )
+
+        for terminal_class, current_class in (
+            ("legacy_unclassified", "dart_single_sale_supply_contract"),
+            ("other", "arbitrary_future_class"),
+        ):
+            with self.subTest(terminal_class=terminal_class, current_class=current_class):
+                self.assertFalse(
+                    self.gate.terminal_dart_matches_current(
+                        {**terminal, "report_class": terminal_class},
+                        {**current, "report_class": current_class},
+                    )
+                )
+
+    def test_terminal_dart_match_preserves_existing_exact_and_v2_behavior(self):
+        classified = {
+            "rcp_no": "20260917800210",
+            "date": "20260918",
+            "receipt_source_date": "20260917",
+            "packet_path": "/packets/20260918/20260917800210.json",
+            "packet_sha256": "a" * 64,
+            "report_class": "dart_single_sale_supply_contract",
+            "report_name": "[기재정정]단일판매ㆍ공급계약체결",
+        }
+        legacy_v2 = {field: classified[field] for field in self.gate._DART_CORE_PROVENANCE_FIELDS}
+
+        self.assertTrue(self.gate.terminal_dart_matches_current(classified, dict(classified)))
+        self.assertTrue(self.gate.terminal_dart_matches_current(legacy_v2, classified))
+
     def test_prehook_correction_selection_moves_only_rejected_hold_audit(self):
         receipt, control_date = "20260916900230", "20260917"
         with tempfile.TemporaryDirectory() as temp:
