@@ -476,6 +476,7 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             contract = self.gate.control_contract("research-2026-09-17-0700-kst-r9", summary, [row])
             self.assertEqual(contract["carry_forward"], [{"identity": "dart:" + receipt, "kind": "dart", "payload": core}])
             self.assertEqual(contract["sources"][0], classified)
+            self.assertEqual(self.gate.control_contract("research-2026-09-17-0700-kst-r9", summary, [row]), contract)
             for mutate in (
                 lambda payload: payload.update(unexpected=True),
                 lambda payload: payload.pop("report_name"),

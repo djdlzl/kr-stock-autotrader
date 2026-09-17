@@ -213,6 +213,25 @@ def terminal_dart_matches_current(terminal: object, current: object) -> bool:
             and same_dart_core_provenance(terminal, current))
 
 
+def normalize_durable_dart_backlog_payload(payload: object, current: object) -> dict | None:
+    """Read legacy classified rows only when their immutable metadata matches current authority."""
+    if not isinstance(payload, dict):
+        return None
+    fields = set(payload)
+    if fields == _DART_CORE_PROVENANCE_FIELDS:
+        return {field: payload[field] for field in _DART_CORE_PROVENANCE_FIELDS}
+    classified_fields = _DART_CORE_PROVENANCE_FIELDS | {'report_class', 'report_name'}
+    if fields != classified_fields or not isinstance(current, dict) or set(current) != classified_fields:
+        return None
+    report_name, report_class = payload['report_name'], payload['report_class']
+    if (not isinstance(report_name, str) or not report_name.strip() or len(report_name) > 500
+            or report_class not in {'dart_single_sale_supply_contract', 'other'}
+            or report_class != authoritative_report_class(report_name)
+            or payload['report_name'] != current['report_name'] or payload['report_class'] != current['report_class']):
+        return None
+    return {field: payload[field] for field in _DART_CORE_PROVENANCE_FIELDS}
+
+
 def control_contract(run_key: str, summaries: list[dict], carry_forward: list[dict] | None = None,
                      terminal_history: list[dict] | None = None, correction_receipts: list[str] | None = None) -> dict:
     sources = []
@@ -275,17 +294,18 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
         if not isinstance(identity, str) or any(identity == prior["identity"] for prior in carry_items) or kind not in {"dart", "discovery"}:
             raise ManifestError("durable research backlog item invalid")
         if kind == "dart":
-            if not isinstance(payload, dict) or set(payload) != _DART_CORE_PROVENANCE_FIELDS:
+            current = sources_by_receipt.get(payload.get("rcp_no")) if isinstance(payload, dict) else None
+            normalized_payload = normalize_durable_dart_backlog_payload(payload, current)
+            if normalized_payload is None:
                 raise ManifestError("durable DART backlog source invalid")
-            metadata = completed_packet(Path(payload["packet_path"]), payload["rcp_no"], expected_control_date=payload["date"])
-            if metadata is None or identity != "dart:" + payload["rcp_no"]:
+            metadata = completed_packet(Path(normalized_payload["packet_path"]), normalized_payload["rcp_no"], expected_control_date=normalized_payload["date"])
+            if metadata is None or identity != "dart:" + normalized_payload["rcp_no"]:
                 raise ManifestError("durable DART backlog packet unavailable")
-            current = sources_by_receipt.get(payload["rcp_no"])
-            if current is not None and not same_dart_core_provenance(current, payload):
+            if current is not None and not same_dart_core_provenance(current, normalized_payload):
                 raise ManifestError("conflicting current and carried DART provenance")
             if current is None:
-                sources_by_receipt[payload["rcp_no"]] = payload
-            carry_items.append({"identity": identity, "kind": "dart", "payload": payload})
+                sources_by_receipt[normalized_payload["rcp_no"]] = normalized_payload
+            carry_items.append({"identity": identity, "kind": "dart", "payload": normalized_payload})
         else:
             if set(item) != {"identity", "kind", "payload", "original_announcement_at", "first_run_key"}:
                 raise ManifestError("durable discovery backlog provenance invalid")
