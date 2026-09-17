@@ -387,6 +387,31 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             with self.assertRaisesRegex(self.gate.ManifestError, "terminal research history conflicts"):
                 self.gate.control_contract("research-2026-09-17-0700-kst-r10", summary, legacy, [classified], [correction_receipt])
 
+    def test_authoritative_contract_classifier_accepts_only_bare_or_exact_correction_prefix(self):
+        for name in ("단일판매ㆍ공급계약체결", "[기재정정]단일판매ㆍ공급계약체결", "[기재정정] 단일판매 · 공급계약 / 체결"):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self.gate._report_class({"report_nm": name}),
+                    ("dart_single_sale_supply_contract", name),
+                )
+        for name in (
+            "[기재정정]단일판매ㆍ공급계약체결(자율공시)",
+            "단일판매ㆍ공급계약체결(자율공시)",
+            "임의[기재정정]단일판매ㆍ공급계약체결",
+            "[기재정정][기재정정]단일판매ㆍ공급계약체결",
+            "[기재정정]단일판매ㆍ공급계약체결추가",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(self.gate._report_class({"report_nm": name}), ("other", name))
+        self.assertEqual(self.gate._report_class({}), ("legacy_unclassified", "legacy OpenDART report metadata unavailable"))
+        for name in (None, "", " " * 501):
+            with self.subTest(name=name):
+                if name is None:
+                    self.assertEqual(self.gate._report_class({"report_nm": name}), ("legacy_unclassified", "legacy OpenDART report metadata unavailable"))
+                else:
+                    with self.assertRaisesRegex(self.gate.ManifestError, "report name invalid"):
+                        self.gate._report_class({"report_nm": name})
+
     def test_production_shaped_discovery_backlog_is_normalized_and_hostile_shapes_fail_closed(self):
         announced = "2026-09-15T10:43:20+09:00"
         source_url = "https://KIND.KRX.CO.KR:443/notice/doosan"

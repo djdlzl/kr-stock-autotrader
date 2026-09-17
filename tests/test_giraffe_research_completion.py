@@ -1014,9 +1014,14 @@ def test_v3_registration_derives_contract_class_from_exact_authoritative_report_
         (2, '단일판매 · 공급계약 / 체결', 'other', 422),
         (3, '단일판매ㆍ공급계약체결(자율공시)', 'dart_single_sale_supply_contract', 422),
         (4, '단일판매ㆍ공급계약체결', 'dart_single_sale_supply_contract', 200),
-        (5, None, None, 422),
-        (6, '   ', 'other', 422),
-        (7, '기타경영사항', None, 422),
+        (5, '[기재정정]단일판매ㆍ공급계약체결', 'dart_single_sale_supply_contract', 200),
+        (6, '[기재정정] 단일판매 · 공급계약 / 체결', 'dart_single_sale_supply_contract', 200),
+        (7, '[기재정정]단일판매ㆍ공급계약체결(자율공시)', 'dart_single_sale_supply_contract', 422),
+        (8, '임의[기재정정]단일판매ㆍ공급계약체결', 'dart_single_sale_supply_contract', 422),
+        (9, '[기재정정]단일판매ㆍ공급계약체결추가', 'dart_single_sale_supply_contract', 422),
+        (10, None, None, 422),
+        (11, '   ', 'other', 422),
+        (12, '기타경영사항', None, 422),
     ):
         key = f'research-2026-09-17-0700-kst-r{number}'
         contract, _ = commitment(key, [rcp])
@@ -1133,6 +1138,137 @@ def test_v3_economic_audit_rejects_bare_malformed_and_qualifying_rejected_hold_t
     value["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
     done = {"status": "done", "count": 1, "detail": {"completion_receipt": value, "control_terminal_dispositions": [{"rcp_no": rcp, "disposition": "saved", "evidence_id": evidence.json()["id"], **audit}]}}
     assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done).status_code == 200
+
+
+def test_v3_corrected_contract_requires_incremental_amendment_economics():
+    client = TestClient(app); rcp = "20260917000003"
+
+    def started(number):
+        key = f"research-2026-09-17-0700-kst-r{number}"
+        contract, _ = commitment(key, [rcp])
+        source = contract["sources"][0]
+        source.update({"report_class": "dart_single_sale_supply_contract", "report_name": "[기재정정]단일판매ㆍ공급계약체결"})
+        contract.update({"schema_version": "giraffe-research-control-v3", "carry_forward": [], "terminal_exclusions": [], "correction_of": []})
+        assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 200
+        assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research"}, headers=HEADERS).status_code == 200
+        return key, contract
+
+    # HanJeon-shaped amended total is 81.2% of revenue; its actual increment is only 1.97%.
+    facts = {"binding_contract": True, "economic_basis": "amendment_delta", "original_contract_amount": 792300,
+             "amended_contract_amount": 812000, "incremental_contract_amount": 19700, "prior_revenue": 1000000,
+             "incremental_ratio_percent": 1.97, "original_term": "2026-01-01 to 2026-12-31", "amended_term": "2026-01-01 to 2027-06-30"}
+    audit = {"economic_disposition": "below_threshold", "economic_reason": "amendment increment is below half of prior revenue", "economic_facts": facts}
+    key, contract = started(20)
+    done = {"status": "done", "count": 0, "detail": {"completion_receipt": receipt(key, hashlib.sha256(canonical(contract)).hexdigest(), [rcp]), "control_terminal_dispositions": [{"rcp_no": rcp, "disposition": "rejected", "evidence_id": None, **audit}]}}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done).status_code == 200
+
+    legacy = {"binding_contract": True, "contract_amount": 812000, "prior_revenue": 1000000, "ratio_percent": 81.2, "term": "2026-01-01 to 2027-06-30"}
+    invalid_facts = [
+        legacy,
+        {**facts, "incremental_contract_amount": 19701},
+        {**facts, "incremental_ratio_percent": 1.96},
+        {**facts, "incremental_ratio_percent": float("nan")},
+        {**facts, "original_contract_amount": True},
+        {**facts, "unexpected": 1},
+        {key: value for key, value in facts.items() if key != "amended_term"},
+    ]
+    for number, bad_facts in enumerate(invalid_facts, 21):
+        key, contract = started(number)
+        bad = {**audit, "economic_facts": bad_facts}
+        done = {"status": "done", "count": 0, "detail": {"completion_receipt": receipt(key, hashlib.sha256(canonical(contract)).hexdigest(), [rcp]), "control_terminal_dispositions": [{"rcp_no": rcp, "disposition": "rejected", "evidence_id": None, **bad}]}}
+        response = (client.post(f"/api/internal/scheduler-runs/{key}/finish", headers={**HEADERS, "content-type": "application/json"}, content=json.dumps(done))
+                    if isinstance(bad_facts.get("incremental_ratio_percent"), float) and __import__("math").isnan(bad_facts["incremental_ratio_percent"])
+                    else client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done))
+        assert response.status_code == 422
+
+    qualifying = {**facts, "amended_contract_amount": 1292300, "incremental_contract_amount": 500000,
+                  "incremental_ratio_percent": 50}
+    source = {"report_class": "dart_single_sale_supply_contract", "report_name": "[기재정정]단일판매ㆍ공급계약체결"}
+    assert api_module._valid_control_economic_audit(source, {**audit, "economic_disposition": "qualifying_A_or_better", "economic_facts": qualifying})
+    assert not api_module._valid_control_economic_audit(source, {**audit, "economic_facts": qualifying})
+    zero = {**facts, "amended_contract_amount": 792300, "incremental_contract_amount": 0, "incremental_ratio_percent": 0}
+    assert not api_module._valid_control_economic_audit(source, {**audit, "economic_disposition": "qualifying_A_or_better", "economic_facts": zero})
+
+def test_v3_fresh_corrected_qualifying_terminalization_requires_bound_evidence(monkeypatch, tmp_path):
+    """Every assertion starts a new corrected-title cursor, never a prior terminal receipt."""
+    import kr_stock_autotrader.db as db_module
+    from kr_stock_autotrader.db import connect
+
+    monkeypatch.setattr(db_module, "DATABASE_PATH", str(tmp_path / "fresh-corrected-terminalization.db"))
+    client = TestClient(app)
+    qualifying_facts = {
+        "binding_contract": True, "economic_basis": "amendment_delta", "original_contract_amount": 500000,
+        "amended_contract_amount": 1000000, "incremental_contract_amount": 500000, "prior_revenue": 1000000,
+        "incremental_ratio_percent": 50, "original_term": "2026-01-01 to 2026-12-31",
+        "amended_term": "2026-01-01 to 2027-06-30",
+    }
+    qualifying_audit = {
+        "economic_disposition": "qualifying_A_or_better",
+        "economic_reason": "binding amendment increment meets half of prior revenue",
+        "economic_facts": qualifying_facts,
+    }
+
+    def fresh_started(case):
+        key, rcp = f"research-2026-09-17-0700-kst-r{600 + case}", f"20260917{600 + case:06d}"
+        contract, _ = commitment(key, [rcp])
+        source = contract["sources"][0]
+        source.update({"report_class": "dart_single_sale_supply_contract", "report_name": "[기재정정]단일판매ㆍ공급계약체결"})
+        contract.update({"schema_version": "giraffe-research-control-v3", "carry_forward": [], "terminal_exclusions": [], "correction_of": []})
+        assert client.post(f"/api/internal/research-runs/{key}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 200
+        assert client.post(f"/api/internal/scheduler-runs/{key}/start", json={"kind": "research"}, headers=HEADERS).status_code == 200
+        return key, rcp, contract, source
+
+    def done(key, rcp, contract, disposition, evidence_id, audit, *, evidence_url=None):
+        totals = {"rejected_after_evidence": int(disposition in {"rejected", "hold"}), "saved": int(disposition == "saved"), "correction_stored": int(disposition == "correction_stored")}
+        value = receipt(key, hashlib.sha256(canonical(contract)).hexdigest(), [rcp], **totals)
+        if evidence_id is not None:
+            candidate = value["coverage_lanes"]["kind_krx"]["checked_sources"][0]
+            candidate.update({"url": evidence_url or "https://dart.fss.or.kr/no-bound-evidence", "outcome": "candidate", "economic_disposition": disposition, "economic_reason": "evidence candidate", "evidence_id": evidence_id})
+            value["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
+        return {"status": "done", "count": int(disposition in {"saved", "correction_stored"}), "detail": {"completion_receipt": value, "control_terminal_dispositions": [{"rcp_no": rcp, "disposition": disposition, "evidence_id": evidence_id, **audit}]}}
+
+    for case, disposition in ((1, "rejected"), (2, "hold")):
+        key, rcp, contract, _ = fresh_started(case)
+        response = client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done(key, rcp, contract, disposition, None, qualifying_audit))
+        assert response.status_code == 422
+        assert response.json()["detail"] == "research control terminal dispositions are not exact"
+        db = connect()
+        try:
+            row = db.execute("SELECT status FROM giraffe_research_backlog WHERE identity=?", ("dart:" + rcp,)).fetchone()
+            assert row["status"] == "pending"
+        finally:
+            db.close()
+
+    for case, disposition in ((3, "saved"), (4, "correction_stored")):
+        key, rcp, contract, _ = fresh_started(case)
+        response = client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done(key, rcp, contract, disposition, 999999, qualifying_audit))
+        assert response.status_code == 422
+
+    key, rcp, contract, source = fresh_started(5)
+    evidence_url = "https://dart.fss.or.kr/fresh-corrected-evidence"
+    evidence = client.post("/api/internal/evidence", headers=HEADERS, json={
+        "symbol": "406820", "kind": "contract", "title": "corrected supply contract", "summary": "bound amendment evidence",
+        "source": "DART", "source_url": evidence_url, "announcement_at": "2026-09-17T06:00:00+09:00",
+        "known_at": "2026-09-17T06:30:00+09:00", "research_mode": "scheduled_as_of", "research_run_key": key,
+        "snapshot": {"rcp_no": rcp, "dart_source": source}, "dedupe_key": "fresh-corrected-bound-evidence",
+    })
+    assert evidence.status_code == 200, evidence.text
+    evidence_id = evidence.json()["id"]
+    stored = client.get(f"/api/internal/evidence/{evidence_id}", headers=HEADERS)
+    assert stored.status_code == 200
+    assert stored.json()["research_run_key"] == key
+    assert stored.json()["snapshot"] == {"rcp_no": rcp, "dart_source": source}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done(key, rcp, contract, "correction_stored", evidence_id, qualifying_audit, evidence_url=evidence_url)).status_code == 200
+    db = connect()
+    try:
+        terminal = db.execute("SELECT status,terminal_disposition,terminal_run_key,terminal_evidence_id FROM giraffe_research_backlog WHERE identity=?", ("dart:" + rcp,)).fetchone()
+        assert dict(terminal) == {"status": "terminal", "terminal_disposition": "correction_stored", "terminal_run_key": key, "terminal_evidence_id": evidence_id}
+    finally:
+        db.close()
+
+    key, rcp, contract, _ = fresh_started(6)
+    nonqualifying = {**qualifying_audit, "economic_disposition": "below_threshold", "economic_reason": "amendment increment is below half of prior revenue", "economic_facts": {**qualifying_facts, "amended_contract_amount": 999999, "incremental_contract_amount": 499999, "incremental_ratio_percent": 49.9999}}
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done(key, rcp, contract, "rejected", None, nonqualifying)).status_code == 200
 
 
 def test_v3_terminal_lookup_is_bounded_canonical_and_exact(monkeypatch, tmp_path):

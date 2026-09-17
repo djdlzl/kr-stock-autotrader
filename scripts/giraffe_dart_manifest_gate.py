@@ -21,6 +21,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(SCRIPT_DIR.parent))
 from giraffe_dart_manifest import ManifestError, collect_manifest  # noqa: E402
 from giraffe_dart_source import SourceError, completed_packet, fetch_with_retry, write_packet  # noqa: E402
+from kr_stock_autotrader.dart_report_classification import authoritative_report_class  # noqa: E402
 from kr_stock_autotrader.krx_calendar import CalendarError, admitted_backlog_dates  # noqa: E402
 
 OUTPUT_ROOT = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-manifests"
@@ -177,8 +178,10 @@ def _report_class(record: dict) -> tuple[str, str]:
         return ('legacy_unclassified', 'legacy OpenDART report metadata unavailable')
     if not 0 < len(name) <= 500:
         raise ManifestError('OpenDART candidate report name invalid')
-    canonical = ''.join(char for char in name if not char.isspace() and char not in {'ㆍ', '·', '/'})
-    return ('dart_single_sale_supply_contract' if canonical == '단일판매공급계약체결' else 'other', name)
+    report_class = authoritative_report_class(name)
+    if report_class is None:
+        raise ManifestError('OpenDART candidate report name invalid')
+    return (report_class, name)
 
 
 _DART_CORE_PROVENANCE_FIELDS = frozenset({"rcp_no", "date", "receipt_source_date", "packet_path", "packet_sha256"})

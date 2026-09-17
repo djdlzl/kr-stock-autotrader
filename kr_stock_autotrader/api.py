@@ -23,6 +23,7 @@ from .db import connect
 from .domain import KST, Quote, is_krx_business_date, market_open, parse_kst, now_kst
 from .krx_calendar import CalendarError
 from .decision_cards import (require_internal_api_key, require_research_control_key, create_evidence, list_evidence, evidence_detail, mutate_evidence, save_filter, filter_detail, current_filter_head, save_card, list_cards, card_detail, user_card_view, user_decision, evaluate_order_plan, edit_order_plan, edit_draft)
+from .dart_report_classification import authoritative_report_class, is_correction_single_sale_supply_contract
 from .service import audit, evaluate_tick
 from .ui import APP_HTML, AUTH_HTML, PROTOTYPE_HTML
 from .kis_readonly import KISReadOnlyClient
@@ -695,14 +696,25 @@ def _registered_research_detail(run_key: str, contract: object) -> dict:
 
 _MAX_TERMINAL_LOOKUP_RECEIPTS = 200
 _ECONOMIC_FACT_FIELDS = frozenset({'binding_contract', 'contract_amount', 'prior_revenue', 'ratio_percent', 'term'})
+_AMENDMENT_ECONOMIC_FACT_FIELDS = frozenset({
+    'binding_contract', 'economic_basis', 'original_contract_amount', 'amended_contract_amount',
+    'incremental_contract_amount', 'prior_revenue', 'incremental_ratio_percent', 'original_term', 'amended_term',
+})
 
 
 def _authoritative_report_class(report_name: object) -> str | None:
     """Classify only the immutable OpenDART report name, never caller intent."""
-    if not isinstance(report_name, str) or not 0 < len(report_name) <= 500:
-        return None
-    normalized = ''.join(char for char in report_name if not char.isspace() and char not in {'ㆍ', '·', '/'})
-    return 'dart_single_sale_supply_contract' if normalized == '단일판매공급계약체결' else 'other'
+    return authoritative_report_class(report_name)
+
+
+def _qualifies_control_contract_from_validated_facts(source: dict, facts: dict) -> bool:
+    """Derive the 50% economic threshold from already shape-validated source facts."""
+    if source.get('report_class') != 'dart_single_sale_supply_contract':
+        return False
+    if is_correction_single_sale_supply_contract(source.get('report_name')):
+        return (facts['binding_contract'] and facts['incremental_contract_amount'] > 0
+                and facts['incremental_contract_amount'] * 2 >= facts['prior_revenue'])
+    return facts['binding_contract'] and facts['contract_amount'] * 2 >= facts['prior_revenue']
 
 
 def _valid_control_economic_audit(source: dict, item: dict) -> bool:
@@ -714,6 +726,28 @@ def _valid_control_economic_audit(source: dict, item: dict) -> bool:
     facts = item.get('economic_facts')
     if source.get('report_class') != 'dart_single_sale_supply_contract':
         return facts is None
+    if is_correction_single_sale_supply_contract(source.get('report_name')):
+        if (not isinstance(facts, dict) or set(facts) != _AMENDMENT_ECONOMIC_FACT_FIELDS
+                or not isinstance(facts['binding_contract'], bool)
+                or facts['economic_basis'] != 'amendment_delta'):
+            return False
+        integer_fields = ('original_contract_amount', 'amended_contract_amount', 'incremental_contract_amount', 'prior_revenue')
+        if (any(not isinstance(facts[field], int) or isinstance(facts[field], bool) for field in integer_fields)
+                or facts['original_contract_amount'] <= 0 or facts['amended_contract_amount'] <= 0
+                or facts['prior_revenue'] <= 0
+                or facts['incremental_contract_amount'] != facts['amended_contract_amount'] - facts['original_contract_amount']
+                or not isinstance(facts['incremental_ratio_percent'], (int, float))
+                or isinstance(facts['incremental_ratio_percent'], bool)
+                or not isinstance(facts['original_term'], str) or facts['original_term'].strip() != facts['original_term'] or not 0 < len(facts['original_term']) <= 500
+                or not isinstance(facts['amended_term'], str) or facts['amended_term'].strip() != facts['amended_term'] or not 0 < len(facts['amended_term']) <= 500):
+            return False
+        ratio = float(facts['incremental_ratio_percent'])
+        expected_ratio = facts['incremental_contract_amount'] * 100 / facts['prior_revenue']
+        if not __import__('math').isfinite(ratio) or not -100000 <= ratio <= 100000 or abs(ratio - expected_ratio) > 0.005:
+            return False
+        qualifies = _qualifies_control_contract_from_validated_facts(source, facts)
+        # An amendment cannot call a zero/negative (or sub-threshold) delta qualifying.
+        return (disposition == 'qualifying_A_or_better') == qualifies
     if not isinstance(facts, dict) or set(facts) != _ECONOMIC_FACT_FIELDS or not isinstance(facts['binding_contract'], bool):
         return False
     if (not isinstance(facts['contract_amount'], int) or isinstance(facts['contract_amount'], bool) or facts['contract_amount'] <= 0
@@ -724,7 +758,7 @@ def _valid_control_economic_audit(source: dict, item: dict) -> bool:
     if not __import__('math').isfinite(float(facts['ratio_percent'])) or not 0 <= facts['ratio_percent'] <= 100000:
         return False
     # The reported ratio is retained for audit, while the threshold is recomputed.
-    qualifies = facts['binding_contract'] and facts['contract_amount'] * 2 >= facts['prior_revenue']
+    qualifies = _qualifies_control_contract_from_validated_facts(source, facts)
     return not qualifies or disposition == 'qualifying_A_or_better'
 
 
@@ -852,8 +886,7 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
                    or (item['disposition'] in {'saved','existing','correction_stored'} and (not isinstance(item['evidence_id'], int) or isinstance(item['evidence_id'], bool) or item['evidence_id'] <= 0))
                    or (item['disposition'] in {'rejected','hold'} and item['evidence_id'] is not None)
                    or (v3 and not _valid_control_economic_audit(sources[item['rcp_no']], item))
-                   or (v3 and sources[item['rcp_no']].get('report_class') == 'dart_single_sale_supply_contract'
-                       and item['economic_facts']['binding_contract'] and item['economic_facts']['contract_amount'] * 2 >= item['economic_facts']['prior_revenue']
+                   or (v3 and _qualifies_control_contract_from_validated_facts(sources[item['rcp_no']], item['economic_facts'])
                        and item['disposition'] not in {'saved', 'correction_stored'}) for item in items)):
         raise HTTPException(422, 'research control terminal dispositions are not exact')
     # Validate every requested transition before changing a cursor row.  In
