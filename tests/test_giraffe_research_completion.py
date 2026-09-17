@@ -1064,6 +1064,43 @@ def test_v3_registration_accepts_legacy_dart_carry_only_for_exact_immutable_core
     assert response.status_code == 422, response.text
 
 
+def test_v3_finish_accepts_pending_legacy_carry_without_rewriting_its_payload(monkeypatch, tmp_path):
+    import kr_stock_autotrader.db as db_module
+    from kr_stock_autotrader.db import connect
+    monkeypatch.setattr(db_module, 'DATABASE_PATH', str(tmp_path / 'legacy-carry-finish.db'))
+    client = TestClient(app); key = 'research-2026-09-17-0700-kst-r11'; rcp = '20260916000465'
+    contract, _ = commitment(key, [rcp])
+    source = contract['sources'][0]
+    source.update({'report_class': 'other', 'report_name': '주요사항보고서(유상증자결정)'})
+    legacy = {field: source[field] for field in ('rcp_no', 'date', 'receipt_source_date', 'packet_path', 'packet_sha256')}
+    contract.update({'schema_version': 'giraffe-research-control-v3',
+                     'carry_forward': [{'identity': 'dart:' + rcp, 'kind': 'dart', 'payload': legacy}],
+                     'terminal_exclusions': [], 'correction_of': []})
+    db = connect()
+    try:
+        db.execute("INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,created_at) VALUES(?,?,?,?,?)",
+                   ('dart:' + rcp, 'dart', json.dumps(legacy, sort_keys=True), 'research-2026-09-16-0700-kst-r7', '2026-09-16T07:00:00+09:00'))
+        db.commit()
+    finally:
+        db.close()
+    assert client.post(f'/api/internal/research-runs/{key}/register', json={'control_contract': contract}, headers=CONTROL_HEADERS).status_code == 200
+    digest = hashlib.sha256(canonical(contract)).hexdigest()
+    value = receipt(key, digest, [rcp])
+    done = {'status': 'done', 'count': 0, 'detail': {'completion_receipt': value,
+            'control_terminal_dispositions': [{'rcp_no': rcp, 'disposition': 'rejected', 'evidence_id': None,
+                                               'economic_disposition': 'negative_risk', 'economic_reason': 'dilutive financing risk',
+                                               'economic_facts': None}]}}
+    response = client.post(f'/api/internal/scheduler-runs/{key}/finish', headers=HEADERS, json=done)
+    assert response.status_code == 200, response.text
+    db = connect()
+    try:
+        row = db.execute('SELECT payload,status,terminal_run_key FROM giraffe_research_backlog WHERE identity=?', ('dart:' + rcp,)).fetchone()
+        assert json.loads(row['payload']) == legacy
+        assert row['status'] == 'terminal' and row['terminal_run_key'] == key
+    finally:
+        db.close()
+
+
 def test_v3_economic_audit_rejects_bare_malformed_and_qualifying_rejected_hold_then_accepts_saved():
     client = TestClient(app); rcp = "20260917000001"
 
