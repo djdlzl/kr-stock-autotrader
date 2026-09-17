@@ -194,13 +194,23 @@ def same_dart_core_provenance(left: object, right: object) -> bool:
 
 
 def terminal_dart_matches_current(terminal: object, current: object) -> bool:
-    """Accept immutable v2 terminal provenance, but never weaken v3 history."""
+    """Accept immutable v2 provenance and one authoritative v3 class promotion."""
     if not isinstance(terminal, dict) or not isinstance(current, dict):
         return False
     terminal_fields = set(terminal)
     if terminal_fields == _DART_CORE_PROVENANCE_FIELDS:
         return same_dart_core_provenance(terminal, current)
-    return terminal_fields == _DART_CORE_PROVENANCE_FIELDS | {'report_class', 'report_name'} and terminal == current
+    classified_fields = _DART_CORE_PROVENANCE_FIELDS | {'report_class', 'report_name'}
+    if terminal_fields != classified_fields or set(current) != classified_fields:
+        return False
+    if terminal == current:
+        return True
+    current_class = current['report_class']
+    return (terminal['report_class'] == 'other'
+            and isinstance(current_class, str) and current_class != 'other'
+            and terminal['report_name'] == current['report_name']
+            and current_class == authoritative_report_class(current['report_name'])
+            and same_dart_core_provenance(terminal, current))
 
 
 def control_contract(run_key: str, summaries: list[dict], carry_forward: list[dict] | None = None,
