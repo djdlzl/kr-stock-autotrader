@@ -15,6 +15,22 @@ sys.modules["dart_source"] = source
 spec.loader.exec_module(source)
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
 def main_page(rcp="20260911800823", dcm="11577485"):
     return (f"<html><meta charset='utf-8'><script>viewDoc('{rcp}','{dcm}','0','0','0','HTML','')</script></html>").encode()
 
@@ -178,3 +194,63 @@ def test_checkpoint_freshness_has_deterministic_kst_bounds(tmp_path):
         metadata["retrieved_at_kst"] = captured.isoformat()
         checkpoint.write_text(json.dumps(metadata), encoding="utf-8")
         assert (source.completed_packet(checkpoint, rcp, now=now) is not None) is accepted
+
+
+def test_source_packet_paces_main_and_viewer_request_starts_one_second_apart():
+    rcp = "20260911800823"
+    clock = FakeClock()
+    requests = []
+    viewer = b"<html><meta charset='utf-8'><body>valid paced disclosure source body</body></html>"
+
+    def fetch(url):
+        requests.append((url, clock()))
+        if "main.do" in url:
+            clock.advance(0.25)
+            return main_page(rcp), "text/html; charset=utf-8", url
+        return viewer, "text/html; charset=utf-8", url
+
+    packet = source.source_packet(rcp, fetch, clock=clock, sleep=clock.sleep)
+
+    assert packet["source_valid"] is True
+    assert [url.split("?", 1)[0].rsplit("/", 1)[-1] for url, _ in requests] == ["main.do", "viewer.do"]
+    assert requests[1][1] - requests[0][1] == pytest.approx(1.0)
+    assert clock.sleeps == pytest.approx([0.75])
+
+
+@pytest.mark.parametrize("configured_attempts", [None, 99])
+def test_transient_retry_backoff_defaults_and_caps_at_four_attempts(configured_attempts):
+    rcp = "20260911800823"
+    clock = FakeClock()
+    request_times = []
+
+    def fetch(_url):
+        request_times.append(clock())
+        raise TimeoutError("temporary DART timeout")
+
+    kwargs = {} if configured_attempts is None else {"retries": configured_attempts}
+    with pytest.raises(source.SourceError) as exc:
+        source.fetch_with_retry(rcp, fetch=fetch, clock=clock, sleep=clock.sleep, **kwargs)
+
+    assert exc.value.code == "SOURCE_FETCH_ERROR"
+    assert request_times == pytest.approx([0.0, 2.0, 6.0, 14.0])
+    assert clock.sleeps == pytest.approx([2.0, 4.0, 8.0])
+
+
+def test_non_transient_source_validation_failure_is_not_retried():
+    rcp = "20260911800823"
+    clock = FakeClock()
+    requests = []
+    login_shell = b"<html><meta charset='utf-8'><body>login page with enough content to parse</body></html>"
+
+    def fetch(url):
+        requests.append(url)
+        if "main.do" in url:
+            return main_page(rcp), "text/html; charset=utf-8", url
+        return login_shell, "text/html; charset=utf-8", url
+
+    with pytest.raises(source.SourceError) as exc:
+        source.fetch_with_retry(rcp, fetch=fetch, clock=clock, sleep=clock.sleep)
+
+    assert exc.value.code == "SOURCE_EXTRACT_ERROR"
+    assert [url.split("?", 1)[0].rsplit("/", 1)[-1] for url in requests] == ["main.do", "viewer.do"]
+    assert clock.sleeps == pytest.approx([1.0])
