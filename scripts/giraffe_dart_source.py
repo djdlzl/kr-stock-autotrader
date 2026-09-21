@@ -7,6 +7,7 @@ import html
 import json
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
@@ -30,6 +31,45 @@ class SourceError(RuntimeError):
     def __init__(self, code: str, message: str):
         self.code = code
         super().__init__(f"{code}: {message}")
+
+
+class _TransientFetchError(SourceError):
+    """A retryable transport failure, distinct from invalid source data."""
+
+
+class _RequestPacer:
+    def __init__(self, clock: Callable[[], float], sleep: Callable[[float], None]):
+        self.clock = clock
+        self.sleep = sleep
+        self.next_start = float("-inf")
+
+    def defer(self, seconds: float) -> None:
+        self.next_start = max(self.next_start, self.clock() + seconds)
+
+    def request(self, fetch: Callable[[str], tuple], url: str) -> tuple:
+        while (remaining := self.next_start - self.clock()) > 0:
+            self.sleep(remaining)
+        self.next_start = self.clock() + 1.0
+        try:
+            return fetch(url)
+        except Exception as exc:
+            # HTTP status errors, TLS/configuration errors and source validation
+            # errors are not transient connection failures.
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            if not isinstance(exc, urllib.error.HTTPError) and isinstance(reason, (TimeoutError, ConnectionError)):
+                raise _TransientFetchError("SOURCE_FETCH_ERROR", str(exc)) from exc
+            raise
+
+
+_DEFAULT_PACER = _RequestPacer(time.monotonic, time.sleep)
+
+
+def _request_pacer(clock: Callable[[], float], sleep: Callable[[float], None]) -> _RequestPacer:
+    # Real requests share pacing across packet calls; injected clocks get an
+    # isolated timeline that remains shared throughout one retry operation.
+    if clock is time.monotonic and sleep is time.sleep:
+        return _DEFAULT_PACER
+    return _RequestPacer(clock, sleep)
 
 
 def _charset_from_content_type(value: str | None) -> str | None:
@@ -126,7 +166,14 @@ def _fetch_result(result: tuple) -> tuple[bytes, str | None, str, dict[str, str]
     return raw, content_type, final_url, headers, status
 
 
-def source_packet(rcp_no: str, fetch: Callable[[str], tuple] = _fetch) -> dict:
+def source_packet(rcp_no: str, fetch: Callable[[str], tuple] = _fetch, *,
+                  clock: Callable[[], float] = time.monotonic,
+                  sleep: Callable[[float], None] = time.sleep) -> dict:
+    pacer = _request_pacer(clock, sleep)
+    return _source_packet(rcp_no, lambda url: pacer.request(fetch, url))
+
+
+def _source_packet(rcp_no: str, fetch: Callable[[str], tuple]) -> dict:
     if not re.fullmatch(r"\d{14}", rcp_no): raise SourceError("SOURCE_FETCH_ERROR", "invalid rcpNo")
     main_url = "https://dart.fss.or.kr/dsaf001/main.do?" + urllib.parse.urlencode({"rcpNo": rcp_no})
     try:
@@ -222,12 +269,17 @@ def completed_packet(path: Path, rcp_no: str, *, expected_control_date: str | No
         return None
 
 
-def fetch_with_retry(rcp_no: str, retries: int = 2, fetch: Callable[[str], tuple] = _fetch) -> dict:
-    last: SourceError | None = None
-    for attempt in range(retries):
-        try: return source_packet(rcp_no, fetch)
-        except SourceError as exc:
-            last = exc
-            if attempt + 1 < retries: time.sleep(attempt + 1)
-    assert last
-    raise last
+def fetch_with_retry(rcp_no: str, retries: int = 4, fetch: Callable[[str], tuple] = _fetch, *,
+                     clock: Callable[[], float] = time.monotonic,
+                     sleep: Callable[[float], None] = time.sleep) -> dict:
+    if retries < 1:
+        raise ValueError("retries must be at least 1")
+    attempts = min(retries, 4)
+    pacer = _request_pacer(clock, sleep)
+    for attempt in range(attempts):
+        try:
+            return _source_packet(rcp_no, lambda url: pacer.request(fetch, url))
+        except _TransientFetchError:
+            if attempt + 1 == attempts:
+                raise
+            pacer.defer(2 ** (attempt + 1))

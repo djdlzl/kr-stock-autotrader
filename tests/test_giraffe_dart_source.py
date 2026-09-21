@@ -2,6 +2,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+import urllib.error
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -254,3 +255,73 @@ def test_non_transient_source_validation_failure_is_not_retried():
     assert exc.value.code == "SOURCE_EXTRACT_ERROR"
     assert [url.split("?", 1)[0].rsplit("/", 1)[-1] for url in requests] == ["main.do", "viewer.do"]
     assert clock.sleeps == pytest.approx([1.0])
+
+
+def test_viewer_timeout_retries_without_adding_pacing_to_backoff():
+    rcp = "20260911800823"
+    clock = FakeClock()
+    requests = []
+
+    def fetch(url):
+        requests.append(("main.do" if "main.do" in url else "viewer.do", clock()))
+        clock.advance(0.25)
+        if "main.do" in url:
+            return main_page(rcp), "text/html; charset=utf-8", url
+        if len(requests) == 2:
+            raise urllib.error.URLError(TimeoutError("temporary timeout"))
+        return b"<body>valid disclosure body with enough content</body>", "text/html; charset=utf-8", url
+
+    assert source.fetch_with_retry(rcp, fetch=fetch, clock=clock, sleep=clock.sleep)["source_valid"] is True
+    assert requests == [("main.do", 0.0), ("viewer.do", 1.0), ("main.do", 3.25), ("viewer.do", 4.25)]
+    assert clock.sleeps == pytest.approx([0.75, 2.0, 0.75])
+
+
+@pytest.mark.parametrize("error", [
+    ValueError("invalid response"),
+    urllib.error.HTTPError("https://dart.fss.or.kr", 403, "Forbidden", {}, None),
+    source.SourceError("SOURCE_FETCH_ERROR", "invalid receipt"),
+])
+def test_non_transport_fetch_errors_are_not_retried(error):
+    clock = FakeClock()
+    requests = []
+
+    def fetch(url):
+        requests.append(url)
+        raise error
+
+    with pytest.raises(source.SourceError):
+        source.fetch_with_retry("20260911800823", fetch=fetch, clock=clock, sleep=clock.sleep)
+    assert len(requests) == 1
+    assert clock.sleeps == []
+
+
+def test_slow_main_request_needs_no_additional_pacing_sleep():
+    clock = FakeClock()
+    requests = []
+
+    def fetch(url):
+        requests.append(clock())
+        if "main.do" in url:
+            clock.advance(1.5)
+            return main_page(), "text/html; charset=utf-8", url
+        return b"<body>valid disclosure body with enough content</body>", "text/html; charset=utf-8", url
+
+    source.source_packet("20260911800823", fetch, clock=clock, sleep=clock.sleep)
+    assert requests == [0.0, 1.5]
+    assert clock.sleeps == []
+
+
+def test_default_pacing_is_shared_between_packet_calls(monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(source, "_DEFAULT_PACER", source._RequestPacer(clock, clock.sleep))
+    requests = []
+
+    def fetch(url):
+        requests.append(clock())
+        raw = main_page() if "main.do" in url else b"<body>valid disclosure body with enough content</body>"
+        return raw, "text/html; charset=utf-8", url
+
+    source.source_packet("20260911800823", fetch)
+    source.fetch_with_retry("20260911800823", fetch=fetch)
+    assert requests == [0.0, 1.0, 2.0, 3.0]
+    assert clock.sleeps == [1.0, 1.0, 1.0]
