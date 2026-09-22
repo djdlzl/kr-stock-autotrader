@@ -819,6 +819,58 @@ def _valid_control_economic_audit(source: dict, item: dict) -> bool:
             or (disposition != 'timing_unresolved' and (not qualifies or disposition == 'qualifying_A_or_better')))
 
 
+def _valid_v3_terminal_item_shape(source: dict, item: dict) -> bool:
+    """Keep caller routing data in the durable finish payload, not a helper."""
+    base = {'rcp_no', 'disposition', 'evidence_id', 'economic_disposition', 'economic_reason', 'economic_facts'}
+    disposition = item.get('disposition')
+    economic = item.get('economic_disposition')
+    if source.get('report_class') == 'other' and economic == 'error':
+        return set(item) == base
+    if source.get('report_class') == 'other':
+        return set(item) == base | {'audit_source_url'} and _canonical_coverage_url(item.get('audit_source_url')) is not None
+    if economic == 'qualifying_A_or_better' and disposition in {'saved', 'existing', 'correction_stored', 'store_error'}:
+        return (set(item) == base | {'evidence_source_url', 'published_at'}
+                and _canonical_coverage_url(item.get('evidence_source_url')) is not None
+                and _parse_timezone_aware_iso_timestamp(item.get('published_at')) is not None)
+    return set(item) == base
+
+
+def _valid_v3_terminal_routing(db, run_key: str, source: dict, item: dict) -> bool:
+    """Enforce disposition/evidence routing for each immutable control receipt."""
+    if not _valid_v3_terminal_item_shape(source, item):
+        return False
+    disposition, economic = item['disposition'], item['economic_disposition']
+    if source.get('report_class') == 'other' and economic == 'error':
+        return disposition in {'source_error', 'store_error'}
+    if source.get('report_class') == 'other':
+        return disposition in {'rejected', 'hold'} and economic in {'negative_risk', 'below_threshold', 'timing_unresolved'}
+    if economic == 'error':
+        return disposition in {'source_error', 'store_error'}
+    qualifies = _qualifies_control_contract_from_validated_facts(source, item['economic_facts'])
+    if not qualifies:
+        # Never let a non-qualifying contract claim an evidence-storage result.
+        return economic == 'below_threshold' and disposition == 'rejected'
+    if economic == 'timing_unresolved':
+        return disposition == 'hold'
+    if economic != 'qualifying_A_or_better':
+        return False
+    if disposition not in {'saved', 'existing', 'correction_stored', 'store_error'}:
+        return False
+    if disposition == 'store_error':
+        return True
+    evidence = db.execute("SELECT source_url,announcement_at,snapshot FROM material_evidence WHERE id=?", (item['evidence_id'],)).fetchone()
+    try:
+        snapshot = json.loads(evidence['snapshot']) if evidence else {}
+        provenance = snapshot.get('dart_source', snapshot.get('control_provenance', {}))
+        published_at = _parse_timezone_aware_iso_timestamp(item['published_at'])
+        announcement_at = _parse_timezone_aware_iso_timestamp(evidence['announcement_at']) if evidence else None
+    except (TypeError, ValueError):
+        return False
+    return (provenance == source and _canonical_coverage_url(evidence['source_url']) == _canonical_coverage_url(item['evidence_source_url'])
+            and published_at is not None and announcement_at is not None
+            and published_at.astimezone(ZoneInfo('UTC')) == announcement_at.astimezone(ZoneInfo('UTC')))
+
+
 def _terminal_dart_history(db, contract: dict) -> dict[str, dict]:
     """Bind v3 exclusions/corrections to immutable terminal rows, not caller prose."""
     if contract.get('schema_version') != 'giraffe-research-control-v3':
@@ -950,17 +1002,12 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
     sources = {source['rcp_no']: source for source in contract['sources']}
     if (not isinstance(items, list) or len(items) != len(expected)
             or [item.get('rcp_no') if isinstance(item, dict) else None for item in items] != expected
-            or any(not isinstance(item, dict) or set(item) != item_fields or item['disposition'] not in allowed
+            or any(not isinstance(item, dict) or (not v3 and set(item) != item_fields) or item['disposition'] not in allowed
                    or (item['disposition'] in {'saved','existing','correction_stored'} and (not isinstance(item['evidence_id'], int) or isinstance(item['evidence_id'], bool) or item['evidence_id'] <= 0))
                    or (item['disposition'] in {'rejected','hold','source_error','store_error'} and item['evidence_id'] is not None)
-                   or (v3 and not _valid_control_economic_audit(sources[item['rcp_no']], item))
-                   or (v3 and item['disposition'] == 'source_error' and item['economic_disposition'] != 'error')
-                   or (v3 and item['economic_disposition'] == 'error' and item['disposition'] not in {'source_error', 'store_error'})
-                   or (_failed_dart_source(sources[item['rcp_no']]) and item['disposition'] != 'source_error')
-                   or (v3 and item['economic_disposition'] != 'error'
-                       and _qualifies_control_contract_from_validated_facts(sources[item['rcp_no']], item['economic_facts'])
-                       and item['disposition'] not in {'saved', 'correction_stored', 'store_error'}
-                       and not (item['economic_disposition'] == 'timing_unresolved' and item['disposition'] == 'hold')) for item in items)):
+                   or (v3 and (not _valid_control_economic_audit(sources[item['rcp_no']], item)
+                               or not _valid_v3_terminal_routing(db, run_key, sources[item['rcp_no']], item)))
+                   or (_failed_dart_source(sources[item['rcp_no']]) and item['disposition'] != 'source_error') for item in items)):
         raise HTTPException(422, 'research control terminal dispositions are not exact')
     # Validate every requested transition before changing a cursor row.  In
     # particular, a positive integer is not evidence, and a listed receipt is

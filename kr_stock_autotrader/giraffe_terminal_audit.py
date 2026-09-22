@@ -90,7 +90,7 @@ def _non_supply_terminal(source: dict, audit: object, rcp_no: str) -> dict:
     """Require a source-grounded human audit; never infer non-supply economics."""
     if not isinstance(audit, dict) or set(audit) != {"source_url", "economic_disposition", "economic_reason", "disposition"}:
         raise TerminalAuditError("non-supply audit must contain exactly source_url, economic_disposition, economic_reason, disposition")
-    _source_url(audit["source_url"])
+    source_url = _source_url(audit["source_url"])
     reason = _reason(audit["economic_reason"])
     if audit["economic_disposition"] not in _NON_SUPPLY_DISPOSITIONS:
         raise TerminalAuditError("non-supply economic_disposition is not allowed")
@@ -98,7 +98,7 @@ def _non_supply_terminal(source: dict, audit: object, rcp_no: str) -> dict:
         raise TerminalAuditError("non-supply disposition must be rejected or hold")
     if audit["economic_disposition"] == "timing_unresolved" and audit["disposition"] != "hold":
         raise TerminalAuditError("timing_unresolved non-supply audit must hold")
-    return {"action": "terminal", "item": {"rcp_no": rcp_no, "disposition": audit["disposition"], "evidence_id": None,
+    return {"action": "terminal", "item": {"rcp_no": rcp_no, "disposition": audit["disposition"], "evidence_id": None, "audit_source_url": source_url,
             "economic_disposition": audit["economic_disposition"], "economic_reason": reason, "economic_facts": None}}
 
 
