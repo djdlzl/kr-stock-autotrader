@@ -890,7 +890,8 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
                    or (item['disposition'] in {'saved','existing','correction_stored'} and (not isinstance(item['evidence_id'], int) or isinstance(item['evidence_id'], bool) or item['evidence_id'] <= 0))
                    or (item['disposition'] in {'rejected','hold','source_error','store_error'} and item['evidence_id'] is not None)
                    or (v3 and not _valid_control_economic_audit(sources[item['rcp_no']], item))
-                   or (v3 and item['disposition'] in {'source_error', 'store_error'} and item['economic_disposition'] != 'error')
+                   or (v3 and ((item['disposition'] in {'source_error', 'store_error'})
+                               != (item['economic_disposition'] == 'error')))
                    or (v3 and item['economic_disposition'] != 'error'
                        and _qualifies_control_contract_from_validated_facts(sources[item['rcp_no']], item['economic_facts'])
                        and item['disposition'] not in {'saved', 'correction_stored', 'store_error'}) for item in items)):

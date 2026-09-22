@@ -1188,7 +1188,7 @@ def test_v3_economic_audit_rejects_bare_malformed_and_qualifying_rejected_hold_t
 
     audit = {"economic_disposition": "qualifying_A_or_better", "economic_reason": "binding contract exceeds half of prior revenue", "economic_facts": {"binding_contract": True, "contract_amount": 50, "prior_revenue": 100, "ratio_percent": 50, "term": "2026-09-19 to 2027-09-18"}}
     stale_ratio = {**audit, "economic_facts": {**audit["economic_facts"], "ratio_percent": 49.99}}
-    for number, disposition, extra in ((1, "rejected", {}), (2, "hold", {}), (3, "rejected", {"economic_reason": ""}), (4, "rejected", {"economic_reason": "x" * 1001}), (5, "rejected", {"economic_facts": {}}), (6, "rejected", {"economic_disposition": None, "economic_reason": None, "economic_facts": None}), (7, "rejected", stale_ratio), (8, "rejected", {"report_class": "other"})):
+    for number, disposition, extra in ((1, "rejected", {}), (2, "hold", {}), (3, "rejected", {"economic_reason": ""}), (4, "rejected", {"economic_reason": "x" * 1001}), (5, "rejected", {"economic_facts": {}}), (6, "rejected", {"economic_disposition": None, "economic_reason": None, "economic_facts": None}), (7, "rejected", stale_ratio), (8, "rejected", {"report_class": "other"}), (9, "rejected", {"economic_disposition": "error", "economic_reason": "classification failed", "economic_facts": None})):
         key = f"research-2026-09-17-0700-kst-r{number}"; contract = v3_started(key)
         item = {"rcp_no": rcp, "disposition": disposition, "evidence_id": None, **audit, **extra}
         done = {"status": "done", "count": 0, "detail": {"completion_receipt": receipt(key, hashlib.sha256(canonical(contract)).hexdigest(), [rcp]), "control_terminal_dispositions": [item]}}
@@ -1356,6 +1356,38 @@ def test_v3_terminal_lookup_is_bounded_canonical_and_exact(monkeypatch, tmp_path
     assert [item["payload"]["rcp_no"] for item in response.json()["items"]] == [requested]
     for bad in ([], [requested] * 2, [unrequested, requested], ["bad"], [f"20260919{i:06d}" for i in range(201)]):
         assert client.post("/api/internal/research-backlog/terminal-items", headers=CONTROL_HEADERS, json={"rcp_nos": bad}).status_code == 422
+
+
+def test_attempted_optional_newsroom_failure_is_bounded_and_does_not_veto_done():
+    client = TestClient(app)
+
+    def failed_newsroom_receipt(key, failure_class):
+        _, digest = start(client, key, [])
+        value = receipt(key, digest, [])
+        lane = value["coverage_lanes"]["issuer_ir_newsroom"]
+        lane["checked_sources"][0].update({
+            "source_valid": False, "published_at": None,
+            "outcome": "invalid_source", "failure_class": failure_class,
+        })
+        lane.update({"source_valid_count": 0, "coverage_error_count": 1})
+        value.update({"coverage_error": 1, "failure_total": 1})
+        return value
+
+    invalid_key = "research-2026-09-17-0700-kst-r699"
+    invalid = failed_newsroom_receipt(invalid_key, "connection_reset")
+    assert client.post(f"/api/internal/scheduler-runs/{invalid_key}/finish", headers=HEADERS, json={
+        "status": "done", "count": 0, "detail": {"completion_receipt": invalid},
+    }).status_code == 422
+
+    valid_key = "research-2026-09-17-0700-kst-r700"
+    valid = failed_newsroom_receipt(valid_key, "extractor_failure")
+    response = client.post(f"/api/internal/scheduler-runs/{valid_key}/finish", headers=HEADERS, json={
+        "status": "done", "count": 0, "detail": {"completion_receipt": valid},
+    })
+    assert response.status_code == 200, response.text
+    persisted = response.json()["detail"]["completion_receipt"]
+    assert persisted["coverage_lanes"]["issuer_ir_newsroom"]["checked_sources"][0]["failure_class"] == "extractor_failure"
+    assert persisted["failure_total"] == 1
 
 
 def test_fastapi_partial_done_edd_smoke_keeps_saved_evidence_available_to_0800():
