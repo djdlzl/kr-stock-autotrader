@@ -46,7 +46,7 @@ class _RequestPacer:
     def defer(self, seconds: float) -> None:
         self.next_start = max(self.next_start, self.clock() + seconds)
 
-    def request(self, fetch: Callable[[str], tuple], url: str) -> tuple:
+    def request(self, fetch: Callable[[str], object], url: str) -> object:
         while (remaining := self.next_start - self.clock()) > 0:
             self.sleep(remaining)
         self.next_start = self.clock() + 1.0

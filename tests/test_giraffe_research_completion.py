@@ -77,6 +77,7 @@ def coverage_lane(name, *, outcome="not_material", source_valid=True, published_
             "published_at": published_at if source_valid else None,
             "retrieved_at": retrieved_at,
             "outcome": outcome,
+            "failure_class": None,
             "economic_disposition": None,
             "economic_reason": None,
             "evidence_id": None,
@@ -96,6 +97,8 @@ def receipt(run_key, digest, receipts, **extra):
         "coverage_lanes": {name: coverage_lane(name, published_at=f"{run_key[9:19]}T06:00:00+09:00", retrieved_at=f"{run_key[9:19]}T07:00:00+09:00") for name in ("kind_krx", "issuer_ir_newsroom", "reputable_media")},
     }
     value.update(extra)
+    value.setdefault("success_total", value["rejected_after_evidence"] + value["saved"] + value["existing"] + value["correction_stored"])
+    value.setdefault("failure_total", value["source_error"] + value["store_error"] + value["coverage_error"])
     return value
 
 
@@ -130,18 +133,33 @@ def test_research_done_requires_exact_coverage_lanes():
         invalid["coverage_lanes"]["kind_krx"][field] = value
         payload = {"status": "done", "count": 0, "detail": {"completion_receipt": invalid}}
         assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 422
-    # A query alone is not coverage: every independent lane must check and
-    # validate an original source before a no-candidate DONE is safe.
-    for lane_name in ("kind_krx", "issuer_ir_newsroom", "reputable_media"):
-        for field, value in (("checked_url_count", 0), ("source_valid_count", 0)):
-            invalid = receipt(key, digest, [])
-            invalid["coverage_lanes"][lane_name][field] = value
-            payload = {"status": "done", "count": 0, "detail": {"completion_receipt": invalid}}
-            assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 422
+    # KIND and reputable media remain required attempts, but successful source
+    # validation is not a DONE prerequisite when failures are audited.
+    for lane_name in ("kind_krx", "reputable_media"):
+        invalid = receipt(key, digest, [])
+        invalid["coverage_lanes"][lane_name] = {
+            "executed": False, "query_count": 0, "checked_url_count": 0,
+            "source_valid_count": 0, "candidate_count": 0, "coverage_error_count": 0,
+            "queries": [], "checked_sources": [],
+        }
+        payload = {"status": "done", "count": 0, "detail": {"completion_receipt": invalid}}
+        assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 422
+    # Derived source counts remain exact.
+    for field, value in (("checked_url_count", 0), ("source_valid_count", 0)):
+        invalid = receipt(key, digest, [])
+        invalid["coverage_lanes"]["kind_krx"][field] = value
+        payload = {"status": "done", "count": 0, "detail": {"completion_receipt": invalid}}
+        assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 422
     invalid = receipt(key, digest, [])
     invalid["coverage_lanes"]["issuer_ir_newsroom"].update({"checked_url_count": 1, "source_valid_count": 2})
     payload = {"status": "done", "count": 0, "detail": {"completion_receipt": invalid}}
     assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 422
+    # Issuer newsroom is the optional supplemental lane.
+    valid["coverage_lanes"]["issuer_ir_newsroom"] = {
+        "executed": False, "query_count": 0, "checked_url_count": 0,
+        "source_valid_count": 0, "candidate_count": 0, "coverage_error_count": 0,
+        "queries": [], "checked_sources": [],
+    }
     payload = {"status": "done", "count": 0, "detail": {"completion_receipt": valid}}
     assert client.post(f"/api/internal/scheduler-runs/{key}/finish", json=payload, headers=HEADERS).status_code == 200
 
@@ -1338,3 +1356,167 @@ def test_v3_terminal_lookup_is_bounded_canonical_and_exact(monkeypatch, tmp_path
     assert [item["payload"]["rcp_no"] for item in response.json()["items"]] == [requested]
     for bad in ([], [requested] * 2, [unrequested, requested], ["bad"], [f"20260919{i:06d}" for i in range(201)]):
         assert client.post("/api/internal/research-backlog/terminal-items", headers=CONTROL_HEADERS, json={"rcp_nos": bad}).status_code == 422
+
+
+def test_fastapi_partial_done_edd_smoke_keeps_saved_evidence_available_to_0800():
+    """EDD smoke: exact partial closure is DONE and successful evidence stays consumable."""
+    client = TestClient(app)
+    key = "research-2026-09-17-0700-kst-r701"
+    source_error_rcp, store_error_rcp, saved_rcp = (
+        "20260917000701", "20260917000702", "20260917000703",
+    )
+    receipts = [source_error_rcp, store_error_rcp, saved_rcp]
+    contract, _ = commitment(key, receipts)
+    for source in contract["sources"]:
+        source.update({"report_class": "other", "report_name": "주요사항보고서(유상증자결정)"})
+    contract.update({
+        "schema_version": "giraffe-research-control-v3", "carry_forward": [],
+        "terminal_exclusions": [], "correction_of": [],
+    })
+    digest = hashlib.sha256(canonical(contract)).hexdigest()
+    registered = client.post(
+        f"/api/internal/research-runs/{key}/register",
+        json={"control_contract": contract}, headers=CONTROL_HEADERS,
+    )
+    assert registered.status_code == 200, registered.text
+    assert client.post(
+        f"/api/internal/scheduler-runs/{key}/start",
+        json={"kind": "research"}, headers=HEADERS,
+    ).status_code == 200
+
+    saved_source = next(source for source in contract["sources"] if source["rcp_no"] == saved_rcp)
+    evidence_url = "https://dart.fss.or.kr/partial-done-success-r701"
+    evidence = client.post("/api/internal/evidence", headers=HEADERS, json={
+        "symbol": "005930", "kind": "contract", "title": "partial run success",
+        "summary": "one admitted DART item produced durable evidence", "source": "DART",
+        "source_url": evidence_url, "announcement_at": "2026-09-17T06:00:00+09:00",
+        "known_at": "2026-09-17T06:30:00+09:00", "collected_at": "2026-09-17T06:40:00+09:00",
+        "research_mode": "scheduled_as_of", "research_run_key": key,
+        "snapshot": {"rcp_no": saved_rcp, "dart_source": saved_source},
+        "dedupe_key": "partial-done-edd-success-r701",
+    })
+    assert evidence.status_code == 200, evidence.text
+    evidence_id = evidence.json()["id"]
+
+    reviewed = [store_error_rcp, saved_rcp]
+    value = receipt(
+        key, digest, receipts, source_valid=2, reviewed_unique=2,
+        reviewed_rcp_nos=reviewed, source_error=1, store_error=1,
+        coverage_error=1, rejected_after_evidence=0, saved=1,
+        success_total=1, failure_total=3,
+    )
+    candidate = value["coverage_lanes"]["kind_krx"]["checked_sources"][0]
+    candidate.update({
+        "url": evidence_url, "published_at": "2026-09-17T06:00:00+09:00",
+        "retrieved_at": "2026-09-17T06:40:00+09:00", "outcome": "candidate",
+        "economic_disposition": "saved", "economic_reason": "durable evidence readback matched",
+        "evidence_id": evidence_id,
+    })
+    value["coverage_lanes"]["kind_krx"]["candidate_count"] = 1
+    value["coverage_lanes"]["issuer_ir_newsroom"] = {
+        "executed": False, "query_count": 0, "checked_url_count": 0,
+        "source_valid_count": 0, "candidate_count": 0, "coverage_error_count": 0,
+        "queries": [], "checked_sources": [],
+    }
+    failed_media = value["coverage_lanes"]["reputable_media"]["checked_sources"][0]
+    failed_media.update({
+        "source_valid": False, "published_at": None, "outcome": "invalid_source",
+        "failure_class": "timeout",
+    })
+    value["coverage_lanes"]["reputable_media"].update({
+        "source_valid_count": 0, "coverage_error_count": 1,
+    })
+    audits = [
+        {"rcp_no": source_error_rcp, "disposition": "source_error", "evidence_id": None,
+         "economic_disposition": "error", "economic_reason": "DART extractor failed after admission",
+         "economic_facts": None},
+        {"rcp_no": store_error_rcp, "disposition": "store_error", "evidence_id": None,
+         "economic_disposition": "error", "economic_reason": "source review completed but evidence store failed",
+         "economic_facts": None},
+        {"rcp_no": saved_rcp, "disposition": "saved", "evidence_id": evidence_id,
+         "economic_disposition": "qualifying_A_or_better", "economic_reason": "durable material evidence stored",
+         "economic_facts": None},
+    ]
+    done = {"status": "done", "count": 1, "detail": {
+        "completion_receipt": value, "control_terminal_dispositions": audits,
+        "discovery_terminal_dispositions": [],
+    }}
+    response = client.post(
+        f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "done"
+
+    persisted = client.get(f"/api/internal/scheduler-runs/{key}", headers=CONTROL_HEADERS).json()
+    assert persisted["status"] == "done"
+    assert persisted["detail"]["detail"]["completion_receipt"]["coverage_error"] == 1
+    terminal = client.post(
+        "/api/internal/research-backlog/terminal-items", headers=CONTROL_HEADERS,
+        json={"rcp_nos": receipts},
+    ).json()["items"]
+    assert {item["payload"]["rcp_no"]: item["terminal_disposition"] for item in terminal} == {
+        source_error_rcp: "source_error", store_error_rcp: "store_error", saved_rcp: "saved",
+    }
+
+    # This is the real read sequence used by the 08:00 prompt: DONE dependency,
+    # then durable evidence/pending-card reads. Nonzero failure totals do not hide
+    # the successful material_evidence row.
+    latest = client.get(
+        "/api/internal/scheduler-runs/latest?kind=research&date=2026-09-17", headers=HEADERS,
+    )
+    assert latest.status_code == 200
+    assert latest.json()["status"] == "done"
+    assert latest.json()["detail"]["detail"]["completion_receipt"]["failure_total"] == 3
+    today_ids = {item["id"] for item in client.get(
+        "/api/internal/evidence?date=2026-09-17", headers=HEADERS,
+    ).json()}
+    pending_ids = {item["id"] for item in client.get(
+        "/api/internal/cards?missing=true", headers=HEADERS,
+    ).json()}
+    assert evidence_id in today_ids
+    assert evidence_id in pending_ids
+
+
+def test_partial_done_binds_reviewed_receipts_to_non_source_error_control_items():
+    client = TestClient(app); key = "research-2026-09-17-0700-kst-r702"
+    source_error_rcp, reviewed_rcp = "20260917000711", "20260917000712"
+    receipts = [source_error_rcp, reviewed_rcp]
+    contract, _ = commitment(key, receipts)
+    for source in contract["sources"]:
+        source.update({"report_class": "other", "report_name": "주요사항보고서(유상증자결정)"})
+    contract.update({"schema_version": "giraffe-research-control-v3", "carry_forward": [],
+                     "terminal_exclusions": [], "correction_of": []})
+    assert client.post(f"/api/internal/research-runs/{key}/register", headers=CONTROL_HEADERS,
+                       json={"control_contract": contract}).status_code == 200
+    assert client.post(f"/api/internal/scheduler-runs/{key}/start", headers=HEADERS,
+                       json={"kind": "research"}).status_code == 200
+    value = receipt(
+        key, hashlib.sha256(canonical(contract)).hexdigest(), receipts,
+        source_valid=1, reviewed_unique=1, reviewed_rcp_nos=[source_error_rcp],
+        source_error=1, rejected_after_evidence=1, success_total=1, failure_total=1,
+    )
+    audits = [
+        {"rcp_no": source_error_rcp, "disposition": "source_error", "evidence_id": None,
+         "economic_disposition": "error", "economic_reason": "extractor failed", "economic_facts": None},
+        {"rcp_no": reviewed_rcp, "disposition": "rejected", "evidence_id": None,
+         "economic_disposition": "negative_risk", "economic_reason": "reviewed non-material filing", "economic_facts": None},
+    ]
+    response = client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json={
+        "status": "done", "count": 0, "detail": {
+            "completion_receipt": value, "control_terminal_dispositions": audits,
+            "discovery_terminal_dispositions": [],
+        },
+    })
+    assert response.status_code == 422
+    assert client.get(f"/api/internal/scheduler-runs/{key}", headers=CONTROL_HEADERS).json()["status"] == "started"
+
+
+def test_research_error_cannot_claim_reviewed_counts_without_receipt_ids():
+    client = TestClient(app); key = "research-2026-09-17-0700-kst-r703"
+    start(client, key, ["20260917000721"])
+    response = client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json={
+        "status": "error", "count": 0,
+        "detail": {"reviewed_unique": 1, "carry_forward_candidates": []},
+    })
+    assert response.status_code == 422
+    assert client.get(f"/api/internal/scheduler-runs/{key}", headers=CONTROL_HEADERS).json()["status"] == "started"

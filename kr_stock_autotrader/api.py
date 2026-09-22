@@ -724,6 +724,8 @@ def _valid_control_economic_audit(source: dict, item: dict) -> bool:
             or not isinstance(reason, str) or reason.strip() != reason or not 0 < len(reason) <= 1000):
         return False
     facts = item.get('economic_facts')
+    if disposition == 'error':
+        return facts is None
     if source.get('report_class') != 'dart_single_sale_supply_contract':
         return facts is None
     if is_correction_single_sale_supply_contract(source.get('report_name')):
@@ -876,7 +878,9 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
     if contract.get('schema_version') not in {'giraffe-research-control-v2', 'giraffe-research-control-v3'}: return
     items = detail.get('control_terminal_dispositions')
     expected = contract['expected_rcp_nos']
-    allowed = {'saved', 'existing', 'correction_stored', 'rejected', 'hold'}
+    # An admitted DART item must close with its own audit; an item failure must
+    # not erase subsequent admitted control work.
+    allowed = {'saved', 'existing', 'correction_stored', 'rejected', 'hold', 'source_error', 'store_error'}
     v3 = contract.get('schema_version') == 'giraffe-research-control-v3'
     item_fields = {'rcp_no', 'disposition', 'evidence_id'} | ({'economic_disposition', 'economic_reason', 'economic_facts'} if v3 else set())
     sources = {source['rcp_no']: source for source in contract['sources']}
@@ -884,15 +888,20 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
             or [item.get('rcp_no') if isinstance(item, dict) else None for item in items] != expected
             or any(not isinstance(item, dict) or set(item) != item_fields or item['disposition'] not in allowed
                    or (item['disposition'] in {'saved','existing','correction_stored'} and (not isinstance(item['evidence_id'], int) or isinstance(item['evidence_id'], bool) or item['evidence_id'] <= 0))
-                   or (item['disposition'] in {'rejected','hold'} and item['evidence_id'] is not None)
+                   or (item['disposition'] in {'rejected','hold','source_error','store_error'} and item['evidence_id'] is not None)
                    or (v3 and not _valid_control_economic_audit(sources[item['rcp_no']], item))
-                   or (v3 and _qualifies_control_contract_from_validated_facts(sources[item['rcp_no']], item['economic_facts'])
-                       and item['disposition'] not in {'saved', 'correction_stored'}) for item in items)):
+                   or (v3 and item['disposition'] in {'source_error', 'store_error'} and item['economic_disposition'] != 'error')
+                   or (v3 and item['economic_disposition'] != 'error'
+                       and _qualifies_control_contract_from_validated_facts(sources[item['rcp_no']], item['economic_facts'])
+                       and item['disposition'] not in {'saved', 'correction_stored', 'store_error'}) for item in items)):
         raise HTTPException(422, 'research control terminal dispositions are not exact')
     # Validate every requested transition before changing a cursor row.  In
     # particular, a positive integer is not evidence, and a listed receipt is
     # not authority to clear an unrelated/missing backlog record.
     receipt = detail.get('completion_receipt', {})
+    reviewed = receipt.get('reviewed_rcp_nos') if isinstance(receipt, dict) else None
+    if reviewed != [item['rcp_no'] for item in items if item['disposition'] != 'source_error']:
+        raise HTTPException(422, 'research reviewed receipts do not match terminal dispositions')
     history = _terminal_dart_history(db, contract)
     corrections = {item['payload']['rcp_no']: item for item in contract.get('correction_of', [])}
     carried_dart = {entry['payload']['rcp_no'] for entry in contract.get('carry_forward', []) if entry['kind'] == 'dart'}
@@ -922,8 +931,8 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
     at = __import__('kr_stock_autotrader.decision_cards', fromlist=['now']).now()
     for item in items:
         identity = _correction_backlog_identity(sources[item['rcp_no']], corrections[item['rcp_no']]) if item['rcp_no'] in corrections else _backlog_identity('dart', item['rcp_no'])
-        if item['rcp_no'] in corrections and item['disposition'] != 'correction_stored':
-            raise HTTPException(422, 'DART correction must store append-only correction evidence')
+        if item['rcp_no'] in corrections and item['disposition'] not in {'correction_stored', 'source_error', 'store_error'}:
+            raise HTTPException(422, 'DART correction must store evidence or close with an audited failure')
         db.execute("UPDATE giraffe_research_backlog SET status='terminal',terminal_disposition=?,terminal_run_key=?,terminal_evidence_id=?,terminal_at=? WHERE identity=? AND status='pending'", (item['disposition'], run_key, item['evidence_id'], at, identity))
         row = db.execute("SELECT status,terminal_disposition,terminal_run_key,terminal_evidence_id FROM giraffe_research_backlog WHERE identity=?", (identity,)).fetchone()
         if row is None or dict(row) != {'status':'terminal','terminal_disposition':item['disposition'],'terminal_run_key':run_key,'terminal_evidence_id':item['evidence_id']}:
@@ -931,12 +940,12 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
     discovery_expected = [item for item in contract['carry_forward'] if item['kind'] == 'discovery']
     discovery = detail.get('discovery_terminal_dispositions', [])
     if (not isinstance(discovery, list) or [item.get('identity') if isinstance(item, dict) else None for item in discovery] != [item['identity'] for item in discovery_expected]
-            or any(not isinstance(item, dict) or set(item) != {'identity','disposition','evidence_id'} or item['disposition'] not in allowed
+            or any(not isinstance(item, dict) or set(item) != {'identity','disposition','evidence_id'} or item['disposition'] not in {'saved', 'existing', 'correction_stored', 'rejected', 'hold'}
                    or (item['disposition'] in {'saved','existing','correction_stored'} and (not isinstance(item['evidence_id'], int) or isinstance(item['evidence_id'], bool) or item['evidence_id'] <= 0))
                    or (item['disposition'] in {'rejected','hold'} and item['evidence_id'] is not None) for item in discovery)):
         raise HTTPException(422, 'research discovery terminal dispositions are not exact')
     terminal_counts = {name: sum(item['disposition'] == name for item in [*items, *discovery]) for name in allowed}
-    if (not isinstance(receipt, dict) or any(receipt.get(name, 0) != terminal_counts[name] for name in ('saved', 'existing', 'correction_stored'))
+    if (not isinstance(receipt, dict) or any(receipt.get(name, 0) != terminal_counts[name] for name in ('saved', 'existing', 'correction_stored', 'source_error', 'store_error'))
             or receipt.get('rejected_after_evidence', 0) != terminal_counts['rejected'] + terminal_counts['hold']):
         raise HTTPException(422, 'research terminal dispositions do not match receipt totals')
     for item, expected_item in zip(discovery, discovery_expected):
@@ -968,6 +977,19 @@ def _safe_research_scheduler_finish(db, run_key: str, start_detail: object, data
     count = _nonnegative_int(data.get("count", 0)); commitment = start_detail.get("control_commitment")
     if count is None or not isinstance(data.get("detail"), dict) or not isinstance(commitment, dict): raise HTTPException(422, "invalid research scheduler detail")
     if data["status"] == "error":
+        # An error receipt is not a partial DONE receipt.  If it reports review
+        # progress, bind the count to explicit control receipt IDs instead of
+        # accepting an unverifiable aggregate.
+        reviewed_count = data['detail'].get('reviewed_unique')
+        reviewed_receipts = data['detail'].get('reviewed_rcp_nos')
+        if reviewed_count is not None or reviewed_receipts is not None:
+            expected = commitment['control_contract']['expected_rcp_nos']
+            if (_nonnegative_int(reviewed_count) is None or not isinstance(reviewed_receipts, list)
+                    or reviewed_receipts != sorted(reviewed_receipts)
+                    or len(reviewed_receipts) != len(set(reviewed_receipts))
+                    or reviewed_count != len(reviewed_receipts)
+                    or any(not isinstance(item, str) or item not in expected for item in reviewed_receipts)):
+                raise HTTPException(422, 'research error reviewed count lacks exact receipt IDs')
         candidates = data['detail'].get('carry_forward_candidates', [])
         if not isinstance(candidates, list): raise HTTPException(422, 'invalid research carry-forward candidates')
         for candidate in candidates:
@@ -980,13 +1002,14 @@ def _safe_research_scheduler_finish(db, run_key: str, start_detail: object, data
             _enqueue_backlog(db, kind='discovery', identity=identity, payload=candidate, run_key=run_key, announcement_at=candidate['announcement_at'])
         return {"status": "error", "count": count, "detail": data["detail"], "control_commitment": commitment}
     receipt = data["detail"].get("completion_receipt")
-    required = {"schema_version", "run_key", "control_contract_sha256", "control_count", "source_valid", "reviewed_unique", "reviewed_rcp_nos", "source_error", "store_error", "coverage_error", "coverage_lanes", "rejected_after_evidence", "saved", "existing", "correction_stored"}
+    required = {"schema_version", "run_key", "control_contract_sha256", "control_count", "source_valid", "reviewed_unique", "reviewed_rcp_nos", "source_error", "store_error", "coverage_error", "coverage_lanes", "rejected_after_evidence", "saved", "existing", "correction_stored", "success_total", "failure_total"}
     if not isinstance(receipt, dict) or set(receipt) != required or receipt.get("schema_version") != "giraffe-research-completion-v1": raise HTTPException(422, "invalid research completion receipt")
     fields = {name: _nonnegative_int(receipt[name]) for name in required - {"schema_version", "run_key", "control_contract_sha256", "reviewed_rcp_nos", "coverage_lanes"}}
     reviewed = receipt.get("reviewed_rcp_nos"); expected = commitment["control_contract"]["expected_rcp_nos"]
     if (any(value is None for value in fields.values()) or not _valid_coverage_lanes(receipt["coverage_lanes"], run_key)
             or receipt["run_key"] != run_key or receipt["control_contract_sha256"] != commitment["control_contract_sha256"]
-            or not isinstance(reviewed, list) or reviewed != expected or reviewed != sorted(reviewed) or len(reviewed) != len(set(reviewed))): raise HTTPException(422, "research completion does not match start commitment")
+            or not isinstance(reviewed, list) or reviewed != sorted(reviewed) or len(reviewed) != len(set(reviewed))
+            or any(not isinstance(item, str) or item not in expected for item in reviewed)): raise HTTPException(422, "research completion does not match start commitment")
     fields = {name: int(value) for name, value in fields.items()}; control = len(expected)
     discovery_terminal_counts = {
         terminal: sum(isinstance(item, dict) and item.get('disposition') == terminal
@@ -1004,9 +1027,18 @@ def _safe_research_scheduler_finish(db, run_key: str, start_detail: object, data
                                               discovery_terminal_counts=discovery_terminal_counts,
                                               manual_correction_evidence_ids=manual_correction_evidence_ids):
         raise HTTPException(422, "research candidate evidence bindings are not done-safe")
-    terminal = sum(fields[name] for name in ("rejected_after_evidence", "saved", "existing", "correction_stored", "source_error", "store_error", "coverage_error"))
+    terminal = sum(fields[name] for name in ("rejected_after_evidence", "saved", "existing", "correction_stored", "source_error", "store_error"))
     discovery_count = sum(item.get('kind') == 'discovery' for item in commitment['control_contract'].get('carry_forward', []))
-    if (fields["control_count"] != control or fields["source_valid"] != control or fields["reviewed_unique"] != control or terminal != control + discovery_count or any(fields[name] for name in ("source_error", "store_error", "coverage_error")) or count != fields["saved"] + fields["correction_stored"]): raise HTTPException(422, "research completion receipt is not done-safe")
+    coverage_failures = sum(lane["coverage_error_count"] for lane in receipt["coverage_lanes"].values())
+    successful_terminal = sum(fields[name] for name in ("rejected_after_evidence", "saved", "existing", "correction_stored"))
+    failed_terminal = sum(fields[name] for name in ("source_error", "store_error", "coverage_error"))
+    if (fields["control_count"] != control or fields["coverage_error"] != coverage_failures
+            or ((fields["source_error"] or fields["store_error"])
+                and commitment["control_contract"].get("schema_version") not in {"giraffe-research-control-v2", "giraffe-research-control-v3"})
+            or fields["source_valid"] + fields["source_error"] != control
+            or fields["reviewed_unique"] != len(reviewed) or fields["reviewed_unique"] + fields["source_error"] != control
+            or fields["success_total"] != successful_terminal or fields["failure_total"] != failed_terminal
+            or terminal != control + discovery_count or count != fields["saved"] + fields["correction_stored"]): raise HTTPException(422, "research completion receipt is not done-safe")
     _terminalize_v2_backlog(db, run_key, commitment, data['detail'])
     return {"status": "done", "count": count, "detail": data["detail"], "control_commitment": commitment}
 
@@ -1017,8 +1049,9 @@ def _nonnegative_int(value: object) -> int | None:
 
 _COVERAGE_LANE_NAMES = frozenset({"kind_krx", "issuer_ir_newsroom", "reputable_media"})
 _COVERAGE_LANE_FIELDS = frozenset({"executed", "query_count", "checked_url_count", "source_valid_count", "candidate_count", "coverage_error_count", "queries", "checked_sources"})
-_CHECKED_SOURCE_FIELDS = frozenset({"url", "source_valid", "published_at", "retrieved_at", "outcome", "economic_disposition", "economic_reason", "evidence_id"})
+_CHECKED_SOURCE_FIELDS = frozenset({"url", "source_valid", "published_at", "retrieved_at", "outcome", "failure_class", "economic_disposition", "economic_reason", "evidence_id"})
 _COVERAGE_OUTCOMES = frozenset({"candidate", "negative_evidence", "not_material", "timing_ineligible", "invalid_source"})
+_COVERAGE_FAILURE_CLASSES = frozenset({"redirect_loop", "timeout", "not_found", "extractor_failure", "unsupported_or_js"})
 _CANDIDATE_DISPOSITIONS = frozenset({"saved", "existing", "correction_stored", "rejected", "hold"})
 _EVIDENCE_CANDIDATE_DISPOSITIONS = frozenset({"saved", "existing", "correction_stored"})
 _MAX_COVERAGE_QUERIES = 100
@@ -1090,7 +1123,7 @@ def _valid_checked_source(value: object, cutoff: datetime) -> bool:
     retrieved_at = _parse_timezone_aware_iso_timestamp(value.get("retrieved_at"))
     if not isinstance(source_valid, bool) or outcome not in _COVERAGE_OUTCOMES or not _valid_coverage_url(value.get("url")) or retrieved_at is None:
         return False
-    disposition, reason = value.get("economic_disposition"), value.get("economic_reason")
+    disposition, reason, failure_class = value.get("economic_disposition"), value.get("economic_reason"), value.get("failure_class")
     if outcome == "candidate":
         if disposition not in _CANDIDATE_DISPOSITIONS or not isinstance(reason, str) or reason.strip() != reason or not 0 < len(reason) <= 1000:
             return False
@@ -1103,7 +1136,9 @@ def _valid_checked_source(value: object, cutoff: datetime) -> bool:
     elif disposition is not None or reason is not None or value.get("evidence_id") is not None:
         return False
     if not source_valid:
-        return outcome == "invalid_source" and value.get("published_at") is None
+        return outcome == "invalid_source" and value.get("published_at") is None and failure_class in _COVERAGE_FAILURE_CLASSES
+    if failure_class is not None:
+        return False
     published_at = _parse_timezone_aware_iso_timestamp(value.get("published_at"))
     if outcome == "invalid_source" or published_at is None or retrieved_at.astimezone(ZoneInfo("UTC")) < published_at.astimezone(ZoneInfo("UTC")):
         return False
@@ -1118,16 +1153,16 @@ def _valid_coverage_lanes(value: object, run_key: str) -> bool:
         return False
     cutoff = datetime.combine(_research_run_date(run_key), time(7), tzinfo=ZoneInfo("Asia/Seoul"))
     canonical_urls = []
-    for lane in value.values():
-        if not isinstance(lane, dict) or set(lane) != _COVERAGE_LANE_FIELDS or lane.get("executed") is not True:
+    for name, lane in value.items():
+        if not isinstance(lane, dict) or set(lane) != _COVERAGE_LANE_FIELDS or not isinstance(lane.get("executed"), bool):
             return False
         if any(_nonnegative_int(lane.get(field)) is None for field in _COVERAGE_LANE_FIELDS - {"executed", "queries", "checked_sources"}):
             return False
         queries, checked_sources = lane.get("queries"), lane.get("checked_sources")
-        if (not isinstance(queries, list) or not 0 < len(queries) <= _MAX_COVERAGE_QUERIES
+        if (not isinstance(queries, list) or not len(queries) <= _MAX_COVERAGE_QUERIES
                 or not all(isinstance(query, str) and query.strip() == query and 0 < len(query) <= _MAX_COVERAGE_QUERY_LENGTH for query in queries)
                 or len(set(queries)) != len(queries)
-                or not isinstance(checked_sources, list) or not 0 < len(checked_sources) <= _MAX_COVERAGE_SOURCES
+                or not isinstance(checked_sources, list) or not len(checked_sources) <= _MAX_COVERAGE_SOURCES
                 or not all(_valid_checked_source(source, cutoff) for source in checked_sources)):
             return False
         urls = [_canonical_coverage_url(source["url"]) for source in checked_sources]
@@ -1136,9 +1171,14 @@ def _valid_coverage_lanes(value: object, run_key: str) -> bool:
         canonical_urls.extend(urls)
         valid_count = sum(source["source_valid"] for source in checked_sources)
         candidate_count = sum(source["outcome"] == "candidate" for source in checked_sources)
+        failure_count = sum(not source["source_valid"] for source in checked_sources)
         if (lane["query_count"] != len(queries) or lane["checked_url_count"] != len(checked_sources)
                 or lane["source_valid_count"] != valid_count or lane["candidate_count"] != candidate_count
-                or lane["query_count"] <= 0 or lane["source_valid_count"] <= 0 or lane["coverage_error_count"] != 0):
+                or lane["coverage_error_count"] != failure_count
+                or (lane["executed"] and lane["query_count"] <= 0)
+                or (name in {"kind_krx", "reputable_media"} and not lane["executed"])
+                or (name == "issuer_ir_newsroom" and not lane["executed"]
+                    and any((queries, checked_sources, lane["query_count"], lane["checked_url_count"], lane["source_valid_count"], lane["candidate_count"], lane["coverage_error_count"])))):
             return False
     return len(set(canonical_urls)) == len(canonical_urls)
 

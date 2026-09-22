@@ -222,13 +222,16 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         prompt = (ROOT / "prompts" / "giraffe-material-discovery-v1.md").read_text(encoding="utf-8")
         for required in (
             "control_contract.run_key", "GIRAFFE_RESEARCH_RERUN_VERSION", "coverage_lanes",
-            "queries", "checked_sources", "retrieved_at", "invalid_source",
+            "queries", "checked_sources", "retrieved_at", "invalid_source", "failure_class",
             "kind_krx", "issuer_ir_newsroom", "reputable_media", "source_published_at",
             "evidence_source_published_at", "DART `rcept_dt`는 date-only", "economic_disposition",
             "발표시각 미확인은 경제 검토 생략 사유가 아니다", "미래 가격 반응은 사용 금지",
-            "단일 `web_search` backend 오류로 lane을 즉시 닫지 않는다", "최소 3회", "direct-domain", "전년도 매출 대비 50% 이상",
+            "단일 `web_search` backend 오류로 lane을 즉시 닫지 않는다", "최대 3회", "direct-domain", "전년도 매출 대비 50% 이상",
+            "redirect_loop", "timeout", "not_found", "extractor_failure", "unsupported_or_js",
+            "success_total", "failure_total", "source_error", "store_error",
         ):
             self.assertIn(required, prompt)
+        self.assertNotIn("최소 3회", prompt)
 
     def test_correction_receipt_uses_manifest_control_date_and_rejects_unsafe_bindings(self):
         receipt, control_date = "20260914000432", "20260915"
@@ -323,6 +326,33 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(contract["schema_version"], "giraffe-research-control-v3")
         self.assertEqual(contract["expected_rcp_nos"], [])
         self.assertEqual(contract["terminal_exclusions"], history)
+
+    def test_terminal_dart_failures_are_excluded_but_cannot_be_selected_as_corrections(self):
+        receipt, control_date = "20260916900231", "20260917"
+        with tempfile.TemporaryDirectory() as temp:
+            packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), pathlib.Path(temp) / control_date)
+            source = {"rcp_no": receipt, "date": control_date, "receipt_source_date": "20260916",
+                      "packet_path": str(packet), "packet_sha256": hashlib.sha256(packet.read_bytes()).hexdigest()}
+            summary = [{"date": control_date,
+                        "material_candidate_records": [{"rcp_no": receipt, "rcept_dt": control_date}],
+                        "source_packet_paths": [str(packet)]}]
+            for disposition in ("source_error", "store_error"):
+                with self.subTest(disposition=disposition):
+                    history = [{"identity": "dart:" + receipt, "kind": "dart", "payload": source,
+                                "terminal_disposition": disposition,
+                                "terminal_run_key": "research-2026-09-16-0700-kst-r7",
+                                "terminal_evidence_id": None,
+                                "terminal_at": "2026-09-16T07:00:00+09:00"}]
+                    contract = self.gate.control_contract(
+                        "research-2026-09-17-0700-kst-r8", summary, terminal_history=history,
+                    )
+                    self.assertEqual(contract["expected_rcp_nos"], [])
+                    self.assertEqual(contract["terminal_exclusions"], history)
+                    with self.assertRaisesRegex(self.gate.ManifestError, "rejected/hold"):
+                        self.gate.control_contract(
+                            "research-2026-09-17-0700-kst-r9", summary,
+                            terminal_history=history, correction_receipts=[receipt],
+                        )
 
     def test_terminal_other_report_class_promotes_for_exact_authoritative_name_and_core(self):
         report_name = "[기재정정]단일판매ㆍ공급계약체결" + " " * 14

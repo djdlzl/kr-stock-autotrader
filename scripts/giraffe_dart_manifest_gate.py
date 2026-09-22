@@ -336,10 +336,10 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
         if (not isinstance(item, dict) or set(item) != required or item.get("kind") != "dart"
                 or not isinstance(rcp_no, str) or not isinstance(item.get("identity"), str)
                 or not (item["identity"] == "dart:" + rcp_no or item["identity"].startswith("dart:correction:"))
-                or item.get("terminal_disposition") not in {"saved", "existing", "correction_stored", "rejected", "hold"}
+                or item.get("terminal_disposition") not in {"saved", "existing", "correction_stored", "rejected", "hold", "source_error", "store_error"}
                 or not valid_research_run_key(item.get("terminal_run_key")) or not valid_discovery_timestamp(item.get("terminal_at"))
                 or (item.get("terminal_disposition") in {"saved", "existing", "correction_stored"} and (not isinstance(item.get("terminal_evidence_id"), int) or isinstance(item.get("terminal_evidence_id"), bool) or item["terminal_evidence_id"] <= 0))
-                or (item.get("terminal_disposition") in {"rejected", "hold"} and item.get("terminal_evidence_id") is not None)):
+                or (item.get("terminal_disposition") in {"rejected", "hold", "source_error", "store_error"} and item.get("terminal_evidence_id") is not None)):
             raise ManifestError("durable terminal research history invalid")
         if item['identity'] == 'dart:' + rcp_no:
             if rcp_no in terminal_by_receipt:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -15,6 +16,20 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+# The script is loaded by path in the prehook tests before ``scripts/`` is on
+# sys.path.  Load the sibling under its production module name so every caller
+# still shares the same monotonic request-start authority.
+_source_module = sys.modules.get("giraffe_dart_source")
+if _source_module is None:
+    _source_spec = importlib.util.spec_from_file_location("giraffe_dart_source", Path(__file__).with_name("giraffe_dart_source.py"))
+    if _source_spec is None or _source_spec.loader is None:
+        raise ImportError("cannot load giraffe_dart_source pacing authority")
+    _source_module = importlib.util.module_from_spec(_source_spec)
+    sys.modules["giraffe_dart_source"] = _source_module
+    _source_spec.loader.exec_module(_source_module)
+_DEFAULT_PACER = _source_module._DEFAULT_PACER
+_RequestPacer = _source_module._RequestPacer
 
 BASE_URL = "https://opendart.fss.or.kr/api/list.json"
 PAGE_COUNT = 100
@@ -133,15 +148,23 @@ def _http_get(url: str, params: dict[str, Any], timeout: float = 30.0) -> dict[s
     return value
 
 
-def fetch_page(date: str, page: int, *, api_key: str | None = None, transport: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None, timeout: float = 30.0, retries: int = 3) -> dict[str, Any]:
+def fetch_page(date: str, page: int, *, api_key: str | None = None, transport: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None, timeout: float = 30.0, retries: int = 3, pacer: _RequestPacer | None = None) -> dict[str, Any]:
+    """Fetch/retry through the one DART request-start pacer.
+
+    Tests can inject a deterministic pacer; real OpenDART calls share the
+    packet-source monotonic authority, including retries.
+    """
     key = api_key if api_key is not None else os.environ.get("OPENDART_API_KEY", "")
     if not key:
         raise ManifestError("OPENDART_API_KEY is required")
     params = {"crtfc_key": key, "bgn_de": date, "end_de": date, "page_no": page, "page_count": PAGE_COUNT}
     request_transport = transport or (lambda url, values: _http_get(url, values, timeout))
+    # Synthetic transports are test-only; real network calls share the source
+    # packet clock.  Tests that assert pacing pass an injected pacer.
+    request_pacer = pacer or (_DEFAULT_PACER if transport is None else _RequestPacer(time.monotonic, lambda _seconds: None))
     for attempt in range(retries):
         try:
-            value = request_transport(BASE_URL, params)
+            value = request_pacer.request(lambda _url: request_transport(BASE_URL, params), BASE_URL)
             if not isinstance(value, dict):
                 raise ValueError("JSON root is not an object")
             return value
