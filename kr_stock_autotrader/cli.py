@@ -24,8 +24,12 @@ def main(argv=None):
     a=s.add_parser('scheduler-finish');a.add_argument('run_key');a.add_argument('status');a.add_argument('--count',type=int,default=0);a.add_argument('--detail',default='{}')
     a=s.add_parser('scheduler-latest');a.add_argument('kind');a.add_argument('--date',required=True)
     a=s.add_parser('scheduler-readback');a.add_argument('run_key')
+    a=s.add_parser('dart-terminal-plan');a.add_argument('json')
     x=p.parse_args(argv)
-    if x.cmd=='today-evidence': out=call('GET','/api/internal/evidence?'+urlencode({'date':x.date}))
+    if x.cmd=='dart-terminal-plan':
+        from kr_stock_autotrader.giraffe_terminal_audit import terminal_audit_plan
+        payload=json.loads(x.json); out=terminal_audit_plan(payload.get('source'),payload.get('audit'))
+    elif x.cmd=='today-evidence': out=call('GET','/api/internal/evidence?'+urlencode({'date':x.date}))
     elif x.cmd=='evidence-detail': out=call('GET','/api/internal/evidence/'+x.evidence_id)
     elif x.cmd=='filter-detail': out=call('GET','/api/internal/filters/'+x.filter_id)
     elif x.cmd=='filter-head': out=call('GET','/api/internal/filters/head?'+urlencode({'evidence_id':x.evidence_id,'as_of':x.as_of,'known_at':x.known_at}))

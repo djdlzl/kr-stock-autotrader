@@ -1657,4 +1657,48 @@ def test_unavailable_source_schema_rejects_unbounded_or_forged_fields(mutation):
     contract.update(schema_version='giraffe-research-control-v3', sources=[{**failure, **mutation}], carry_forward=[], terminal_exclusions=[], correction_of=[])
     response = client.post(f'/api/internal/research-runs/{key}/register', headers=CONTROL_HEADERS, json={'control_contract': contract})
     assert response.status_code == 422
+
+
+def test_dart_terminal_plan_closes_non_supply_and_missing_time_per_receipt():
+    from kr_stock_autotrader.giraffe_terminal_audit import TerminalAuditError, terminal_audit_plan
+
+    client = TestClient(app); key = "research-2026-09-17-0700-kst-r805"
+    other, supply = "20260917000805", "20260917000806"
+    contract, _ = commitment(key, [other, supply])
+    contract["sources"][0].update(report_class="other", report_name="주요사항보고서(유상증자결정)")
+    contract["sources"][1].update(report_class="dart_single_sale_supply_contract", report_name="단일판매ㆍ공급계약체결")
+    contract.update(schema_version="giraffe-research-control-v3", carry_forward=[], terminal_exclusions=[], correction_of=[])
+    assert client.post(f"/api/internal/research-runs/{key}/register", headers=CONTROL_HEADERS, json={"control_contract": contract}).status_code == 200
+    assert client.post(f"/api/internal/scheduler-runs/{key}/start", headers=HEADERS, json={"kind": "research"}).status_code == 200
+
+    non_supply = terminal_audit_plan(contract["sources"][0], {})
+    facts = {"binding_contract": True, "contract_amount": 50, "prior_revenue": 100, "ratio_percent": 50, "term": "2026-09-17 to 2027-09-16"}
+    timing_unknown = terminal_audit_plan(contract["sources"][1], {"economic_reason": "binding contract qualifies but source publication time is unavailable", "economic_facts": facts, "published_at": None})
+    assert non_supply == {"action": "terminal", "item": {"rcp_no": other, "disposition": "rejected", "evidence_id": None, "economic_disposition": "negative_risk", "economic_reason": "non-supply DART filing is not a supply-contract candidate", "economic_facts": None}}
+    assert timing_unknown["item"]["disposition"] == "hold"
+    assert timing_unknown["item"]["economic_disposition"] == "timing_unresolved"
+    assert timing_unknown["item"]["economic_facts"] == facts
+    with __import__("pytest").raises(TerminalAuditError):
+        terminal_audit_plan(contract["sources"][1], {"economic_reason": "bad facts", "economic_facts": {}})
+    with __import__("pytest").raises(TerminalAuditError):
+        terminal_audit_plan(contract["sources"][1], {"economic_reason": "bad facts", "economic_facts": {**facts, "ratio_percent": float("nan")}})
+    with __import__("pytest").raises(TerminalAuditError):
+        terminal_audit_plan(contract["sources"][1], {"economic_reason": "bad time", "economic_facts": facts, "published_at": "2026-09-17"})
+    ready = terminal_audit_plan(contract["sources"][1], {"economic_reason": "binding contract qualifies", "economic_facts": facts, "published_at": "2026-09-17T06:10:00+09:00"})
+    assert ready["action"] == "evidence_add_required" and ready["published_at"] == "2026-09-17T06:10:00+09:00"
+
+    complete = receipt(key, hashlib.sha256(canonical(contract)).hexdigest(), [other, supply])
+    done = {"status": "done", "count": 0, "detail": {"completion_receipt": complete,
+            "control_terminal_dispositions": [non_supply["item"], timing_unknown["item"]]}}
+    response = client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done)
+    assert response.status_code == 200, response.text
+    db = api_module.connect()
+    try:
+        rows = db.execute("SELECT identity,status,terminal_disposition,terminal_evidence_id FROM giraffe_research_backlog WHERE identity IN (?,?) ORDER BY identity", ("dart:" + other, "dart:" + supply)).fetchall()
+        assert [dict(row) for row in rows] == [
+            {"identity": "dart:" + other, "status": "terminal", "terminal_disposition": "rejected", "terminal_evidence_id": None},
+            {"identity": "dart:" + supply, "status": "terminal", "terminal_disposition": "hold", "terminal_evidence_id": None},
+        ]
+    finally:
+        db.close()
     assert client.get('/api/internal/research-backlog', headers=CONTROL_HEADERS).json()['items'] == []

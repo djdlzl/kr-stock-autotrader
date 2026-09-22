@@ -799,7 +799,10 @@ def _valid_control_economic_audit(source: dict, item: dict) -> bool:
             return False
         qualifies = _qualifies_control_contract_from_validated_facts(source, facts)
         # An amendment cannot call a zero/negative (or sub-threshold) delta qualifying.
-        return (disposition == 'qualifying_A_or_better') == qualifies
+        # Missing source publication time prevents evidence storage, not the
+        # receipt-level economic audit.  Keep the validated amendment facts
+        # with a terminal timing hold instead of forcing a whole-run error.
+        return disposition == 'timing_unresolved' or (disposition == 'qualifying_A_or_better') == qualifies
     if not isinstance(facts, dict) or set(facts) != _ECONOMIC_FACT_FIELDS or not isinstance(facts['binding_contract'], bool):
         return False
     if (not isinstance(facts['contract_amount'], int) or isinstance(facts['contract_amount'], bool) or facts['contract_amount'] <= 0
@@ -811,7 +814,10 @@ def _valid_control_economic_audit(source: dict, item: dict) -> bool:
         return False
     # The reported ratio is retained for audit, while the threshold is recomputed.
     qualifies = _qualifies_control_contract_from_validated_facts(source, facts)
-    return not qualifies or disposition == 'qualifying_A_or_better'
+    # A receipt with validated contract facts may be held when the event's
+    # publication instant cannot be established.  DART's date-only rcept_dt is
+    # deliberately not accepted as an evidence announcement timestamp.
+    return disposition == 'timing_unresolved' or not qualifies or disposition == 'qualifying_A_or_better'
 
 
 def _terminal_dart_history(db, contract: dict) -> dict[str, dict]:
@@ -952,7 +958,7 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
                    or (v3 and item['disposition'] == 'source_error' and item['economic_disposition'] != 'error')
                    or (v3 and item['economic_disposition'] == 'error' and item['disposition'] not in {'source_error', 'store_error'})
                    or (_failed_dart_source(sources[item['rcp_no']]) and item['disposition'] != 'source_error')
-                   or (v3 and item['economic_disposition'] != 'error'
+                   or (v3 and item['economic_disposition'] not in {'error', 'timing_unresolved'}
                        and _qualifies_control_contract_from_validated_facts(sources[item['rcp_no']], item['economic_facts'])
                        and item['disposition'] not in {'saved', 'correction_stored', 'store_error'}) for item in items)):
         raise HTTPException(422, 'research control terminal dispositions are not exact')
