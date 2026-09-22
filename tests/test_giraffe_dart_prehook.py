@@ -229,9 +229,12 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             "단일 `web_search` backend 오류로 lane을 즉시 닫지 않는다", "최대 3회", "direct-domain", "전년도 매출 대비 50% 이상",
             "redirect_loop", "timeout", "not_found", "extractor_failure", "unsupported_or_js",
             "success_total", "failure_total", "source_error", "store_error",
+            "`material_candidate_records`가 DART 조사 제어 목록", "`source_packet_paths`는 source-valid control receipt의 원문 packet만",
+            "packet이 없는 `source_errors` receipt도 제어 목록에 포함", "`source_valid_count + source_error_count`가 제어 수와 같아야",
         ):
             self.assertIn(required, prompt)
         self.assertNotIn("최소 3회", prompt)
+        self.assertNotIn("`source_packet_paths`만이 DART 조사 제어 목록", prompt)
 
     def test_correction_receipt_uses_manifest_control_date_and_rejects_unsafe_bindings(self):
         receipt, control_date = "20260914000432", "20260915"
