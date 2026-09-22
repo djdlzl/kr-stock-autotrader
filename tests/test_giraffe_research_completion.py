@@ -1671,10 +1671,10 @@ def test_dart_terminal_plan_closes_non_supply_and_missing_time_per_receipt():
     assert client.post(f"/api/internal/research-runs/{key}/register", headers=CONTROL_HEADERS, json={"control_contract": contract}).status_code == 200
     assert client.post(f"/api/internal/scheduler-runs/{key}/start", headers=HEADERS, json={"kind": "research"}).status_code == 200
 
-    non_supply = terminal_audit_plan(contract["sources"][0], {})
+    non_supply = terminal_audit_plan(contract["sources"][0], {"source_url": "https://dart.fss.or.kr/non-supply", "economic_disposition": "negative_risk", "economic_reason": "source-grounded non-material filing audit", "disposition": "rejected"})
     facts = {"binding_contract": True, "contract_amount": 50, "prior_revenue": 100, "ratio_percent": 50, "term": "2026-09-17 to 2027-09-16"}
     timing_unknown = terminal_audit_plan(contract["sources"][1], {"economic_reason": "binding contract qualifies but source publication time is unavailable", "economic_facts": facts, "published_at": None})
-    assert non_supply == {"action": "terminal", "item": {"rcp_no": other, "disposition": "rejected", "evidence_id": None, "economic_disposition": "negative_risk", "economic_reason": "non-supply DART filing is not a supply-contract candidate", "economic_facts": None}}
+    assert non_supply == {"action": "terminal", "item": {"rcp_no": other, "disposition": "rejected", "evidence_id": None, "economic_disposition": "negative_risk", "economic_reason": "source-grounded non-material filing audit", "economic_facts": None}}
     assert timing_unknown["item"]["disposition"] == "hold"
     assert timing_unknown["item"]["economic_disposition"] == "timing_unresolved"
     assert timing_unknown["item"]["economic_facts"] == facts
@@ -1702,3 +1702,26 @@ def test_dart_terminal_plan_closes_non_supply_and_missing_time_per_receipt():
     finally:
         db.close()
     assert client.get('/api/internal/research-backlog', headers=CONTROL_HEADERS).json()['items'] == []
+
+
+def test_v3_direct_api_rejects_timing_unresolved_for_nonqualifying_contract_facts():
+    """Direct completion payloads cannot use timing to bypass recomputed economics."""
+    client = TestClient(app)
+    cases = [
+        ("단일판매ㆍ공급계약체결", {"binding_contract": False, "contract_amount": 50, "prior_revenue": 100, "ratio_percent": 50, "term": "2026-01-01 to 2026-12-31"}),
+        ("단일판매ㆍ공급계약체결", {"binding_contract": True, "contract_amount": 49, "prior_revenue": 100, "ratio_percent": 49, "term": "2026-01-01 to 2026-12-31"}),
+        ("[기재정정]단일판매ㆍ공급계약체결", {"binding_contract": True, "economic_basis": "amendment_delta", "original_contract_amount": 50, "amended_contract_amount": 50, "incremental_contract_amount": 0, "prior_revenue": 100, "incremental_ratio_percent": 0, "original_term": "2026-01-01 to 2026-12-31", "amended_term": "2026-01-01 to 2027-12-31"}),
+        ("[기재정정]단일판매ㆍ공급계약체결", {"binding_contract": True, "economic_basis": "amendment_delta", "original_contract_amount": 60, "amended_contract_amount": 50, "incremental_contract_amount": -10, "prior_revenue": 100, "incremental_ratio_percent": -10, "original_term": "2026-01-01 to 2026-12-31", "amended_term": "2026-01-01 to 2027-12-31"}),
+        ("[기재정정]단일판매ㆍ공급계약체결", {"binding_contract": True, "economic_basis": "amendment_delta", "original_contract_amount": 50, "amended_contract_amount": 99, "incremental_contract_amount": 49, "prior_revenue": 100, "incremental_ratio_percent": 49, "original_term": "2026-01-01 to 2026-12-31", "amended_term": "2026-01-01 to 2027-12-31"}),
+    ]
+    for index, (report_name, facts) in enumerate(cases, 901):
+        key, rcp = f"research-2026-09-17-0700-kst-r{index}", f"20260917{index:06d}"
+        contract, _ = commitment(key, [rcp])
+        contract["sources"][0].update(report_class="dart_single_sale_supply_contract", report_name=report_name)
+        contract.update(schema_version="giraffe-research-control-v3", carry_forward=[], terminal_exclusions=[], correction_of=[])
+        assert client.post(f"/api/internal/research-runs/{key}/register", headers=CONTROL_HEADERS, json={"control_contract": contract}).status_code == 200
+        assert client.post(f"/api/internal/scheduler-runs/{key}/start", headers=HEADERS, json={"kind": "research"}).status_code == 200
+        audit = {"rcp_no": rcp, "disposition": "hold", "evidence_id": None, "economic_disposition": "timing_unresolved", "economic_reason": "publication time is unavailable", "economic_facts": facts}
+        payload = {"status": "done", "count": 0, "detail": {"completion_receipt": receipt(key, hashlib.sha256(canonical(contract)).hexdigest(), [rcp]), "control_terminal_dispositions": [audit]}}
+        response = client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=payload)
+        assert response.status_code == 422, response.text

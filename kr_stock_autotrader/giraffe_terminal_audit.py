@@ -1,9 +1,10 @@
-"""Deterministic DART receipt terminal-audit planning."""
+"""Deterministic, exact-set DART receipt terminal-audit planning."""
 
 from __future__ import annotations
 
 from datetime import datetime
 import math
+from urllib.parse import urlparse
 
 from kr_stock_autotrader.dart_report_classification import is_correction_single_sale_supply_contract
 
@@ -17,6 +18,7 @@ _AMENDMENT_FACTS = frozenset({
     "binding_contract", "economic_basis", "original_contract_amount", "amended_contract_amount",
     "incremental_contract_amount", "prior_revenue", "incremental_ratio_percent", "original_term", "amended_term",
 })
+_NON_SUPPLY_DISPOSITIONS = frozenset({"negative_risk", "below_threshold", "timing_unresolved"})
 
 
 def _timestamp(value: object) -> bool:
@@ -32,6 +34,15 @@ def _timestamp(value: object) -> bool:
 def _reason(value: object) -> str:
     if not isinstance(value, str) or value.strip() != value or not 0 < len(value) <= 1000:
         raise TerminalAuditError("economic_reason must be a bounded trimmed string")
+    return value
+
+
+def _source_url(value: object) -> str:
+    if not isinstance(value, str) or value.strip() != value or not 0 < len(value) <= 2000:
+        raise TerminalAuditError("source_url must be a bounded trimmed HTTPS URL")
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.fragment:
+        raise TerminalAuditError("source_url must be a bounded trimmed HTTPS URL")
     return value
 
 
@@ -75,21 +86,31 @@ def _amendment_qualifies(facts: object) -> bool:
     return facts["binding_contract"] and facts["incremental_contract_amount"] > 0 and facts["incremental_contract_amount"] * 2 >= facts["prior_revenue"]
 
 
-def terminal_audit_plan(source: object, audit: object) -> dict:
-    """Return one safe receipt action without inventing a DART publication time.
+def _non_supply_terminal(source: dict, audit: object, rcp_no: str) -> dict:
+    """Require a source-grounded human audit; never infer non-supply economics."""
+    if not isinstance(audit, dict) or set(audit) != {"source_url", "economic_disposition", "economic_reason", "disposition"}:
+        raise TerminalAuditError("non-supply audit must contain exactly source_url, economic_disposition, economic_reason, disposition")
+    _source_url(audit["source_url"])
+    reason = _reason(audit["economic_reason"])
+    if audit["economic_disposition"] not in _NON_SUPPLY_DISPOSITIONS:
+        raise TerminalAuditError("non-supply economic_disposition is not allowed")
+    if audit["disposition"] not in {"rejected", "hold"}:
+        raise TerminalAuditError("non-supply disposition must be rejected or hold")
+    if audit["economic_disposition"] == "timing_unresolved" and audit["disposition"] != "hold":
+        raise TerminalAuditError("timing_unresolved non-supply audit must hold")
+    return {"action": "terminal", "item": {"rcp_no": rcp_no, "disposition": audit["disposition"], "evidence_id": None,
+            "economic_disposition": audit["economic_disposition"], "economic_reason": reason, "economic_facts": None}}
 
-    Non-supply filings are closed as receipt-level non-material audits.  Supply
-    contracts must carry validated economic facts; qualifying contracts only
-    request evidence storage after an event-specific published_at is supplied.
-    """
+
+def terminal_audit_plan(source: object, audit: object) -> dict:
+    """Plan one safe action without inventing an announcement or publication time."""
     if not isinstance(source, dict) or not isinstance(audit, dict):
         raise TerminalAuditError("source and audit must be objects")
     rcp_no, report_class, report_name = source.get("rcp_no"), source.get("report_class"), source.get("report_name")
     if not isinstance(rcp_no, str) or len(rcp_no) != 14 or not rcp_no.isdigit():
         raise TerminalAuditError("source rcp_no must be exactly 14 digits")
     if report_class == "other":
-        return {"action": "terminal", "item": {"rcp_no": rcp_no, "disposition": "rejected", "evidence_id": None,
-                "economic_disposition": "negative_risk", "economic_reason": "non-supply DART filing is not a supply-contract candidate", "economic_facts": None}}
+        return _non_supply_terminal(source, audit, rcp_no)
     if report_class != "dart_single_sale_supply_contract" or not isinstance(report_name, str) or not 0 < len(report_name) <= 500:
         raise TerminalAuditError("source report class is not an authoritative DART class")
     reason = _reason(audit.get("economic_reason"))
@@ -106,3 +127,51 @@ def terminal_audit_plan(source: object, audit: object) -> dict:
         raise TerminalAuditError("published_at must be a timezone-aware ISO timestamp or null")
     return {"action": "evidence_add_required", "rcp_no": rcp_no, "published_at": published_at,
             "economic_disposition": "qualifying_A_or_better", "economic_reason": reason, "economic_facts": facts}
+
+
+def _audit_map(audits: object, expected: list[str]) -> dict[str, dict]:
+    if isinstance(audits, dict):
+        if set(audits) != set(expected) or any(not isinstance(key, str) or not isinstance(value, dict) for key, value in audits.items()):
+            raise TerminalAuditError("audit map receipt IDs are not the exact source set")
+        return audits
+    if not isinstance(audits, list):
+        raise TerminalAuditError("audits must be an exact receipt map or list")
+    mapped: dict[str, dict] = {}
+    for entry in audits:
+        if not isinstance(entry, dict) or set(entry) != {"rcp_no", "audit"} or not isinstance(entry["rcp_no"], str) or not isinstance(entry["audit"], dict):
+            raise TerminalAuditError("audit list entries must contain exactly rcp_no and audit")
+        if entry["rcp_no"] in mapped:
+            raise TerminalAuditError("duplicate audit receipt ID")
+        mapped[entry["rcp_no"]] = entry["audit"]
+    if set(mapped) != set(expected):
+        raise TerminalAuditError("audit list receipt IDs are not the exact source set")
+    return mapped
+
+
+def terminal_audit_batch(sources: object, audits: object) -> dict:
+    """Process every immutable control receipt once and expose only terminal-safe items.
+
+    Timestamped qualifying receipts are emitted solely as evidence requirements;
+    callers cannot place them in ``terminal_items`` before evidence readback.
+    """
+    if not isinstance(sources, list) or not sources:
+        raise TerminalAuditError("sources must be a nonempty immutable control list")
+    ids = []
+    for source in sources:
+        if not isinstance(source, dict):
+            raise TerminalAuditError("sources must contain objects")
+        rcp_no = source.get("rcp_no")
+        if not isinstance(rcp_no, str) or len(rcp_no) != 14 or not rcp_no.isdigit():
+            raise TerminalAuditError("source rcp_no must be exactly 14 digits")
+        ids.append(rcp_no)
+    if len(set(ids)) != len(ids):
+        raise TerminalAuditError("duplicate source receipt ID")
+    by_id = _audit_map(audits, ids)
+    terminal_items, evidence_requirements = [], []
+    for source in sources:
+        plan = terminal_audit_plan(source, by_id[source["rcp_no"]])
+        if plan["action"] == "terminal":
+            terminal_items.append(plan["item"])
+        else:
+            evidence_requirements.append({key: plan[key] for key in ("rcp_no", "published_at", "economic_disposition", "economic_reason", "economic_facts")})
+    return {"terminal_items": terminal_items, "evidence_requirements": evidence_requirements}
