@@ -139,10 +139,12 @@ def parse_page(payload: Any) -> ParsedPage:
     return ParsedPage(page=page, pages=pages, declared_total=total, records=[_record(row) for row in rows])
 
 
-def _http_get(url: str, params: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
-    request = urllib.request.Request(url + "?" + urllib.parse.urlencode(params), headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        value = json.load(response)
+def _http_get(url: str, params: dict[str, Any], timeout: float = 30.0, *, pacer=None) -> dict[str, Any]:
+    raw, _content_type, _final_url, _headers, _status = _source_module.fetch_https_bytes(
+        url + "?" + urllib.parse.urlencode(params), pacer=pacer or _DEFAULT_PACER,
+        attempts=1, timeout=timeout, same_origin=True,
+    )
+    value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError("JSON root is not an object")
     return value
@@ -158,13 +160,15 @@ def fetch_page(date: str, page: int, *, api_key: str | None = None, transport: C
     if not key:
         raise ManifestError("OPENDART_API_KEY is required")
     params = {"crtfc_key": key, "bgn_de": date, "end_de": date, "page_no": page, "page_count": PAGE_COUNT}
-    request_transport = transport or (lambda url, values: _http_get(url, values, timeout))
     # Synthetic transports are test-only; real network calls share the source
     # packet clock.  Tests that assert pacing pass an injected pacer.
     request_pacer = pacer or (_DEFAULT_PACER if transport is None else _RequestPacer(time.monotonic, lambda _seconds: None))
     for attempt in range(retries):
         try:
-            value = request_pacer.request(lambda _url: request_transport(BASE_URL, params), BASE_URL)
+            if transport is None:
+                value = _http_get(BASE_URL, params, timeout, pacer=request_pacer)
+            else:
+                value = request_pacer.request(lambda _url: transport(BASE_URL, params), BASE_URL)
             if not isinstance(value, dict):
                 raise ValueError("JSON root is not an object")
             return value

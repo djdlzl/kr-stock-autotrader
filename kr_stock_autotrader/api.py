@@ -541,6 +541,11 @@ def _seed_unfinished_research_backlog(db) -> None:
     readback commit or rollback together.
     """
     audit_at = __import__('kr_stock_autotrader.decision_cards', fromlist=['now']).now()
+    for row in db.execute("SELECT identity,first_run_key FROM giraffe_research_backlog WHERE status='terminal' AND terminal_disposition IN ('source_error','store_error')").fetchall():
+        if _is_research_run(row['first_run_key'], 'research'):
+            # Compatibility for partial DONE records written before failures
+            # became retryable. Keep the prior attempt columns for audit.
+            db.execute("UPDATE giraffe_research_backlog SET status='pending' WHERE identity=? AND status='terminal'", (row['identity'],))
     for row in db.execute(
         "SELECT identity,first_run_key FROM giraffe_research_backlog WHERE status='pending'"
     ).fetchall():
@@ -565,6 +570,24 @@ def _seed_unfinished_research_backlog(db) -> None:
 
 
 _DART_CORE_PROVENANCE_FIELDS = frozenset({"rcp_no", "date", "receipt_source_date", "packet_path", "packet_sha256"})
+_DART_FAILURE_FIELDS = frozenset({"rcp_no", "date", "receipt_source_date", "report_class", "report_name", "source_error_code"})
+_DART_SOURCE_ERROR_CODES = frozenset({"SOURCE_FETCH_ERROR", "SOURCE_DECODE_ERROR", "SOURCE_EXTRACT_ERROR"})
+
+
+def _failed_dart_source(source: object) -> bool:
+    return (isinstance(source, dict) and set(source) == _DART_FAILURE_FIELDS
+            and isinstance(source.get('source_error_code'), str) and source['source_error_code'] in _DART_SOURCE_ERROR_CODES
+            and isinstance(source.get('rcp_no'), str) and re.fullmatch(r'\d{14}', source['rcp_no']) is not None
+            and isinstance(source.get('date'), str) and re.fullmatch(r'\d{8}', source['date']) is not None
+            and source.get('receipt_source_date') == source['rcp_no'][:8]
+            and isinstance(source.get('report_name'), str) and 0 < len(source['report_name']) <= 500
+            and isinstance(source['report_class'], str) and source['report_class'] in {'dart_single_sale_supply_contract', 'other'}
+            and source['report_class'] == _authoritative_report_class(source['report_name']))
+
+
+def _failed_dart_matches_source(failed: object, source: object) -> bool:
+    return (_failed_dart_source(failed) and isinstance(source, dict)
+            and all(failed[field] == source.get(field) for field in _DART_FAILURE_FIELDS - {'source_error_code'}))
 
 
 def _same_dart_core_provenance(left: object, right: object) -> bool:
@@ -577,6 +600,8 @@ def _carried_dart_matches_source(carried: object, source: object, *, v3: bool) -
     """Keep v2 equality strict while allowing v2 carry into enriched v3 sources."""
     if not isinstance(carried, dict) or not isinstance(source, dict):
         return False
+    if v3 and _failed_dart_matches_source(carried, source):
+        return True
     return (set(carried) == _DART_CORE_PROVENANCE_FIELDS and _same_dart_core_provenance(carried, source)) if v3 else carried == source
 
 
@@ -584,6 +609,8 @@ def _terminal_dart_matches_source(terminal: object, source: object) -> bool:
     """Permit only exact legacy provenance or an exact classified terminal payload."""
     if not isinstance(terminal, dict) or not isinstance(source, dict):
         return False
+    if _failed_dart_matches_source(terminal, source):
+        return True
     terminal_fields = set(terminal)
     if terminal_fields == _DART_CORE_PROVENANCE_FIELDS:
         return _same_dart_core_provenance(terminal, source)
@@ -612,13 +639,22 @@ def _research_commitment(run_key: str, contract: object) -> dict:
                 continue
             if (not isinstance(item, dict) or set(item) != {'identity', 'kind', 'payload'}
                     or item.get('kind') != 'dart' or not isinstance(item.get('identity'), str)
-                    or re.fullmatch(r'dart:\d{14}', item['identity']) is None
-                    or not isinstance(item.get('payload'), dict) or item['payload'].get('rcp_no') != item['identity'][5:]):
+                    or re.fullmatch(r'dart:(?:\d{14}|correction:[0-9a-f]{64})' if v3 else r'dart:\d{14}', item['identity']) is None
+                    or not isinstance(item.get('payload'), dict)
+                    or not isinstance(item['payload'].get('rcp_no'), str)
+                    or re.fullmatch(r'\d{14}', item['payload']['rcp_no']) is None
+                    or (not item['identity'].startswith('dart:correction:') and item['payload']['rcp_no'] != item['identity'][5:])):
                 raise HTTPException(422, "invalid research carry-forward set")
-            carried_dart[item['identity'][5:]] = item['payload']
+            rcp_no = item['payload']['rcp_no']
+            if rcp_no in carried_dart:
+                raise HTTPException(422, 'duplicate carried DART receipt')
+            carried_dart[rcp_no] = item['payload']
         sources_by_receipt = {source.get('rcp_no'): source for source in contract.get('sources', []) if isinstance(source, dict)}
         if (len(sources_by_receipt) != len(contract.get('sources', []))
-                or any(not _carried_dart_matches_source(carried, sources_by_receipt.get(rcp_no), v3=v3)
+                or any(not (_carried_dart_matches_source(carried, sources_by_receipt.get(rcp_no), v3=v3)
+                            or (v3 and any(item['identity'].startswith('dart:correction:') and item['payload'] == carried
+                                           for item in contract['carry_forward'] if item['kind'] == 'dart')
+                                and carried == sources_by_receipt.get(rcp_no)))
                        for rcp_no, carried in carried_dart.items())):
             raise HTTPException(422, "carried DART provenance does not match the immutable source")
         for item in carried:
@@ -642,8 +678,19 @@ def _research_commitment(run_key: str, contract: object) -> dict:
                     or not isinstance(sources, list) or len(sources) != len(expected)):
                 raise
             if any(not isinstance(rcp, str) or not re.fullmatch(r"\d{14}", rcp) for rcp in expected): raise
+            from .krx_calendar import admitted_backlog_dates, CalendarError
+            try:
+                if contract['dates'] != admitted_backlog_dates(_research_run_date(run_key)): raise HTTPException(422, 'invalid research control dates')
+            except CalendarError as exc:
+                raise HTTPException(422, 'KRX calendar admission failed') from exc
+            if [source.get('rcp_no') if isinstance(source, dict) else None for source in sources] != expected:
+                raise HTTPException(422, 'research source commitment is not canonical')
             source_fields = _DART_CORE_PROVENANCE_FIELDS | ({"report_class", "report_name"} if v3 else set())
             for source in sources:
+                if v3 and _failed_dart_source(source):
+                    if source['date'] not in contract['dates'] and source['rcp_no'] not in carried_dart:
+                        raise HTTPException(422, 'unadmitted DART source failure date')
+                    continue
                 if (not isinstance(source, dict) or set(source) != source_fields
                         or source.get("rcp_no") not in expected or not isinstance(source.get("date"), str)
                         or source.get("receipt_source_date") != source.get("rcp_no", "")[:8]
@@ -656,8 +703,11 @@ def _research_commitment(run_key: str, contract: object) -> dict:
                             or source.get('report_class') not in {'dart_single_sale_supply_contract', 'other'}
                             or source['report_class'] != _authoritative_report_class(source['report_name'])
                         ))): raise
+                if source['packet_path'] != str(_research_packet_root() / source['date'] / (source['rcp_no'] + '.json')):
+                    raise HTTPException(422, 'invalid research packet path')
                 if source["date"] not in contract["dates"] and source["rcp_no"] not in carried_dart: raise
-                if source['rcp_no'] in carried_dart and not _carried_dart_matches_source(carried_dart[source['rcp_no']], source, v3=v3): raise
+                if source['rcp_no'] in carried_dart and not (_carried_dart_matches_source(carried_dart[source['rcp_no']], source, v3=v3)
+                                                             or (v3 and carried_dart[source['rcp_no']] == source)): raise
             return {"control_contract": contract, "control_contract_sha256": _sha256(contract)}
     required = v1_required
     if (set(contract) != required or contract.get("schema_version") != "giraffe-research-control-v1"
@@ -796,6 +846,15 @@ def _terminal_dart_history(db, contract: dict) -> dict[str, dict]:
         if (prior['terminal_disposition'] not in {'rejected', 'hold'}
                 or not _is_terminal_prior_research_run(db, prior['terminal_run_key'], contract['run_key'])):
             raise HTTPException(422, 'DART correction must follow a prior rejected or hold terminal receipt')
+    for item in contract['carry_forward']:
+        if item['kind'] != 'dart' or not item['identity'].startswith('dart:correction:'):
+            continue
+        rcp = item['payload']['rcp_no']
+        if rcp not in corrected or item['identity'] != _correction_backlog_identity(sources[rcp], history[rcp]):
+            raise HTTPException(422, 'carried DART correction lacks exact original lineage')
+        pending = db.execute("SELECT payload FROM giraffe_research_backlog WHERE identity=? AND status='pending'", (item['identity'],)).fetchone()
+        if pending is None or json.loads(pending['payload']) != sources[rcp]:
+            raise HTTPException(422, 'carried DART correction was not pending')
     return history
 
 
@@ -890,8 +949,9 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
                    or (item['disposition'] in {'saved','existing','correction_stored'} and (not isinstance(item['evidence_id'], int) or isinstance(item['evidence_id'], bool) or item['evidence_id'] <= 0))
                    or (item['disposition'] in {'rejected','hold','source_error','store_error'} and item['evidence_id'] is not None)
                    or (v3 and not _valid_control_economic_audit(sources[item['rcp_no']], item))
-                   or (v3 and ((item['disposition'] in {'source_error', 'store_error'})
-                               != (item['economic_disposition'] == 'error')))
+                   or (v3 and item['disposition'] == 'source_error' and item['economic_disposition'] != 'error')
+                   or (v3 and item['economic_disposition'] == 'error' and item['disposition'] not in {'source_error', 'store_error'})
+                   or (_failed_dart_source(sources[item['rcp_no']]) and item['disposition'] != 'source_error')
                    or (v3 and item['economic_disposition'] != 'error'
                        and _qualifies_control_contract_from_validated_facts(sources[item['rcp_no']], item['economic_facts'])
                        and item['disposition'] not in {'saved', 'correction_stored', 'store_error'}) for item in items)):
@@ -901,7 +961,8 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
     # not authority to clear an unrelated/missing backlog record.
     receipt = detail.get('completion_receipt', {})
     reviewed = receipt.get('reviewed_rcp_nos') if isinstance(receipt, dict) else None
-    if reviewed != [item['rcp_no'] for item in items if item['disposition'] != 'source_error']:
+    if reviewed != [item['rcp_no'] for item in items if item['disposition'] != 'source_error'
+                    and (item['disposition'] != 'store_error' or (v3 and item['economic_disposition'] != 'error'))]:
         raise HTTPException(422, 'research reviewed receipts do not match terminal dispositions')
     history = _terminal_dart_history(db, contract)
     corrections = {item['payload']['rcp_no']: item for item in contract.get('correction_of', [])}
@@ -934,6 +995,10 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
         identity = _correction_backlog_identity(sources[item['rcp_no']], corrections[item['rcp_no']]) if item['rcp_no'] in corrections else _backlog_identity('dart', item['rcp_no'])
         if item['rcp_no'] in corrections and item['disposition'] not in {'correction_stored', 'source_error', 'store_error'}:
             raise HTTPException(422, 'DART correction must store evidence or close with an audited failure')
+        if item['disposition'] in {'source_error', 'store_error'}:
+            # The immutable scheduler receipt is the attempt audit. The cursor
+            # remains pending until an economic/evidence terminal result exists.
+            continue
         db.execute("UPDATE giraffe_research_backlog SET status='terminal',terminal_disposition=?,terminal_run_key=?,terminal_evidence_id=?,terminal_at=? WHERE identity=? AND status='pending'", (item['disposition'], run_key, item['evidence_id'], at, identity))
         row = db.execute("SELECT status,terminal_disposition,terminal_run_key,terminal_evidence_id FROM giraffe_research_backlog WHERE identity=?", (identity,)).fetchone()
         if row is None or dict(row) != {'status':'terminal','terminal_disposition':item['disposition'],'terminal_run_key':run_key,'terminal_evidence_id':item['evidence_id']}:
@@ -1037,7 +1102,8 @@ def _safe_research_scheduler_finish(db, run_key: str, start_detail: object, data
             or ((fields["source_error"] or fields["store_error"])
                 and commitment["control_contract"].get("schema_version") not in {"giraffe-research-control-v2", "giraffe-research-control-v3"})
             or fields["source_valid"] + fields["source_error"] != control
-            or fields["reviewed_unique"] != len(reviewed) or fields["reviewed_unique"] + fields["source_error"] != control
+            or fields["reviewed_unique"] != len(reviewed)
+            or not control - fields["source_error"] - fields["store_error"] <= fields["reviewed_unique"] <= control - fields["source_error"]
             or fields["success_total"] != successful_terminal or fields["failure_total"] != failed_terminal
             or terminal != control + discovery_count or count != fields["saved"] + fields["correction_stored"]): raise HTTPException(422, "research completion receipt is not done-safe")
     _terminalize_v2_backlog(db, run_key, commitment, data['detail'])
@@ -2119,6 +2185,12 @@ async def register_research_run(run_key: str, request: Request, _: None = Depend
         if not _is_research_run(run_key, 'research') or not isinstance(data, dict) or set(data) != {'control_contract'}:
             raise HTTPException(422, 'invalid deterministic research registration')
         detail = _registered_research_detail(run_key, data['control_contract'])
+        existing = db.execute("SELECT kind,status,detail FROM scheduler_runs WHERE run_key=?", (run_key,)).fetchone()
+        if existing:
+            if existing['kind'] != 'research': raise HTTPException(409, 'run_key kind conflict')
+            if json.loads(existing['detail']).get('control_commitment') != detail['control_commitment']:
+                raise HTTPException(409, 'research control commitment conflict')
+            return {'run_key': run_key, 'kind': 'research', 'status': existing['status'], 'idempotent': True}
         _seed_unfinished_research_backlog(db)
         history = _terminal_dart_history(db, data['control_contract'])
         if data['control_contract'].get('schema_version') in {'giraffe-research-control-v2', 'giraffe-research-control-v3'}:
@@ -2129,12 +2201,11 @@ async def register_research_run(run_key: str, request: Request, _: None = Depend
                     _enqueue_backlog(db, kind='dart', identity=identity, payload=source, run_key=run_key)
                 else:
                     _enqueue_backlog(db, kind='dart', identity=source['rcp_no'], payload=source, run_key=run_key)
-        existing = db.execute("SELECT kind,status,detail FROM scheduler_runs WHERE run_key=?", (run_key,)).fetchone()
-        if existing:
-            if existing['kind'] != 'research': raise HTTPException(409, 'run_key kind conflict')
-            if json.loads(existing['detail']).get('control_commitment') != detail['control_commitment']:
-                raise HTTPException(409, 'research control commitment conflict')
-            return {'run_key': run_key, 'kind': 'research', 'status': existing['status'], 'idempotent': True}
+                    pending = db.execute("SELECT payload FROM giraffe_research_backlog WHERE identity=? AND status='pending'", (_backlog_identity('dart', source['rcp_no']),)).fetchone()
+                    if pending and _failed_dart_matches_source(json.loads(pending['payload']), source) and not _failed_dart_source(source):
+                        # Enrich only an exact previously unavailable source.
+                        # Prior contracts/attempt receipts retain the failure.
+                        db.execute("UPDATE giraffe_research_backlog SET payload=? WHERE identity=? AND status='pending'", (json.dumps(source, sort_keys=True), _backlog_identity('dart', source['rcp_no'])))
         db.execute("INSERT INTO scheduler_runs(run_key,kind,status,started_at,detail) VALUES(?,?, 'started',?,?)", (run_key, 'research', __import__('kr_stock_autotrader.decision_cards', fromlist=['now']).now(), json.dumps(detail)))
         db.commit(); return {'run_key': run_key, 'kind': 'research', 'status': 'started', 'idempotent': False}
     finally: db.close()

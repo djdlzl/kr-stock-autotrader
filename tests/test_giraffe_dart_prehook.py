@@ -327,7 +327,7 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(contract["expected_rcp_nos"], [])
         self.assertEqual(contract["terminal_exclusions"], history)
 
-    def test_terminal_dart_failures_are_excluded_but_cannot_be_selected_as_corrections(self):
+    def test_legacy_terminal_dart_failures_retry_but_cannot_be_selected_as_corrections(self):
         receipt, control_date = "20260916900231", "20260917"
         with tempfile.TemporaryDirectory() as temp:
             packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), pathlib.Path(temp) / control_date)
@@ -346,8 +346,8 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                     contract = self.gate.control_contract(
                         "research-2026-09-17-0700-kst-r8", summary, terminal_history=history,
                     )
-                    self.assertEqual(contract["expected_rcp_nos"], [])
-                    self.assertEqual(contract["terminal_exclusions"], history)
+                    self.assertEqual(contract["expected_rcp_nos"], [receipt])
+                    self.assertEqual(contract["terminal_exclusions"], [])
                     with self.assertRaisesRegex(self.gate.ManifestError, "rejected/hold"):
                         self.gate.control_contract(
                             "research-2026-09-17-0700-kst-r9", summary,
@@ -608,6 +608,80 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             self.assertEqual(item["material_candidate_count"], len(item["source_packet_paths"]))
             self.assertEqual(item["source_valid_count"], 1)
             self.assertEqual(item["source_error_count"], 0)
+
+    def test_source_failure_registers_exact_receipt_and_continues_later_dates(self):
+        failed = "20260915000001"
+        def manifest(date):
+            records = [{"rcp_no": date + suffix, "rcept_dt": date, "report_nm": "주요사항보고서(유상증자결정)"} for suffix in ("000001", "000002")]
+            return {"declared_total": 2, "declared_pages": 1, "pages_collected": 1, "page_counts": [2], "unique_receipts": 2, "material_candidate_count": 2, "material_candidate_records": records, "complete": True}
+        def fetch(rcp):
+            if rcp == failed:
+                raise self.gate.SourceError("SOURCE_FETCH_ERROR", "private transport diagnostics")
+            return valid_source_packet(self.gate, rcp)
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            with patch.object(self.gate, "OUTPUT_ROOT", root / "manifests"), patch.object(self.gate, "SOURCE_ROOT", root / "sources"), patch.object(self.gate, "CONTROL_ROOT", root / "controls"), patch.object(self.gate, "target_dates", return_value=["20260915", "20260916"]), patch.object(self.gate, "check_card_prompt"), patch.object(self.gate, "collect_manifest", side_effect=manifest), patch.object(self.gate, "fetch_with_retry", side_effect=fetch) as calls, patch.object(self.gate, "fetch_research_backlog", return_value=[]), patch.object(self.gate, "register_research_run") as register, contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(self.gate.main(), 0)
+            result = json.loads(output.getvalue())
+            self.assertEqual(calls.call_count, 4)
+            self.assertEqual(result["control_contract"]["expected_rcp_nos"], ["20260915000001", "20260915000002", "20260916000001", "20260916000002"])
+            failure = result["control_contract"]["sources"][0]
+            self.assertEqual(failure, {"rcp_no": failed, "date": "20260915", "receipt_source_date": "20260915", "report_class": "other", "report_name": "주요사항보고서(유상증자결정)", "source_error_code": "SOURCE_FETCH_ERROR"})
+            self.assertEqual(result["dates"][0]["source_errors"], [{"rcp_no": failed, "code": "SOURCE_FETCH_ERROR"}])
+            self.assertNotIn("private transport", output.getvalue())
+            register.assert_called_once()
+
+    def test_carried_missing_packet_is_refetched_outside_current_manifest_and_audits_new_failure(self):
+        rcp = '20260915000001'
+        failed = {'rcp_no': rcp, 'date': '20260915', 'receipt_source_date': '20260915', 'report_class': 'other', 'report_name': '주요사항보고서(유상증자결정)', 'source_error_code': 'SOURCE_FETCH_ERROR'}
+        backlog = [{'identity': 'dart:' + rcp, 'kind': 'dart', 'payload': failed}]
+        empty = {'declared_total': 0, 'declared_pages': 0, 'pages_collected': 0, 'page_counts': [], 'unique_receipts': 0, 'material_candidate_count': 0, 'material_candidate_records': [], 'complete': True}
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            with patch.object(self.gate, 'OUTPUT_ROOT', root / 'manifests'), patch.object(self.gate, 'SOURCE_ROOT', root / 'sources'), patch.object(self.gate, 'CONTROL_ROOT', root / 'controls'), patch.object(self.gate, 'target_dates', return_value=['20260917', '20260918']), patch.object(self.gate, 'check_card_prompt'), patch.object(self.gate, 'collect_manifest', return_value=empty), patch.object(self.gate, 'fetch_research_backlog', return_value=backlog), patch.object(self.gate, 'register_research_run'):
+                with patch.object(self.gate, 'fetch_with_retry', side_effect=self.gate.SourceError('SOURCE_EXTRACT_ERROR', 'private')) as fetch, contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(self.gate.main(['--rerun-version', '1']), 0)
+                fetch.assert_called_once_with(rcp)
+                result = json.loads(output.getvalue())['control_contract']
+                self.assertEqual(result['sources'][0]['source_error_code'], 'SOURCE_EXTRACT_ERROR')
+                self.assertEqual(result['carry_forward'][0]['payload'], failed)
+                committed_path = root / 'controls' / 'research-2026-09-18-0700-kst-r1.json'
+                committed = committed_path.read_bytes()
+                with patch.object(self.gate, 'fetch_with_retry', return_value=valid_source_packet(self.gate, rcp)) as fetch, contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(self.gate.main(['--rerun-version', '1']), 2)
+                self.assertEqual(committed_path.read_bytes(), committed)
+                fetch.assert_called_once_with(rcp)
+                with patch.object(self.gate, 'fetch_with_retry', side_effect=AssertionError('reuse successful retry checkpoint')), contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(self.gate.main(['--rerun-version', '2']), 0)
+                result = json.loads(output.getvalue())['control_contract']
+                self.assertEqual(result['expected_rcp_nos'], [rcp])
+                self.assertEqual(result['sources'][0]['date'], '20260915')
+                self.assertEqual(result['sources'][0]['packet_path'], str(root / 'sources' / '20260915' / (rcp + '.json')))
+                self.assertNotIn('source_error_code', result['sources'][0])
+                self.assertEqual(result['carry_forward'][0]['payload'], failed)
+
+    def test_carried_packet_outside_current_window_preserves_classification(self):
+        rcp = '20260915000002'
+        with tempfile.TemporaryDirectory() as temp:
+            checkpoint = self.gate.write_packet(valid_source_packet(self.gate, rcp), pathlib.Path(temp) / '20260915')
+            source = {'rcp_no': rcp, 'date': '20260915', 'receipt_source_date': '20260915', 'report_class': 'other', 'report_name': '주요사항보고서(유상증자결정)', 'packet_path': str(checkpoint), 'packet_sha256': hashlib.sha256(checkpoint.read_bytes()).hexdigest()}
+            contract = self.gate.control_contract('research-2026-09-18-0700-kst', [], [{'identity': 'dart:' + rcp, 'kind': 'dart', 'payload': source}])
+            self.assertEqual(contract['sources'], [source])
+
+    def test_pending_correction_retries_exact_identity_and_original_lineage(self):
+        rcp = '20260915000003'
+        with tempfile.TemporaryDirectory() as temp:
+            checkpoint = self.gate.write_packet(valid_source_packet(self.gate, rcp), pathlib.Path(temp) / '20260915')
+            source = {'rcp_no': rcp, 'date': '20260915', 'receipt_source_date': '20260915', 'report_class': 'other', 'report_name': '주요사항보고서(유상증자결정)', 'packet_path': str(checkpoint), 'packet_sha256': hashlib.sha256(checkpoint.read_bytes()).hexdigest()}
+            prior = {'identity': 'dart:' + rcp, 'kind': 'dart', 'payload': source, 'terminal_disposition': 'hold', 'terminal_run_key': 'research-2026-09-15-0700-kst', 'terminal_evidence_id': None, 'terminal_at': '2026-09-15T07:30:00+09:00'}
+            identity = 'dart:correction:' + hashlib.sha256(self.gate.canonical_bytes({'source': source, 'prior': prior})).hexdigest()
+            carry = {'identity': identity, 'kind': 'dart', 'payload': source}
+            contract = self.gate.control_contract('research-2026-09-18-0700-kst', [], [carry], [prior])
+            self.assertEqual(contract['correction_of'], [prior])
+            self.assertEqual(contract['sources'], [source])
+            self.assertEqual(contract['carry_forward'][0]['identity'], identity)
+            with self.assertRaises(self.gate.ManifestError):
+                self.gate.control_contract('research-2026-09-18-0700-kst', [], [{**carry, 'identity': 'dart:correction:' + '0' * 64}], [prior])
 
     def test_gate_fails_nonzero_when_manifest_is_incomplete(self):
         with patch.object(self.gate, "collect_manifest", side_effect=self.gate.ManifestError("incomplete DART manifest")), patch.dict(os.environ, {"GIRAFFE_DART_GATE_DATES": "20260908", "GIRAFFE_DART_RECOVERY_KEY": "test-recovery-key", "GIRAFFE_DART_RECOVERY_AUTHORIZATION": "ea00db45d13c4eda4f0315cf78065effdb8903a0da0a952a2e43d024bfbd2b51"}, clear=False), contextlib.redirect_stdout(io.StringIO()) as output:

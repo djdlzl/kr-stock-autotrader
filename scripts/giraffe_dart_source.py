@@ -12,8 +12,13 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
+
+try:
+    from scripts.giraffe_direct_fetch import DEFAULT_PACER, FetchError, fetch_https_bytes
+except ModuleNotFoundError:  # Direct script execution from the scripts directory.
+    from giraffe_direct_fetch import DEFAULT_PACER, FetchError, fetch_https_bytes
 
 USER_AGENT = "Mozilla/5.0 (compatible; Giraffe-DART-Source/1.0)"
 DART_HOST = "dart.fss.or.kr"
@@ -46,6 +51,11 @@ class _RequestPacer:
     def defer(self, seconds: float) -> None:
         self.next_start = max(self.next_start, self.clock() + seconds)
 
+    def mark_start(self) -> float:
+        started = self.clock()
+        self.next_start = started + 1.0
+        return started
+
     def request(self, fetch: Callable[[str], object], url: str) -> object:
         while (remaining := self.next_start - self.clock()) > 0:
             self.sleep(remaining)
@@ -61,14 +71,28 @@ class _RequestPacer:
             raise
 
 
-_DEFAULT_PACER = _RequestPacer(time.monotonic, time.sleep)
+class _NoopPacer:
+    """Test-double transport has no network starts to serialize."""
+    def defer(self, _seconds: float) -> None:
+        pass
+
+    def request(self, fetch: Callable[[str], object], url: str) -> object:
+        return fetch(url)
 
 
-def _request_pacer(clock: Callable[[], float], sleep: Callable[[float], None]) -> _RequestPacer:
-    # Real requests share pacing across packet calls; injected clocks get an
-    # isolated timeline that remains shared throughout one retry operation.
-    if clock is time.monotonic and sleep is time.sleep:
+_DEFAULT_PACER = DEFAULT_PACER
+
+
+def _request_pacer(clock: Callable[[], float], sleep: Callable[[float], None], *, fetch: object,
+                   pacer: Any | None = None) -> Any:
+    # Only the real transport creates HTTP starts. Synthetic test transports
+    # must opt in with an injected deterministic pacer, never sleep wall time.
+    if pacer is not None:
+        return pacer
+    if fetch is _fetch and clock is time.monotonic and sleep is time.sleep:
         return _DEFAULT_PACER
+    if clock is time.monotonic and sleep is time.sleep:
+        return _NoopPacer()
     return _RequestPacer(clock, sleep)
 
 
@@ -147,11 +171,25 @@ def _valid_provenance_headers(headers: object, content_type: object, raw_length:
     return content_length is None or (content_length.isascii() and content_length.isdecimal() and int(content_length) == raw_length)
 
 
-def _fetch(url: str, timeout: float = 30.0) -> tuple[bytes, str | None, str, dict[str, str], int]:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        headers = {key.lower(): value for key, value in response.headers.items()}
-        return response.read(), response.headers.get("Content-Type"), response.geturl(), headers, response.status
+def _fetch(url: str, timeout: float = 30.0, *, pacer=None) -> tuple[bytes, str | None, str, dict[str, str], int]:
+    try:
+        return fetch_https_bytes(url, pacer=pacer or _DEFAULT_PACER, attempts=1, timeout=timeout)
+    except FetchError as exc:
+        error_type = _TransientFetchError if exc.retryable else SourceError
+        raise error_type("SOURCE_FETCH_ERROR", exc.failure_class) from exc
+
+
+def _paced_fetch(pacer, fetch, url):
+    if fetch is _fetch:
+        # The transport paces each redirect hop; do not double-pace the wrapper.
+        return _fetch(url, pacer=pacer)
+    try:
+        return pacer.request(fetch, url)
+    except Exception as exc:
+        reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        if not isinstance(exc, urllib.error.HTTPError) and isinstance(reason, (TimeoutError, ConnectionError)):
+            raise _TransientFetchError("SOURCE_FETCH_ERROR", "transient transport failure") from exc
+        raise
 
 
 def _fetch_result(result: tuple) -> tuple[bytes, str | None, str, dict[str, str], int]:
@@ -168,9 +206,9 @@ def _fetch_result(result: tuple) -> tuple[bytes, str | None, str, dict[str, str]
 
 def source_packet(rcp_no: str, fetch: Callable[[str], tuple] = _fetch, *,
                   clock: Callable[[], float] = time.monotonic,
-                  sleep: Callable[[float], None] = time.sleep) -> dict:
-    pacer = _request_pacer(clock, sleep)
-    return _source_packet(rcp_no, lambda url: pacer.request(fetch, url))
+                  sleep: Callable[[float], None] = time.sleep, pacer: Any | None = None) -> dict:
+    request_pacer = _request_pacer(clock, sleep, fetch=fetch, pacer=pacer)
+    return _source_packet(rcp_no, lambda url: _paced_fetch(request_pacer, fetch, url))
 
 
 def _source_packet(rcp_no: str, fetch: Callable[[str], tuple]) -> dict:
@@ -271,15 +309,16 @@ def completed_packet(path: Path, rcp_no: str, *, expected_control_date: str | No
 
 def fetch_with_retry(rcp_no: str, retries: int = 4, fetch: Callable[[str], tuple] = _fetch, *,
                      clock: Callable[[], float] = time.monotonic,
-                     sleep: Callable[[float], None] = time.sleep) -> dict:
+                     sleep: Callable[[float], None] = time.sleep, pacer: Any | None = None) -> dict:
     if retries < 1:
         raise ValueError("retries must be at least 1")
     attempts = min(retries, 4)
-    pacer = _request_pacer(clock, sleep)
+    request_pacer = _request_pacer(clock, sleep, fetch=fetch, pacer=pacer)
     for attempt in range(attempts):
         try:
-            return _source_packet(rcp_no, lambda url: pacer.request(fetch, url))
+            return _source_packet(rcp_no, lambda url: _paced_fetch(request_pacer, fetch, url))
         except _TransientFetchError:
             if attempt + 1 == attempts:
                 raise
-            pacer.defer(2 ** (attempt + 1))
+            request_pacer.defer(2 ** (attempt + 1))
+    raise AssertionError('retry loop exhausted unexpectedly')

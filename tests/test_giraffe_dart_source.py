@@ -313,7 +313,7 @@ def test_slow_main_request_needs_no_additional_pacing_sleep():
 
 def test_default_pacing_is_shared_between_packet_calls(monkeypatch):
     clock = FakeClock()
-    monkeypatch.setattr(source, "_DEFAULT_PACER", source._RequestPacer(clock, clock.sleep))
+    pacing = source._RequestPacer(clock, clock.sleep)
     requests = []
 
     def fetch(url):
@@ -321,7 +321,7 @@ def test_default_pacing_is_shared_between_packet_calls(monkeypatch):
         raw = main_page() if "main.do" in url else b"<body>valid disclosure body with enough content</body>"
         return raw, "text/html; charset=utf-8", url
 
-    source.source_packet("20260911800823", fetch)
-    source.fetch_with_retry("20260911800823", fetch=fetch)
+    source.source_packet("20260911800823", fetch, pacer=pacing)
+    source.fetch_with_retry("20260911800823", fetch=fetch, pacer=pacing)
     assert requests == [0.0, 1.0, 2.0, 3.0]
     assert clock.sleeps == [1.0, 1.0, 1.0]

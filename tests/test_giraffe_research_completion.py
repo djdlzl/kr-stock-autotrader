@@ -935,7 +935,8 @@ def test_backlog_seed_requires_a_real_calendar_date_and_preserves_valid_reruns(m
         db.close()
 
 
-def test_v3_terminal_exclusion_and_beautyskin_append_only_correction(monkeypatch, tmp_path):
+@__import__('pytest').mark.parametrize('retry_failure', [None, 'source_error', 'store_error'])
+def test_v3_terminal_exclusion_and_beautyskin_append_only_correction(monkeypatch, tmp_path, retry_failure):
     """A prior rejected terminal row is excluded normally and recoverable only by a new correction cursor."""
     import kr_stock_autotrader.db as db_module
     from kr_stock_autotrader.db import connect
@@ -968,6 +969,18 @@ def test_v3_terminal_exclusion_and_beautyskin_append_only_correction(monkeypatch
     contract['sources'][0].update({'report_class': 'dart_single_sale_supply_contract', 'report_name': '단일판매ㆍ공급계약체결'})
     contract.update({"schema_version": "giraffe-research-control-v3", "carry_forward": [], "terminal_exclusions": [], "correction_of": [original]})
     assert client.post(f"/api/internal/research-runs/{correction_key}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 200
+    if retry_failure:
+        failure = receipt(correction_key, hashlib.sha256(canonical(contract)).hexdigest(), [rcp],
+                          source_valid=int(retry_failure != 'source_error'), reviewed_unique=0, reviewed_rcp_nos=[],
+                          source_error=int(retry_failure == 'source_error'), store_error=int(retry_failure == 'store_error'), rejected_after_evidence=0)
+        attempt = {'rcp_no': rcp, 'disposition': retry_failure, 'evidence_id': None, 'economic_disposition': 'error', 'economic_reason': 'temporary failure', 'economic_facts': None}
+        assert client.post(f'/api/internal/scheduler-runs/{correction_key}/finish', headers=HEADERS, json={'status': 'done', 'count': 0, 'detail': {'completion_receipt': failure, 'control_terminal_dispositions': [attempt]}}).status_code == 200
+        pending = client.get('/api/internal/research-backlog', headers=CONTROL_HEADERS).json()['items']
+        assert len(pending) == 1 and pending[0]['identity'].startswith('dart:correction:')
+        correction_key = 'research-2026-09-17-0700-kst-r11'
+        contract = {**contract, 'run_key': correction_key, 'carry_forward': [{field: pending[0][field] for field in ('identity', 'kind', 'payload')}]}
+        response = client.post(f'/api/internal/research-runs/{correction_key}/register', headers=CONTROL_HEADERS, json={'control_contract': contract})
+        assert response.status_code == 200, response.text
     evidence = client.post("/api/internal/evidence", headers=HEADERS, json={"symbol": "406820", "name": "뷰티스킨", "kind": "contract", "title": "공급계약", "summary": "30bn KRW China contract", "source": "DART", "source_url": "https://dart.fss.or.kr/beautyskin", "announcement_at": "2026-09-17T06:00:00+09:00", "known_at": "2026-09-17T13:19:00+09:00", "research_mode": "manual_catch_up", "research_run_key": correction_key, "snapshot": {"rcp_no": rcp, "dart_source": source}, "dedupe_key": "beautyskin-append-only-correction"})
     assert evidence.status_code == 200
     stored_correction = client.get(f"/api/internal/evidence/{evidence.json()['id']}", headers=HEADERS)
@@ -983,6 +996,8 @@ def test_v3_terminal_exclusion_and_beautyskin_append_only_correction(monkeypatch
     audit = {'economic_disposition': 'qualifying_A_or_better', 'economic_reason': 'binding contract is 54.62% of prior revenue', 'economic_facts': {'binding_contract': True, 'contract_amount': 30000000000, 'prior_revenue': 54920000000, 'ratio_percent': 54.62, 'term': '2026-09-17 to 2027-09-16'}}
     done = {"status": "done", "count": 1, "detail": {"completion_receipt": result, "control_terminal_dispositions": [{"rcp_no": rcp, "disposition": "correction_stored", "evidence_id": evidence.json()["id"], **audit}]}}
     assert client.post(f"/api/internal/scheduler-runs/{correction_key}/finish", headers=HEADERS, json=done).status_code == 200
+    repeated_registration = client.post(f'/api/internal/research-runs/{correction_key}/register', headers=CONTROL_HEADERS, json={'control_contract': contract})
+    assert repeated_registration.status_code == 200 and repeated_registration.json()['idempotent'] is True
 
     # The second contract is assembled through the actual prehook terminal-lookup
     # path.  Its correction selection fails before registration because the
@@ -1463,7 +1478,7 @@ def test_fastapi_partial_done_edd_smoke_keeps_saved_evidence_available_to_0800()
          "economic_disposition": "error", "economic_reason": "DART extractor failed after admission",
          "economic_facts": None},
         {"rcp_no": store_error_rcp, "disposition": "store_error", "evidence_id": None,
-         "economic_disposition": "error", "economic_reason": "source review completed but evidence store failed",
+         "economic_disposition": "qualifying_A_or_better", "economic_reason": "source review completed but evidence store failed",
          "economic_facts": None},
         {"rcp_no": saved_rcp, "disposition": "saved", "evidence_id": evidence_id,
          "economic_disposition": "qualifying_A_or_better", "economic_reason": "durable material evidence stored",
@@ -1487,8 +1502,11 @@ def test_fastapi_partial_done_edd_smoke_keeps_saved_evidence_available_to_0800()
         json={"rcp_nos": receipts},
     ).json()["items"]
     assert {item["payload"]["rcp_no"]: item["terminal_disposition"] for item in terminal} == {
-        source_error_rcp: "source_error", store_error_rcp: "store_error", saved_rcp: "saved",
+        saved_rcp: "saved",
     }
+    pending = client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"]
+    assert [item["payload"]["rcp_no"] for item in pending] == [source_error_rcp, store_error_rcp]
+    assert persisted["detail"]["detail"]["control_terminal_dispositions"] == audits
 
     # This is the real read sequence used by the 08:00 prompt: DONE dependency,
     # then durable evidence/pending-card reads. Nonzero failure totals do not hide
@@ -1552,3 +1570,91 @@ def test_research_error_cannot_claim_reviewed_counts_without_receipt_ids():
     })
     assert response.status_code == 422
     assert client.get(f"/api/internal/scheduler-runs/{key}", headers=CONTROL_HEADERS).json()["status"] == "started"
+
+
+def test_missing_packet_partial_done_retries_exact_receipt_and_upgrades_provenance():
+    client = TestClient(app); key = "research-2026-09-17-0700-kst-r801"; rcp = "20260917000801"
+    contract, _ = commitment(key, [rcp])
+    packet = {**contract["sources"][0], "report_class": "other", "report_name": "주요사항보고서(유상증자결정)"}
+    failed = {name: value for name, value in packet.items() if name not in {"packet_path", "packet_sha256"}}
+    failed["source_error_code"] = "SOURCE_FETCH_ERROR"
+    contract.update(schema_version="giraffe-research-control-v3", sources=[failed], carry_forward=[], terminal_exclusions=[], correction_of=[])
+    response = client.post(f"/api/internal/research-runs/{key}/register", headers=CONTROL_HEADERS, json={"control_contract": contract})
+    assert response.status_code == 200, response.text
+    assert client.post(f"/api/internal/research-runs/{key}/register", headers=CONTROL_HEADERS, json={"control_contract": contract}).json()["idempotent"] is True
+    value = receipt(key, hashlib.sha256(canonical(contract)).hexdigest(), [rcp], source_valid=0, reviewed_unique=0, reviewed_rcp_nos=[], source_error=1, rejected_after_evidence=0)
+    audit = {"rcp_no": rcp, "disposition": "source_error", "evidence_id": None, "economic_disposition": "error", "economic_reason": "SOURCE_FETCH_ERROR", "economic_facts": None}
+    done = {"status": "done", "count": 0, "detail": {"completion_receipt": value, "control_terminal_dispositions": [audit]}}
+    for disposition in ('rejected', 'hold', 'store_error'):
+        bad = json.loads(json.dumps(done))
+        bad['detail']['control_terminal_dispositions'][0].update(disposition=disposition, economic_disposition='negative_risk')
+        bad['detail']['completion_receipt'].update(source_valid=1, source_error=0, reviewed_unique=1, reviewed_rcp_nos=[rcp], rejected_after_evidence=int(disposition != 'store_error'), store_error=int(disposition == 'store_error'), success_total=int(disposition != 'store_error'), failure_total=int(disposition == 'store_error'))
+        assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=bad).status_code == 422
+    assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=done).status_code == 200
+    pending = client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"]
+    assert len(pending) == 1 and pending[0]["payload"] == failed
+    next_key = "research-2026-09-18-0700-kst-r801"
+    retry, _ = commitment(next_key, [rcp])
+    retry.update(schema_version="giraffe-research-control-v3", sources=[packet], carry_forward=[{"identity": "dart:" + rcp, "kind": "dart", "payload": failed}], terminal_exclusions=[], correction_of=[])
+    response = client.post(f"/api/internal/research-runs/{next_key}/register", headers=CONTROL_HEADERS, json={"control_contract": retry})
+    assert response.status_code == 200, response.text
+    next_value = receipt(next_key, hashlib.sha256(canonical(retry)).hexdigest(), [rcp])
+    reviewed = {**audit, "disposition": "rejected", "economic_disposition": "negative_risk", "economic_reason": "review completed"}
+    response = client.post(f"/api/internal/scheduler-runs/{next_key}/finish", headers=HEADERS, json={"status": "done", "count": 0, "detail": {"completion_receipt": next_value, "control_terminal_dispositions": [reviewed]}})
+    assert response.status_code == 200, response.text
+    assert client.get("/api/internal/research-backlog", headers=CONTROL_HEADERS).json()["items"] == []
+    original = client.get(f"/api/internal/scheduler-runs/{key}", headers=CONTROL_HEADERS).json()
+    assert original["detail"]["control_commitment"]["control_contract"]["sources"] == [failed]
+    assert original["detail"]["detail"]["control_terminal_dispositions"] == [audit]
+
+
+def test_store_error_without_completed_economics_is_not_reviewed_and_stays_pending():
+    client = TestClient(app); key = 'research-2026-09-17-0700-kst-r802'; rcp = '20260917000802'
+    contract, _ = commitment(key, [rcp])
+    contract['sources'][0].update(report_class='other', report_name='주요사항보고서(유상증자결정)')
+    contract.update(schema_version='giraffe-research-control-v3', carry_forward=[], terminal_exclusions=[], correction_of=[])
+    assert client.post(f'/api/internal/research-runs/{key}/register', headers=CONTROL_HEADERS, json={'control_contract': contract}).status_code == 200
+    value = receipt(key, hashlib.sha256(canonical(contract)).hexdigest(), [rcp], reviewed_unique=0, reviewed_rcp_nos=[], store_error=1, rejected_after_evidence=0)
+    audit = {'rcp_no': rcp, 'disposition': 'store_error', 'evidence_id': None, 'economic_disposition': 'error', 'economic_reason': 'storage unavailable before economic review', 'economic_facts': None}
+    payload = {'status': 'done', 'count': 0, 'detail': {'completion_receipt': value, 'control_terminal_dispositions': [audit]}}
+    forged = json.loads(json.dumps(payload)); forged['detail']['completion_receipt'].update(reviewed_unique=1, reviewed_rcp_nos=[rcp])
+    assert client.post(f'/api/internal/scheduler-runs/{key}/finish', headers=HEADERS, json=forged).status_code == 422
+    response = client.post(f'/api/internal/scheduler-runs/{key}/finish', headers=HEADERS, json=payload)
+    assert response.status_code == 200, response.text
+    assert client.get('/api/internal/research-backlog', headers=CONTROL_HEADERS).json()['items'][0]['payload'] == contract['sources'][0]
+
+
+def test_legacy_terminal_failure_reopens_pending_without_losing_prior_attempt():
+    client = TestClient(app); key = 'research-2026-09-17-0700-kst-r803'; rcp = '20260917000803'
+    contract, _ = commitment(key, [rcp])
+    source = contract['sources'][0]
+    start(client, key, [rcp])
+    db = api_module.connect()
+    try:
+        db.execute("INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,created_at,status,terminal_disposition,terminal_run_key,terminal_at) VALUES(?,?,?,?,?,'terminal','source_error',?,?)", ('dart:' + rcp, 'dart', json.dumps(source), key, '2026-09-17T07:00:00+09:00', key, '2026-09-17T07:10:00+09:00'))
+        db.commit()
+    finally:
+        db.close()
+    pending = client.get('/api/internal/research-backlog', headers=CONTROL_HEADERS).json()['items']
+    assert len(pending) == 1 and pending[0]['payload'] == source
+    db = api_module.connect()
+    try:
+        row = db.execute('SELECT status,terminal_disposition,terminal_run_key FROM giraffe_research_backlog WHERE identity=?', ('dart:' + rcp,)).fetchone()
+        assert dict(row) == {'status': 'pending', 'terminal_disposition': 'source_error', 'terminal_run_key': key}
+    finally:
+        db.close()
+
+
+@__import__('pytest').mark.parametrize('mutation', [
+    {'source_error_code': {'secret': 'diagnostic'}}, {'source_error_code': 'UNKNOWN'},
+    {'report_class': []}, {'packet_path': '/tmp/forged'}, {'economic_facts': {}},
+    {'receipt_source_date': '20260916'}, {'date': '20260901'},
+])
+def test_unavailable_source_schema_rejects_unbounded_or_forged_fields(mutation):
+    client = TestClient(app); key = 'research-2026-09-17-0700-kst-r804'; rcp = '20260917000804'
+    contract, _ = commitment(key, [rcp])
+    failure = {'rcp_no': rcp, 'date': '20260917', 'receipt_source_date': '20260917', 'report_class': 'other', 'report_name': '주요사항보고서(유상증자결정)', 'source_error_code': 'SOURCE_FETCH_ERROR'}
+    contract.update(schema_version='giraffe-research-control-v3', sources=[{**failure, **mutation}], carry_forward=[], terminal_exclusions=[], correction_of=[])
+    response = client.post(f'/api/internal/research-runs/{key}/register', headers=CONTROL_HEADERS, json={'control_contract': contract})
+    assert response.status_code == 422
+    assert client.get('/api/internal/research-backlog', headers=CONTROL_HEADERS).json()['items'] == []
