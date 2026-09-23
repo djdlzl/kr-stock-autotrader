@@ -58,6 +58,61 @@ def test_utf8_and_meta_fallback_are_valid():
     packet = source.source_packet(rcp, fetch_from({"main.do": (main_page(rcp), None, "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp), "viewer.do": (viewer.encode(), None, "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML")}))
     assert packet["charset"] == "utf-8"
 
+
+def test_packet_captures_every_main_viewer_section_in_document_order(tmp_path):
+    rcp = "20260911800823"
+    main = b"""<html><meta charset='utf-8'><script>
+viewDoc('20260911800823','11577485','1','0','10','HTML','');
+viewDoc('20260911800823','11577485','7','10','20','HTML','');
+</script></html>"""
+    urls = []
+    def fetch(url):
+        urls.append(url)
+        if "main.do" in url:
+            return main, "text/html; charset=utf-8", url
+        ele = __import__("urllib.parse").parse.parse_qs(__import__("urllib.parse").parse.urlparse(url).query)["eleId"][0]
+        body = ("cover header only sufficient body" if ele == "1" else "merger consideration ratio and effective date substantive body")
+        return ("<html><meta charset='utf-8'><body>" + body + "</body></html>").encode(), "text/html; charset=utf-8", url
+
+    packet = source.source_packet(rcp, fetch)
+    checkpoint = source.write_packet(packet, tmp_path / rcp[:8])
+
+    assert packet["schema_version"] == "giraffe-dart-source-packet-v3"
+    assert [section["canonical_viewer_url"] for section in packet["sections"]] == urls[1:]
+    assert [__import__("urllib.parse").parse.parse_qs(__import__("urllib.parse").parse.urlparse(url).query)["eleId"][0] for url in urls[1:]] == ["1", "7"]
+    assert "merger consideration ratio" in packet["text"]
+    assert source.completed_packet(checkpoint, rcp) is not None
+
+
+def test_packet_rejects_duplicate_or_partial_section_fetch():
+    rcp = "20260911800823"
+    duplicate = b"<html><meta charset='utf-8'><script>viewDoc('20260911800823','11577485','1','0','10','HTML','');viewDoc('20260911800823','11577485','1','0','10','HTML','');</script></html>"
+    with pytest.raises(source.SourceError, match="duplicate"):
+        source.source_packet(rcp, fetch_from({"main.do": (duplicate, "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp)}))
+    main = b"<html><meta charset='utf-8'><script>viewDoc('20260911800823','11577485','1','0','10','HTML','');viewDoc('20260911800823','11577485','2','10','10','HTML','');</script></html>"
+    with pytest.raises(source.SourceError, match="invalid fetch response"):
+        source.source_packet(rcp, fetch_from({
+            "main.do": (main, "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp),
+            "eleId=1": (b"<html><meta charset='utf-8'><body>first complete source body sufficient</body></html>", "text/html; charset=utf-8", "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=1&offset=0&length=10&dtd=HTML"),
+            "eleId=2": (b"partial", "text/html; charset=utf-8", "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=2&offset=10&length=10&dtd=HTML", {}, 206),
+        }))
+
+def test_tree_declaration_controls_noncontiguous_document_order():
+    rcp = "20260911800823"
+    def node(ele, toc, offset):
+        return f'''var node1 = {{}};
+node1['rcpNo'] = "{rcp}"; node1['dcmNo'] = "11577485"; node1['eleId'] = "{ele}";
+node1['offset'] = "{offset}"; node1['length'] = "10"; node1['dtd'] = "HTML";
+node1['tocNo'] = "{toc}"; node1['atocId'] = "{toc}"; treeData.push(node1);'''
+    main = ("<meta charset='utf-8'><script>" + node("9", "1", "0") + node("2", "2", "10") + "</script>").encode()
+    packet = source.source_packet(rcp, fetch_from({
+        "main.do": (main, "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp),
+        "eleId=9": (b"<meta charset='utf-8'><body>first tree declared section sufficient</body>", "text/html; charset=utf-8", "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=9&offset=0&length=10&dtd=HTML"),
+        "eleId=2": (b"<meta charset='utf-8'><body>second tree declared section sufficient</body>", "text/html; charset=utf-8", "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=2&offset=10&length=10&dtd=HTML"),
+    }))
+    assert [(x["ele_id"], x["toc_no"]) for x in packet["sections"]] == [("9", "1"), ("2", "2")]
+
+
 @pytest.mark.parametrize("viewer,content_type,code", [
     (b"<html><body>\xff\xfe\xff</body></html>", "text/html; charset=utf-8", "SOURCE_DECODE_ERROR"),
     ("<html><meta charset='utf-8'><body>占쏙옙 document body longer enough</body></html>".encode(), None, "SOURCE_DECODE_ERROR"),
@@ -111,7 +166,7 @@ def test_checkpoint_rejects_cross_directory_symlink_and_corrupt_siblings(tmp_pat
     copied = tmp_path / "other" / f"{rcp}.json"; copied.parent.mkdir(); copied.write_bytes(checkpoint.read_bytes())
     assert source.completed_packet(copied, rcp) is None
     metadata = json.loads(checkpoint.read_text())
-    raw = packet_dir / f"{rcp}.viewer.raw"; raw.write_bytes(b"corrupt")
+    raw = packet_dir / f"{rcp}.viewer.0000.raw"; raw.write_bytes(b"corrupt")
     assert source.completed_packet(checkpoint, rcp) is None
     raw.unlink(); raw.symlink_to(packet_dir / f"{rcp}.viewer.txt")
     assert source.completed_packet(checkpoint, rcp) is None
@@ -161,8 +216,8 @@ def test_checkpoint_rederives_semantics_and_rejects_resealed_tampering(tmp_path)
     reseal(lambda m: m.update(retrieved_at_kst="2026-09-11T07:00:00"))
     reseal(lambda m: m.update(source_date="20200101"))
     reseal(lambda m: m.update(main_raw_sha256="0" * 64))
-    escaped = tmp_path / "escaped.raw"; escaped.write_bytes((packet_dir / f"{rcp}.viewer.raw").read_bytes())
-    (packet_dir / f"{rcp}.viewer.raw").unlink(); (packet_dir / f"{rcp}.viewer.raw").symlink_to(escaped)
+    escaped = tmp_path / "escaped.raw"; escaped.write_bytes((packet_dir / f"{rcp}.viewer.0000.raw").read_bytes())
+    (packet_dir / f"{rcp}.viewer.0000.raw").unlink(); (packet_dir / f"{rcp}.viewer.0000.raw").symlink_to(escaped)
     assert source.completed_packet(checkpoint, rcp) is None
 
 

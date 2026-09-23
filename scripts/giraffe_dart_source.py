@@ -23,6 +23,8 @@ except ModuleNotFoundError:  # Direct script execution from the scripts director
 USER_AGENT = "Mozilla/5.0 (compatible; Giraffe-DART-Source/1.0)"
 DART_HOST = "dart.fss.or.kr"
 VIEWER_PATH = "/report/viewer.do"
+TREE_NODE_RE = re.compile(r"var\s+node1\s*=\s*\{\s*\};(?P<body>.*?)treeData\.push\(node1\)\s*;", re.I | re.S)
+TREE_FIELD_RE = re.compile(r"node1\[\s*['\"](?P<name>[A-Za-z0-9_]+)['\"]\s*\]\s*=\s*['\"](?P<value>[^'\"]*)['\"]", re.I)
 VIEWDOC_RE = re.compile(r"viewDoc\(\s*['\"](?P<rcp>\d{14})['\"]\s*,\s*['\"](?P<dcm>\d+)['\"]\s*,\s*['\"](?P<ele>[^'\"]*)['\"]\s*,\s*['\"](?P<offset>[^'\"]*)['\"]\s*,\s*['\"](?P<length>[^'\"]*)['\"]\s*,\s*['\"](?P<dtd>[^'\"]+)['\"]", re.I)
 META_CHARSET_RE = re.compile(r"<meta[^>]+charset\s*=\s*['\"]?\s*([\w.-]+)", re.I)
 META_HTTP_EQUIV_RE = re.compile(r"<meta[^>]+content\s*=\s*['\"][^'\"]*charset\s*=\s*([\w.-]+)", re.I)
@@ -120,11 +122,39 @@ def strict_decode(raw: bytes, content_type: str | None) -> tuple[str, str]:
     return text, charset
 
 
+def declared_viewer_sections(main_html: str, rcp_no: str) -> list[dict[str, str]]:
+    """Use the declared jsTree order, not eleId arithmetic or a 404 sentinel."""
+    tree_nodes = []
+    for node in TREE_NODE_RE.finditer(main_html):
+        fields = {item.group("name"): item.group("value") for item in TREE_FIELD_RE.finditer(node.group("body"))}
+        if fields.get("rcpNo") == rcp_no:
+            required = ("rcpNo", "dcmNo", "eleId", "offset", "length", "dtd", "tocNo", "atocId")
+            if any(not fields.get(key) for key in required):
+                raise SourceError("SOURCE_EXTRACT_ERROR", "malformed declared tree section")
+            tree_nodes.append(fields)
+    # Fixtures and older main pages without a declared tree retain the direct
+    # viewDoc extraction path; production tree declarations are authoritative.
+    if tree_nodes:
+        candidates = tree_nodes
+    else:
+        candidates = [{"rcpNo": m.group("rcp"), "dcmNo": m.group("dcm"), "eleId": m.group("ele"), "offset": m.group("offset"), "length": m.group("length"), "dtd": m.group("dtd"), "tocNo": "", "atocId": ""} for m in VIEWDOC_RE.finditer(main_html) if m.group("rcp") == rcp_no]
+    if not candidates:
+        raise SourceError("SOURCE_EXTRACT_ERROR", "missing declared viewer sections for rcpNo")
+    sections: list[dict[str, str]] = []; seen: set[tuple[str, str, str, str, str]] = set()
+    for fields in candidates:
+        values = {"dcm": fields["dcmNo"], "ele": fields["eleId"], "offset": fields["offset"], "length": fields["length"], "dtd": fields["dtd"]}
+        if (not values["dcm"].isdigit() or not values["ele"].isdigit() or not values["offset"].isdigit() or not values["length"].isdigit() or not re.fullmatch(r"[A-Za-z0-9._-]+", values["dtd"])):
+            raise SourceError("SOURCE_EXTRACT_ERROR", "malformed declared viewer section")
+        identity = tuple(values[key] for key in ("dcm", "ele", "offset", "length", "dtd"))
+        if identity in seen: raise SourceError("SOURCE_EXTRACT_ERROR", "duplicate declared viewer section")
+        seen.add(identity); query = {"rcpNo": rcp_no, "dcmNo": values["dcm"], "eleId": values["ele"], "offset": values["offset"], "length": values["length"], "dtd": values["dtd"]}
+        sections.append({"canonical_viewer_url": "https://" + DART_HOST + VIEWER_PATH + "?" + urllib.parse.urlencode(query), "dcm_no": values["dcm"], "ele_id": values["ele"], "offset": values["offset"], "length": values["length"], "dtd": values["dtd"], "toc_no": fields["tocNo"], "atoc_id": fields["atocId"]})
+    return sections
+
+
 def canonical_viewer_url(main_html: str, rcp_no: str) -> str:
-    match = next((m for m in VIEWDOC_RE.finditer(main_html) if m.group("rcp") == rcp_no), None)
-    if not match: raise SourceError("SOURCE_EXTRACT_ERROR", "missing dcmNo/viewDoc for rcpNo")
-    query = {"rcpNo": rcp_no, "dcmNo": match.group("dcm"), "eleId": match.group("ele"), "offset": match.group("offset"), "length": match.group("length"), "dtd": match.group("dtd")}
-    return "https://" + DART_HOST + VIEWER_PATH + "?" + urllib.parse.urlencode(query)
+    """Legacy first-section selector; v3 captures declared_viewer_sections()."""
+    return declared_viewer_sections(main_html, rcp_no)[0]["canonical_viewer_url"]
 
 
 def validate_viewer(text: str, canonical_url: str, final_url: str, rcp_no: str) -> str:
@@ -219,34 +249,62 @@ def _source_packet(rcp_no: str, fetch: Callable[[str], tuple]) -> dict:
         if main_final != main_url:
             raise SourceError("SOURCE_FETCH_ERROR", "main URL canonical identity mismatch")
         main_html, main_charset = strict_decode(main_raw, main_type)
-        canonical = canonical_viewer_url(main_html, rcp_no)
-        raw, content_type, final_url, viewer_headers, viewer_status = _fetch_result(fetch(canonical))
-        document, charset = strict_decode(raw, content_type)
-        visible = validate_viewer(document, canonical, final_url, rcp_no)
+        declared = declared_viewer_sections(main_html, rcp_no)
+        captured, documents = [], []
+        for position, declaration in enumerate(declared):
+            canonical = declaration["canonical_viewer_url"]
+            raw, content_type, final_url, viewer_headers, viewer_status = _fetch_result(fetch(canonical))
+            document, charset = strict_decode(raw, content_type)
+            visible = validate_viewer(document, canonical, final_url, rcp_no)
+            captured.append(declaration | {"position": position, "final_url": final_url, "content_type": content_type,
+                "response_headers": _provenance_headers(viewer_headers, content_type, len(raw)), "response_status": viewer_status,
+                "retrieved_at_kst": datetime.now(KST).isoformat(), "charset": charset,
+                "raw_sha256": hashlib.sha256(raw).hexdigest(), "raw_bytes": len(raw),
+                "text_sha256": hashlib.sha256(document.encode("utf-8")).hexdigest(), "text_chars": len(document),
+                "visible_chars": len(visible), "_raw": raw, "_text": document})
+            documents.append(document)
+        text = "\n\n".join(documents)
+        visible = " ".join(validate_viewer(document, section["canonical_viewer_url"], section["final_url"], rcp_no)
+                           for document, section in zip(documents, captured))
     except SourceError: raise
     except Exception as exc: raise SourceError("SOURCE_FETCH_ERROR", str(exc)) from exc
-    return {"schema_version":"giraffe-dart-source-packet-v2","rcp_no":rcp_no,"source_date":rcp_no[:8],"main_url":main_url,"main_final_url":main_final,"main_content_type":main_type,"main_charset":main_charset,"main_response_headers":_provenance_headers(main_headers, main_type, len(main_raw)),"main_response_status":main_status,"main_raw_sha256":hashlib.sha256(main_raw).hexdigest(),"main_raw_bytes":len(main_raw),"canonical_viewer_url":canonical,"final_url":final_url,"content_type":content_type,"response_headers":_provenance_headers(viewer_headers, content_type, len(raw)),"response_status":viewer_status,"retrieved_at_kst":datetime.now(KST).isoformat(),"charset":charset,"raw_sha256":hashlib.sha256(raw).hexdigest(),"raw_bytes":len(raw),"text_sha256":hashlib.sha256(document.encode("utf-8")).hexdigest(),"text_chars":len(document),"visible_chars":len(visible),"source_valid":True,"text":document,"_raw":raw,"_main_raw":main_raw}
+    return {"schema_version":"giraffe-dart-source-packet-v3","rcp_no":rcp_no,"source_date":rcp_no[:8],
+        "main_url":main_url,"main_final_url":main_final,"main_content_type":main_type,"main_charset":main_charset,
+        "main_response_headers":_provenance_headers(main_headers, main_type, len(main_raw)),"main_response_status":main_status,
+        "main_raw_sha256":hashlib.sha256(main_raw).hexdigest(),"main_raw_bytes":len(main_raw),
+        "sections":[{k:v for k,v in section.items() if not k.startswith("_")} for section in captured],
+        "retrieved_at_kst":datetime.now(KST).isoformat(),"text_sha256":hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "text_chars":len(text),"visible_chars":len(visible),"source_valid":True,"text":text,"_main_raw":main_raw,
+        "_sections":captured} | ({key: captured[0][key] for key in ("canonical_viewer_url", "final_url", "content_type", "response_headers", "response_status", "charset", "raw_sha256", "raw_bytes")} if len(captured) == 1 else {})
 
 
 def write_packet(packet: dict, directory: Path) -> Path:
+    """Publish v3 packet only after every section has been captured in staging."""
     directory.mkdir(parents=True, exist_ok=True)
     directory = directory.resolve()
+    if directory.is_symlink() or packet.get("schema_version") != "giraffe-dart-source-packet-v3":
+        raise SourceError("SOURCE_FETCH_ERROR", "invalid v3 packet publication")
     rcp_no = packet["rcp_no"]
-    raw_bytes_path = directory / f"{rcp_no}.viewer.raw"
-    raw_path = directory / f"{rcp_no}.viewer.txt"
     main_raw_path = directory / f"{rcp_no}.main.raw"
+    text_path = directory / f"{rcp_no}.viewer.txt"
     meta_path = directory / f"{rcp_no}.json"
-    # Atomic sibling writes prevent a receipt from looking complete after a crash.
-    for path, content in ((raw_bytes_path, packet.get("_raw", packet["text"].encode("utf-8"))), (main_raw_path, packet.get("_main_raw"))):
+    sections = packet.get("_sections")
+    if not isinstance(sections, list) or len(sections) != len(packet.get("sections", [])):
+        raise SourceError("SOURCE_FETCH_ERROR", "incomplete section capture")
+    staged: list[tuple[Path, bytes]] = [(main_raw_path, packet.get("_main_raw")), (text_path, packet["text"].encode("utf-8"))]
+    public_sections = []
+    for position, section in enumerate(sections):
+        raw_path = directory / f"{rcp_no}.viewer.{position:04d}.raw"
+        section_text_path = directory / f"{rcp_no}.viewer.{position:04d}.txt"
+        if not isinstance(section.get("_raw"), bytes) or not isinstance(section.get("_text"), str):
+            raise SourceError("SOURCE_FETCH_ERROR", "incomplete section capture")
+        staged.extend(((raw_path, section["_raw"]), (section_text_path, section["_text"].encode("utf-8"))))
+        public_sections.append({k:v for k,v in section.items() if not k.startswith("_")} | {"raw_path": str(raw_path), "text_path": str(section_text_path)})
+    for path, content in staged:
         if not isinstance(content, bytes): raise SourceError("SOURCE_FETCH_ERROR", "missing raw response bytes")
-        temp = path.with_suffix(path.suffix + ".tmp")
-        temp.write_bytes(content)
-        temp.replace(path)
-    metadata = {k:v for k,v in packet.items() if k not in {"text", "_raw", "_main_raw"}} | {"raw_path":str(raw_bytes_path), "text_path":str(raw_path), "main_raw_path":str(main_raw_path)}
-    for path, content in ((raw_path, packet["text"]), (meta_path, json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n")):
-        temp = path.with_suffix(path.suffix + ".tmp")
-        temp.write_text(content, encoding="utf-8")
-        temp.replace(path)
+        temp = path.with_suffix(path.suffix + ".tmp"); temp.write_bytes(content); temp.replace(path)
+    metadata = {k:v for k,v in packet.items() if k not in {"text", "_main_raw", "_sections", "sections"}} | {"sections": public_sections, "text_path":str(text_path), "main_raw_path":str(main_raw_path)}
+    temp = meta_path.with_suffix(".json.tmp"); temp.write_text(json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8"); temp.replace(meta_path)
     return meta_path
 
 
@@ -266,45 +324,47 @@ def _capture_time_is_fresh(value: object, now: datetime) -> bool:
 
 
 def completed_packet(path: Path, rcp_no: str, *, expected_control_date: str | None = None, now: datetime | None = None) -> dict | None:
-    """Resume only a raw-revalidated packet in its declared control-date directory."""
+    """Resume only a fully revalidated v3 packet; every declared section is bound."""
     try:
         if (not re.fullmatch(r"\d{14}", rcp_no) or path.is_symlink() or path.name != f"{rcp_no}.json"
                 or path.parent.is_symlink() or not re.fullmatch(r"\d{8}", path.parent.name)
-                or (expected_control_date is not None and (not re.fullmatch(r"\d{8}", expected_control_date) or path.parent.name != expected_control_date))):
-            return None
-        directory = path.parent.resolve(strict=True)
-        metadata = json.loads(path.read_text(encoding="utf-8"))
-        raw_path, text_path, main_raw_path = (directory / f"{rcp_no}.viewer.raw", directory / f"{rcp_no}.viewer.txt", directory / f"{rcp_no}.main.raw")
-        required = {"schema_version", "rcp_no", "source_date", "main_url", "main_final_url", "main_content_type", "main_charset", "main_response_headers", "main_response_status", "main_raw_sha256", "main_raw_bytes", "canonical_viewer_url", "final_url", "content_type", "response_headers", "response_status", "retrieved_at_kst", "charset", "raw_sha256", "raw_bytes", "text_sha256", "text_chars", "visible_chars", "source_valid", "raw_path", "text_path", "main_raw_path"}
-        if (not isinstance(metadata, dict) or set(metadata) != required or metadata.get("schema_version") != "giraffe-dart-source-packet-v2" or metadata.get("rcp_no") != rcp_no
+                or (expected_control_date is not None and (not re.fullmatch(r"\d{8}", expected_control_date) or path.parent.name != expected_control_date))): return None
+        directory = path.parent.resolve(strict=True); metadata = json.loads(path.read_text(encoding="utf-8"))
+        required = {"schema_version", "rcp_no", "source_date", "main_url", "main_final_url", "main_content_type", "main_charset", "main_response_headers", "main_response_status", "main_raw_sha256", "main_raw_bytes", "sections", "retrieved_at_kst", "text_sha256", "text_chars", "visible_chars", "source_valid", "text_path", "main_raw_path"}
+        legacy = {"canonical_viewer_url", "final_url", "content_type", "response_headers", "response_status", "charset", "raw_sha256", "raw_bytes"}
+        if (not isinstance(metadata, dict) or set(metadata) != required and set(metadata) != required | legacy
+                or metadata.get("schema_version") != "giraffe-dart-source-packet-v3" or metadata.get("rcp_no") != rcp_no
                 or metadata.get("source_date") != rcp_no[:8] or metadata.get("source_valid") is not True
-                or metadata.get("raw_path") != str(raw_path) or metadata.get("text_path") != str(text_path) or metadata.get("main_raw_path") != str(main_raw_path)
                 or metadata.get("main_url") != "https://dart.fss.or.kr/dsaf001/main.do?" + urllib.parse.urlencode({"rcpNo": rcp_no})
-                or metadata.get("main_final_url") != metadata.get("main_url")
-                or not _capture_time_is_fresh(metadata.get("retrieved_at_kst"), now or datetime.now(KST))): return None
-        paths = (raw_path, text_path, main_raw_path)
-        if any(item.is_symlink() or item.resolve(strict=True).parent != directory for item in paths): return None
-        # Preserve the exact decoded representation. Path.read_text() enables
-        # universal-newline translation, which changes authoritative CRLF
-        # source text and makes every valid Windows-newline checkpoint miss.
-        raw = raw_path.read_bytes(); text = text_path.read_bytes().decode("utf-8"); main_raw = main_raw_path.read_bytes()
-        if (hashlib.sha256(raw).hexdigest() != metadata["raw_sha256"] or len(raw) != metadata["raw_bytes"] or hashlib.sha256(text.encode("utf-8")).hexdigest() != metadata["text_sha256"]
-                or hashlib.sha256(main_raw).hexdigest() != metadata["main_raw_sha256"] or len(main_raw) != metadata["main_raw_bytes"]): return None
-        main_type = metadata.get("main_content_type")
-        viewer_type = metadata.get("content_type")
-        if (not isinstance(main_type, (str, type(None))) or not isinstance(viewer_type, (str, type(None)))
-                or not _valid_provenance_headers(metadata.get("main_response_headers"), main_type, len(main_raw))
-                or not _valid_provenance_headers(metadata.get("response_headers"), viewer_type, len(raw))): return None
-        main_text, main_charset = strict_decode(main_raw, main_type)
-        document, charset = strict_decode(raw, viewer_type)
-        canonical = canonical_viewer_url(main_text, rcp_no)
-        visible = validate_viewer(document, canonical, metadata["final_url"], rcp_no)
-        if (metadata.get("main_charset") != main_charset or metadata.get("charset") != charset or metadata.get("canonical_viewer_url") != canonical
-                or document != text or len(document) != metadata["text_chars"] or len(visible) != metadata["visible_chars"]
-                or metadata.get("main_response_status") != 200 or metadata.get("response_status") != 200): return None
+                or metadata.get("main_final_url") != metadata.get("main_url") or not _capture_time_is_fresh(metadata.get("retrieved_at_kst"), now or datetime.now(KST))): return None
+        main_raw_path, text_path = directory / f"{rcp_no}.main.raw", directory / f"{rcp_no}.viewer.txt"
+        if metadata.get("main_raw_path") != str(main_raw_path) or metadata.get("text_path") != str(text_path): return None
+        main_raw, text_bytes = main_raw_path.read_bytes(), text_path.read_bytes()
+        if any(item.is_symlink() or item.resolve(strict=True).parent != directory for item in (main_raw_path, text_path)): return None
+        if hashlib.sha256(main_raw).hexdigest() != metadata["main_raw_sha256"] or len(main_raw) != metadata["main_raw_bytes"] or hashlib.sha256(text_bytes).hexdigest() != metadata["text_sha256"]: return None
+        main_text, main_charset = strict_decode(main_raw, metadata.get("main_content_type"))
+        declared = declared_viewer_sections(main_text, rcp_no); sections = metadata.get("sections")
+        if not isinstance(sections, list) or len(sections) != len(declared) or not sections: return None
+        documents, visibles = [], []
+        for position, (decl, section) in enumerate(zip(declared, sections)):
+            if not isinstance(section, dict): return None
+            raw_path, section_text_path = directory / f"{rcp_no}.viewer.{position:04d}.raw", directory / f"{rcp_no}.viewer.{position:04d}.txt"
+            required_section = set(decl) | {"position", "final_url", "content_type", "response_headers", "response_status", "retrieved_at_kst", "charset", "raw_sha256", "raw_bytes", "text_sha256", "text_chars", "visible_chars", "raw_path", "text_path"}
+            if (set(section) != required_section or any(section.get(key) != value for key, value in decl.items()) or section.get("position") != position
+                    or section.get("raw_path") != str(raw_path) or section.get("text_path") != str(section_text_path)
+                    ): return None
+            if any(item.is_symlink() or item.resolve(strict=True).parent != directory for item in (raw_path, section_text_path)): return None
+            raw, section_text_bytes = raw_path.read_bytes(), section_text_path.read_bytes(); document = section_text_bytes.decode("utf-8")
+            if (hashlib.sha256(raw).hexdigest() != section["raw_sha256"] or len(raw) != section["raw_bytes"] or hashlib.sha256(section_text_bytes).hexdigest() != section["text_sha256"]): return None
+            charset = strict_decode(raw, section.get("content_type"))[1]
+            visible = validate_viewer(document, decl["canonical_viewer_url"], section.get("final_url"), rcp_no)
+            if (charset != section["charset"] or len(document) != section["text_chars"] or len(visible) != section["visible_chars"] or section.get("response_status") != 200 or not _valid_provenance_headers(section.get("response_headers"), section.get("content_type"), len(raw))): return None
+            documents.append(document); visibles.append(visible)
+        text = text_bytes.decode("utf-8"); combined = "\n\n".join(documents)
+        if legacy <= set(metadata) and any(metadata[key] != sections[0][key] for key in legacy): return None
+        if text != combined or len(text) != metadata["text_chars"] or len(" ".join(visibles)) != metadata["visible_chars"] or main_charset != metadata["main_charset"] or metadata.get("main_response_status") != 200 or not _valid_provenance_headers(metadata.get("main_response_headers"), metadata.get("main_content_type"), len(main_raw)): return None
         return metadata
-    except (OSError, KeyError, TypeError, ValueError, SourceError, json.JSONDecodeError):
-        return None
+    except (OSError, KeyError, TypeError, ValueError, UnicodeDecodeError, SourceError, json.JSONDecodeError): return None
 
 
 def fetch_with_retry(rcp_no: str, retries: int = 4, fetch: Callable[[str], tuple] = _fetch, *,

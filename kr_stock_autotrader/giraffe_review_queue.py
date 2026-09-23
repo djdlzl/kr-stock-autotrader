@@ -17,6 +17,7 @@ from scripts.giraffe_dart_source import (
     _capture_time_is_fresh,
     _valid_provenance_headers,
     canonical_viewer_url,
+    completed_packet,
     strict_decode,
     validate_viewer,
 )
@@ -236,52 +237,20 @@ def _packet_artifacts(source: dict[str, Any], source_root: Path) -> tuple[Path, 
 
 
 def _completed_packet_snapshot(packet_bytes: bytes, rcp_no: str, expected_control_date: str, packet: Path, root: Path) -> tuple[dict[str, Any], bytes]:
-    """Validate the source contract solely from already-retained artifact bytes."""
+    """Revalidate the retained v3 aggregate and every source-bound section."""
     try:
-        directory = packet.parent.resolve(strict=True)
-        if (packet.name != f"{rcp_no}.json" or directory.name != expected_control_date
-                or not _under(directory, root) or packet.parent != directory):
+        if json.loads(packet_bytes.decode("utf-8", "strict")).get("schema_version") != "giraffe-dart-source-packet-v3":
             raise ReviewQueueError("immutable source packet failed provenance validation")
-        metadata = json.loads(packet_bytes.decode("utf-8", "strict"))
-        raw_path = directory / f"{rcp_no}.viewer.raw"
-        text_path = directory / f"{rcp_no}.viewer.txt"
-        main_raw_path = directory / f"{rcp_no}.main.raw"
-        required = {"schema_version", "rcp_no", "source_date", "main_url", "main_final_url", "main_content_type", "main_charset", "main_response_headers", "main_response_status", "main_raw_sha256", "main_raw_bytes", "canonical_viewer_url", "final_url", "content_type", "response_headers", "response_status", "retrieved_at_kst", "charset", "raw_sha256", "raw_bytes", "text_sha256", "text_chars", "visible_chars", "source_valid", "raw_path", "text_path", "main_raw_path"}
-        if (not isinstance(metadata, dict) or set(metadata) != required
-                or metadata.get("schema_version") != "giraffe-dart-source-packet-v2"
-                or metadata.get("rcp_no") != rcp_no or metadata.get("source_date") != rcp_no[:8]
-                or metadata.get("source_valid") is not True
-                or metadata.get("raw_path") != str(raw_path) or metadata.get("text_path") != str(text_path)
-                or metadata.get("main_raw_path") != str(main_raw_path)
-                or metadata.get("main_url") != "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp_no
-                or metadata.get("main_final_url") != metadata.get("main_url")
-                or not _capture_time_is_fresh(metadata.get("retrieved_at_kst"), datetime.now(KST))):
+        metadata = completed_packet(packet, rcp_no, expected_control_date=expected_control_date)
+        if metadata is None:
             raise ReviewQueueError("immutable source packet failed provenance validation")
-        # Each sibling is opened once, after packet authority has been captured.
-        raw, text_bytes, main_raw = (_read_regular(raw_path, root), _read_regular(text_path, root), _read_regular(main_raw_path, root))
-        text = text_bytes.decode("utf-8", "strict")
-        if (hashlib.sha256(raw).hexdigest() != metadata["raw_sha256"] or len(raw) != metadata["raw_bytes"]
-                or hashlib.sha256(text_bytes).hexdigest() != metadata["text_sha256"]
-                or hashlib.sha256(main_raw).hexdigest() != metadata["main_raw_sha256"] or len(main_raw) != metadata["main_raw_bytes"]):
-            raise ReviewQueueError("immutable source packet failed provenance validation")
-        main_type, viewer_type = metadata.get("main_content_type"), metadata.get("content_type")
-        if (not isinstance(main_type, (str, type(None))) or not isinstance(viewer_type, (str, type(None)))
-                or not _valid_provenance_headers(metadata.get("main_response_headers"), main_type, len(main_raw))
-                or not _valid_provenance_headers(metadata.get("response_headers"), viewer_type, len(raw))):
-            raise ReviewQueueError("immutable source packet failed provenance validation")
-        main_text, main_charset = strict_decode(main_raw, main_type)
-        document, charset = strict_decode(raw, viewer_type)
-        canonical = canonical_viewer_url(main_text, rcp_no)
-        visible = validate_viewer(document, canonical, metadata["final_url"], rcp_no)
-        if (metadata.get("main_charset") != main_charset or metadata.get("charset") != charset
-                or metadata.get("canonical_viewer_url") != canonical or document != text
-                or len(document) != metadata["text_chars"] or len(visible) != metadata["visible_chars"]
-                or metadata.get("main_response_status") != 200 or metadata.get("response_status") != 200):
+        text_path = packet.parent / f"{rcp_no}.viewer.txt"
+        text_bytes = _read_regular(text_path, root)
+        if hashlib.sha256(text_bytes).hexdigest() != metadata["text_sha256"]:
             raise ReviewQueueError("immutable source packet failed provenance validation")
         return metadata, text_bytes
     except (OSError, KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError, SourceError) as exc:
-        if isinstance(exc, ReviewQueueError):
-            raise
+        if isinstance(exc, ReviewQueueError): raise
         raise ReviewQueueError("immutable source packet failed provenance validation") from exc
 
 
