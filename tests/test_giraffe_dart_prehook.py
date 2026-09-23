@@ -586,7 +586,10 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             with patch.object(self.gate, "OUTPUT_ROOT", root / "manifests"), patch.object(self.gate, "SOURCE_ROOT", root / "sources"), patch.object(self.gate, "CONTROL_ROOT", root / "controls"), patch.object(self.gate, "target_dates", return_value=[control_date]), patch.object(self.gate, "check_card_prompt"), patch.object(self.gate, "collect_manifest", side_effect=fake_collect), patch.object(self.gate, "fetch_with_retry", side_effect=AssertionError("checkpoint must avoid refetch")) as fetch, patch.object(self.gate, "fetch_research_backlog", return_value=[]), patch.object(self.gate, "register_research_run"), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(self.gate.main(), 0)
         fetch.assert_not_called()
-        self.assertEqual(json.loads(output.getvalue())["control_contract"]["sources"][0]["date"], control_date)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["control_count"], 1)
+        self.assertEqual(result["source_valid_count"], 1)
+        self.assertNotIn("control_contract", result)
 
     def test_gate_emits_giraffe_contract_for_previous_and_current_dates(self):
         def fake_collect(date):
@@ -606,11 +609,11 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         result = json.loads(output.getvalue())
         self.assertEqual(result["gate"], "GIRAFFE_DART_GATE_V1")
         self.assertTrue(result["complete"])
-        self.assertEqual([item["date"] for item in result["dates"]], ["20260831", "20260901"])
-        for item in result["dates"]:
-            self.assertEqual(item["material_candidate_count"], len(item["source_packet_paths"]))
-            self.assertEqual(item["source_valid_count"], 1)
-            self.assertEqual(item["source_error_count"], 0)
+        self.assertTrue(result["run_key"].startswith("research-2026-09-01-0700-kst"))
+        self.assertEqual(result["control_count"], 2)
+        self.assertEqual(result["source_valid_count"], 2)
+        self.assertEqual(result["source_error_count"], 0)
+        self.assertEqual(set(result), {"gate", "complete", "run_key", "control_contract_sha256", "control_count", "source_valid_count", "source_error_count"})
 
     def test_source_failure_registers_exact_receipt_and_continues_later_dates(self):
         failed = "20260915000001"
@@ -627,10 +630,14 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                 self.assertEqual(self.gate.main(), 0)
             result = json.loads(output.getvalue())
             self.assertEqual(calls.call_count, 4)
-            self.assertEqual(result["control_contract"]["expected_rcp_nos"], ["20260915000001", "20260915000002", "20260916000001", "20260916000002"])
-            failure = result["control_contract"]["sources"][0]
+            self.assertEqual(result["control_count"], 4)
+            self.assertEqual(result["source_valid_count"], 3)
+            self.assertEqual(result["source_error_count"], 1)
+            contract = json.loads((root / "controls" / (result["run_key"] + ".json")).read_text(encoding="utf-8"))
+            self.assertEqual(contract["expected_rcp_nos"], ["20260915000001", "20260915000002", "20260916000001", "20260916000002"])
+            failure = contract["sources"][0]
             self.assertEqual(failure, {"rcp_no": failed, "date": "20260915", "receipt_source_date": "20260915", "report_class": "other", "report_name": "주요사항보고서(유상증자결정)", "source_error_code": "SOURCE_FETCH_ERROR"})
-            self.assertEqual(result["dates"][0]["source_errors"], [{"rcp_no": failed, "code": "SOURCE_FETCH_ERROR"}])
+            self.assertEqual(result["source_error_count"], 1)
             self.assertNotIn("private transport", output.getvalue())
             register.assert_called_once()
 
@@ -645,7 +652,7 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                 with patch.object(self.gate, 'fetch_with_retry', side_effect=self.gate.SourceError('SOURCE_EXTRACT_ERROR', 'private')) as fetch, contextlib.redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(self.gate.main(['--rerun-version', '1']), 0)
                 fetch.assert_called_once_with(rcp)
-                result = json.loads(output.getvalue())['control_contract']
+                result = json.loads((root / 'controls' / 'research-2026-09-18-0700-kst-r1.json').read_text(encoding='utf-8'))
                 self.assertEqual(result['sources'][0]['source_error_code'], 'SOURCE_EXTRACT_ERROR')
                 self.assertEqual(result['carry_forward'][0]['payload'], failed)
                 committed_path = root / 'controls' / 'research-2026-09-18-0700-kst-r1.json'
@@ -656,7 +663,7 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                 fetch.assert_called_once_with(rcp)
                 with patch.object(self.gate, 'fetch_with_retry', side_effect=AssertionError('reuse successful retry checkpoint')), contextlib.redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(self.gate.main(['--rerun-version', '2']), 0)
-                result = json.loads(output.getvalue())['control_contract']
+                result = json.loads((root / 'controls' / 'research-2026-09-18-0700-kst-r2.json').read_text(encoding='utf-8'))
                 self.assertEqual(result['expected_rcp_nos'], [rcp])
                 self.assertEqual(result['sources'][0]['date'], '20260915')
                 self.assertEqual(result['sources'][0]['packet_path'], str(root / 'sources' / '20260915' / (rcp + '.json')))

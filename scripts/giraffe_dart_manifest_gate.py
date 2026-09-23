@@ -22,6 +22,7 @@ sys.path.insert(0, str(SCRIPT_DIR.parent))
 from giraffe_dart_manifest import ManifestError, collect_manifest  # noqa: E402
 from giraffe_dart_source import SourceError, completed_packet, fetch_with_retry, write_packet  # noqa: E402
 from kr_stock_autotrader.dart_report_classification import authoritative_report_class  # noqa: E402
+from kr_stock_autotrader.giraffe_review_queue import compact_gate_payload  # noqa: E402
 from kr_stock_autotrader.krx_calendar import CalendarError, admitted_backlog_dates  # noqa: E402
 
 OUTPUT_ROOT = Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-manifests"
@@ -625,9 +626,12 @@ def main(argv: list[str] | None = None) -> int:
         error = str(exc) if isinstance(exc, ManifestError) else 'research control persistence failed'
         print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": False, "error": error}, ensure_ascii=False))
         return 2
-    print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": True, "dates": summaries,
-                      "control_contract": contract, "control_contract_path": str(contract_path),
-                      "control_contract_sha256": digest}, ensure_ascii=False, sort_keys=True))
+    # Keep the immutable full contract local/prehook-owned. The agent receives
+    # only this compact handle and pages/open packets through the bounded CLI.
+    print(json.dumps(compact_gate_payload(run_key, digest, contract["control_count"],
+                                          sum("packet_path" in source for source in contract["sources"]),
+                                          sum("source_error_code" in source for source in contract["sources"])),
+                     ensure_ascii=False, sort_keys=True))
     return 0
 
 
