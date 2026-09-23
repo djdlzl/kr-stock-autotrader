@@ -851,6 +851,14 @@ def _valid_control_economic_audit(source: dict, item: dict) -> bool:
             or (disposition != 'timing_unresolved' and (not qualifies or disposition == 'qualifying_A_or_better')))
 
 
+def _is_authoritative_dart_main_url(value: object, rcp_no: object) -> bool:
+    """Match the receipt's canonical DART locator used by source capture."""
+    if not isinstance(rcp_no, str) or re.fullmatch(r'\d{14}', rcp_no) is None:
+        return False
+    expected = 'https://dart.fss.or.kr/dsaf001/main.do?rcpNo=' + rcp_no
+    return _canonical_coverage_url(value) == expected
+
+
 def _valid_v3_terminal_item_shape(source: dict, item: dict) -> bool:
     """Keep caller routing data in the durable finish payload, not a helper."""
     base = {'rcp_no', 'disposition', 'evidence_id', 'economic_disposition', 'economic_reason', 'economic_facts'}
@@ -867,7 +875,7 @@ def _valid_v3_terminal_item_shape(source: dict, item: dict) -> bool:
     return set(item) == base
 
 
-def _valid_v3_terminal_routing(db, run_key: str, source: dict, item: dict) -> bool:
+def _valid_v3_terminal_routing(db, run_key: str, source: dict, item: dict, *, is_correction: bool = False) -> bool:
     """Enforce disposition/evidence routing for each immutable control receipt."""
     if not _valid_v3_terminal_item_shape(source, item):
         return False
@@ -875,6 +883,8 @@ def _valid_v3_terminal_routing(db, run_key: str, source: dict, item: dict) -> bo
     if source.get('report_class') == 'other' and economic == 'error':
         return disposition in {'source_error', 'store_error'}
     if source.get('report_class') == 'other':
+        if is_correction and economic == 'timing_unresolved':
+            return disposition == 'hold'
         return disposition in {'rejected', 'hold'} and economic in {'negative_risk', 'below_threshold', 'timing_unresolved'}
     if economic == 'error':
         return disposition in {'source_error', 'store_error'}
@@ -1032,13 +1042,19 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
     v3 = contract.get('schema_version') == 'giraffe-research-control-v3'
     item_fields = {'rcp_no', 'disposition', 'evidence_id'} | ({'economic_disposition', 'economic_reason', 'economic_facts'} if v3 else set())
     sources = {source['rcp_no']: source for source in contract['sources']}
+    correction_receipts = {item['payload']['rcp_no'] for item in contract.get('correction_of', [])}
     if (not isinstance(items, list) or len(items) != len(expected)
             or [item.get('rcp_no') if isinstance(item, dict) else None for item in items] != expected
             or any(not isinstance(item, dict) or (not v3 and set(item) != item_fields) or item['disposition'] not in allowed
                    or (item['disposition'] in {'saved','existing','correction_stored'} and (not isinstance(item['evidence_id'], int) or isinstance(item['evidence_id'], bool) or item['evidence_id'] <= 0))
                    or (item['disposition'] in {'rejected','hold','source_error','store_error'} and item['evidence_id'] is not None)
                    or (v3 and (not _valid_control_economic_audit(sources[item['rcp_no']], item)
-                               or not _valid_v3_terminal_routing(db, run_key, sources[item['rcp_no']], item)))
+                               or not _valid_v3_terminal_routing(db, run_key, sources[item['rcp_no']], item,
+                                                                 is_correction=item['rcp_no'] in correction_receipts)
+                               or (item['rcp_no'] in correction_receipts
+                                   and sources[item['rcp_no']].get('report_class') == 'other'
+                                   and item['economic_disposition'] != 'error'
+                                   and not _is_authoritative_dart_main_url(item.get('audit_source_url'), item['rcp_no']))))
                    or (_failed_dart_source(sources[item['rcp_no']]) and item['disposition'] != 'source_error') for item in items)):
         raise HTTPException(422, 'research control terminal dispositions are not exact')
     # Validate every requested transition before changing a cursor row.  In
@@ -1078,8 +1094,12 @@ def _terminalize_v2_backlog(db, run_key: str, commitment: dict, detail: dict) ->
     at = __import__('kr_stock_autotrader.decision_cards', fromlist=['now']).now()
     for item in items:
         identity = _correction_backlog_identity(sources[item['rcp_no']], corrections[item['rcp_no']]) if item['rcp_no'] in corrections else _backlog_identity('dart', item['rcp_no'])
-        if item['rcp_no'] in corrections and item['disposition'] not in {'correction_stored', 'source_error', 'store_error'}:
-            raise HTTPException(422, 'DART correction must store evidence or close with an audited failure')
+        # Corrections use the same semantic terminal routing as their immutable
+        # v3 source.  A qualifying correction still needs correction_stored and
+        # its evidence readback; a source-grounded non-material/timing outcome
+        # may close rejected/hold without inventing evidence.
+        if item['rcp_no'] in corrections and item['disposition'] not in {'correction_stored', 'rejected', 'hold', 'source_error', 'store_error'}:
+            raise HTTPException(422, 'DART correction disposition is not semantically terminal')
         if item['disposition'] in {'source_error', 'store_error'}:
             # The immutable scheduler receipt is the attempt audit. The cursor
             # remains pending until an economic/evidence terminal result exists.
