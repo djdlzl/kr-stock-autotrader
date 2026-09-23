@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py ./
 COPY kr_stock_autotrader ./kr_stock_autotrader
+COPY scripts ./scripts
 # Runtime assets are versioned with the image; inject only secret values at run time.
 # Required environment names: SESSION_SECRET and INTERNAL_API_KEY.
 COPY prompts ./prompts

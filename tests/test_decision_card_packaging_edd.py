@@ -55,6 +55,7 @@ def test_container_copy_contract_and_runtime_prompt_asset(tmp_path):
     dockerfile = (REPO / "Dockerfile").read_text()
     assert "COPY app.py ./" in dockerfile
     assert "COPY kr_stock_autotrader ./kr_stock_autotrader" in dockerfile
+    assert "COPY scripts ./scripts" in dockerfile
     assert "COPY prompts ./prompts" in dockerfile
 
     # Model exactly the Docker COPY destinations; this catches a prompt omission
