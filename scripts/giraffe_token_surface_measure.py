@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only end-to-end LLM-visible byte/character proxy for a Giraffe run."""
+"""Read-only source-intake/operator-protocol byte/character proxy for Giraffe."""
 from __future__ import annotations
 
 import argparse
@@ -19,7 +19,7 @@ def git_bytes(rev_path: str) -> bytes:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Measure complete raw versus compact Giraffe LLM-visible proxy")
+    parser = argparse.ArgumentParser(description="Measure source-intake/operator-protocol UTF-8 proxy")
     parser.add_argument("contract", type=Path)
     parser.add_argument("--base", default="b179205")
     parser.add_argument("--page-size", type=int, default=25)
@@ -47,7 +47,9 @@ def main(argv: list[str] | None = None) -> int:
     before_parts = [base_prompt, base_cron, raw_contract, *raw_texts]
     after_parts = [current_prompt, current_cron, gate, *queue_pages, *compact_texts]
     before = b"".join(before_parts); after = b"".join(after_parts)
-    out = {"metric": "UTF-8 byte/character proxy; not tokenizer measurement", "run_key": contract["run_key"], "control_count": contract["control_count"], "packet_count": len(receipts),
+    out = {"metric": "source-intake/operator-protocol proxy: UTF-8 byte/character count, not tokenizer measurement", "metric_scope": "source-intake/operator-protocol proxy", "run_key": contract["run_key"], "control_count": contract["control_count"], "packet_count": len(receipts),
+           "included_components": {"before": ["operator_prompt", "cron_prompt", "raw_control_contract", "raw_viewer_text"], "after": ["operator_prompt", "cron_prompt", "compact_gate", "review_manifest_pages", "compact_visible_text"]},
+           "excluded_components": ["scheduler-start command input/output envelope", "scheduler-finish command input/output envelope", "scheduler-readback detail", "terminal batch command input/output envelope", "terminal control dispositions", "evidence requirements and evidence readback", "common agent-generated audits"],
            "raw_viewer_bytes": sum(map(len, raw_texts)), "compact_visible_bytes": sum(map(len, compact_texts)),
            "raw_viewer_chars": len(b"".join(raw_texts).decode("utf-8")), "compact_visible_chars": len(b"".join(compact_texts).decode("utf-8")),
            "before_bytes": len(before), "after_bytes": len(after), "before_chars": len(before.decode("utf-8")), "after_chars": len(after.decode("utf-8")),

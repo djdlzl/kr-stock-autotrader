@@ -2,16 +2,24 @@
 from __future__ import annotations
 
 import hashlib
-import html
 import json
 import os
 import re
 import stat
+from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-from scripts.giraffe_dart_source import completed_packet
+from scripts.giraffe_dart_source import (
+    KST,
+    SourceError,
+    _capture_time_is_fresh,
+    _valid_provenance_headers,
+    canonical_viewer_url,
+    strict_decode,
+    validate_viewer,
+)
 
 CONTROL_ROOT = Path(os.environ.get("GIRAFFE_DART_CONTROL_ROOT", str(Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-control-contracts")))
 SOURCE_ROOT = Path(os.environ.get("GIRAFFE_DART_SOURCE_ROOT", str(Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets")))
@@ -210,8 +218,9 @@ def compact_visible_text(document: str) -> str:
     if not text or not re.search(r"[가-힣A-Za-z0-9]", text):
         raise ReviewQueueError("empty visible source text")
     # One terminal separator makes individual packet boundaries explicit when
-    # compact texts are concatenated into a review context.
-    return html.unescape(text) + "\n"
+    # compact texts are concatenated into a review context. HTMLParser already
+    # resolves one entity layer; a second unescape would corrupt visible text.
+    return text + "\n"
 
 
 def _packet_artifacts(source: dict[str, Any], source_root: Path) -> tuple[Path, Path]:
@@ -226,6 +235,56 @@ def _packet_artifacts(source: dict[str, Any], source_root: Path) -> tuple[Path, 
     return packet, source_root
 
 
+def _completed_packet_snapshot(packet_bytes: bytes, rcp_no: str, expected_control_date: str, packet: Path, root: Path) -> tuple[dict[str, Any], bytes]:
+    """Validate the source contract solely from already-retained artifact bytes."""
+    try:
+        directory = packet.parent.resolve(strict=True)
+        if (packet.name != f"{rcp_no}.json" or directory.name != expected_control_date
+                or not _under(directory, root) or packet.parent != directory):
+            raise ReviewQueueError("immutable source packet failed provenance validation")
+        metadata = json.loads(packet_bytes.decode("utf-8", "strict"))
+        raw_path = directory / f"{rcp_no}.viewer.raw"
+        text_path = directory / f"{rcp_no}.viewer.txt"
+        main_raw_path = directory / f"{rcp_no}.main.raw"
+        required = {"schema_version", "rcp_no", "source_date", "main_url", "main_final_url", "main_content_type", "main_charset", "main_response_headers", "main_response_status", "main_raw_sha256", "main_raw_bytes", "canonical_viewer_url", "final_url", "content_type", "response_headers", "response_status", "retrieved_at_kst", "charset", "raw_sha256", "raw_bytes", "text_sha256", "text_chars", "visible_chars", "source_valid", "raw_path", "text_path", "main_raw_path"}
+        if (not isinstance(metadata, dict) or set(metadata) != required
+                or metadata.get("schema_version") != "giraffe-dart-source-packet-v2"
+                or metadata.get("rcp_no") != rcp_no or metadata.get("source_date") != rcp_no[:8]
+                or metadata.get("source_valid") is not True
+                or metadata.get("raw_path") != str(raw_path) or metadata.get("text_path") != str(text_path)
+                or metadata.get("main_raw_path") != str(main_raw_path)
+                or metadata.get("main_url") != "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp_no
+                or metadata.get("main_final_url") != metadata.get("main_url")
+                or not _capture_time_is_fresh(metadata.get("retrieved_at_kst"), datetime.now(KST))):
+            raise ReviewQueueError("immutable source packet failed provenance validation")
+        # Each sibling is opened once, after packet authority has been captured.
+        raw, text_bytes, main_raw = (_read_regular(raw_path, root), _read_regular(text_path, root), _read_regular(main_raw_path, root))
+        text = text_bytes.decode("utf-8", "strict")
+        if (hashlib.sha256(raw).hexdigest() != metadata["raw_sha256"] or len(raw) != metadata["raw_bytes"]
+                or hashlib.sha256(text_bytes).hexdigest() != metadata["text_sha256"]
+                or hashlib.sha256(main_raw).hexdigest() != metadata["main_raw_sha256"] or len(main_raw) != metadata["main_raw_bytes"]):
+            raise ReviewQueueError("immutable source packet failed provenance validation")
+        main_type, viewer_type = metadata.get("main_content_type"), metadata.get("content_type")
+        if (not isinstance(main_type, (str, type(None))) or not isinstance(viewer_type, (str, type(None)))
+                or not _valid_provenance_headers(metadata.get("main_response_headers"), main_type, len(main_raw))
+                or not _valid_provenance_headers(metadata.get("response_headers"), viewer_type, len(raw))):
+            raise ReviewQueueError("immutable source packet failed provenance validation")
+        main_text, main_charset = strict_decode(main_raw, main_type)
+        document, charset = strict_decode(raw, viewer_type)
+        canonical = canonical_viewer_url(main_text, rcp_no)
+        visible = validate_viewer(document, canonical, metadata["final_url"], rcp_no)
+        if (metadata.get("main_charset") != main_charset or metadata.get("charset") != charset
+                or metadata.get("canonical_viewer_url") != canonical or document != text
+                or len(document) != metadata["text_chars"] or len(visible) != metadata["visible_chars"]
+                or metadata.get("main_response_status") != 200 or metadata.get("response_status") != 200):
+            raise ReviewQueueError("immutable source packet failed provenance validation")
+        return metadata, text_bytes
+    except (OSError, KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError, SourceError) as exc:
+        if isinstance(exc, ReviewQueueError):
+            raise
+        raise ReviewQueueError("immutable source packet failed provenance validation") from exc
+
+
 def open_review_packet(run_key: str, digest: str, rcp_no: str, *, control_root: Path = CONTROL_ROOT, source_root: Path = SOURCE_ROOT) -> dict[str, object]:
     if not isinstance(rcp_no, str) or not _RECEIPT.fullmatch(rcp_no):
         raise ReviewQueueError("invalid review receipt")
@@ -238,16 +297,8 @@ def open_review_packet(run_key: str, digest: str, rcp_no: str, *, control_root: 
     packet_bytes = _read_regular(packet, root)
     if hashlib.sha256(packet_bytes).hexdigest() != source["packet_sha256"]:
         raise ReviewQueueError("source packet artifact hash mismatch")
-    # completed_packet independently revalidates metadata and raw/text hashes.
-    metadata = completed_packet(packet, rcp_no, expected_control_date=source["date"])
-    if metadata is None: raise ReviewQueueError("immutable source packet failed provenance validation")
-    text_path = Path(metadata.get("text_path", ""))
-    text_bytes = _read_regular(text_path, root)
-    try: document = text_bytes.decode("utf-8", "strict")
-    except UnicodeDecodeError as exc: raise ReviewQueueError("immutable source text unavailable") from exc
-    if hashlib.sha256(document.encode("utf-8")).hexdigest() != metadata.get("text_sha256"):
-        raise ReviewQueueError("immutable source text hash mismatch")
-    compact = compact_visible_text(document)
+    metadata, text_bytes = _completed_packet_snapshot(packet_bytes, rcp_no, source["date"], packet, root)
+    compact = compact_visible_text(text_bytes.decode("utf-8", "strict"))
     return {"schema_version": "giraffe-compact-review-packet-v2", "run_key": run_key, "control_contract_sha256": digest,
             "position": position, "source": _queue_item(source, position), "packet_sha256": source["packet_sha256"],
             "raw_text_sha256": metadata["text_sha256"], "compact_text_sha256": hashlib.sha256(compact.encode()).hexdigest(),
@@ -273,6 +324,10 @@ def terminal_batch_handle(run_key: str, digest: str, audits: object, *, control_
         result = terminal_audit_batch(semantic_sources, semantic_audits) if semantic_sources else {"terminal_items": [], "evidence_requirements": []}
     except TerminalAuditError as exc:
         raise ReviewQueueError(str(exc)) from exc
+    by_receipt = {item["rcp_no"]: item for item in [*result["terminal_items"], *automatic]}
+    expected_order = [source["rcp_no"] for source in sources]
+    if set(by_receipt) != set(expected_order) or len(by_receipt) != len(result["terminal_items"]) + len(automatic):
+        raise ReviewQueueError("terminal result receipt IDs are not the exact source set")
     return {"schema_version": "giraffe-terminal-batch-handle-v1", "run_key": run_key, "control_contract_sha256": digest,
-            "terminal_items": [*result["terminal_items"], *automatic], "evidence_requirements": result["evidence_requirements"],
-            "exact_receipt_order": [source["rcp_no"] for source in sources]}
+            "terminal_items": [by_receipt[rcp_no] for rcp_no in expected_order], "evidence_requirements": result["evidence_requirements"],
+            "exact_receipt_order": expected_order}
