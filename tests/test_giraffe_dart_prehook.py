@@ -613,7 +613,7 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(result["control_count"], 2)
         self.assertEqual(result["source_valid_count"], 2)
         self.assertEqual(result["source_error_count"], 0)
-        self.assertEqual(set(result), {"gate", "complete", "run_key", "control_contract_sha256", "control_count", "source_valid_count", "source_error_count"})
+        self.assertEqual(set(result), {"gate", "complete", "compaction_required", "run_key", "control_contract_sha256", "control_count", "source_valid_count", "source_error_count"})
 
     def test_source_failure_registers_exact_receipt_and_continues_later_dates(self):
         failed = "20260915000001"

@@ -6,17 +6,17 @@ Telegram `mac` thread `7923` only. Paper-only: `LIVE_TRADING=false`; never creat
 
 The deterministic prehook is the sole owner of the complete immutable DART control contract and raw packet custody. It registers the canonical research run before the agent starts. A successful injected `GIRAFFE_DART_GATE_V1` payload is deliberately compact: use its `run_key`, `control_contract_sha256`, `control_count`, `source_valid_count`, and `source_error_count` as an opaque review handle. Do not reconstruct a run key, submit a control contract to `scheduler-start`, infer timestamps, or inspect arbitrary files.
 
-If the gate is absent/non-JSON, `complete!=true`, or the compact counts do not add to `control_count`, do no research, web search, or storage; finish `error`. `control_contract_sha256` means canonical JSON of parsed `control_contract` (UTF-8, `ensure_ascii=False`, `sort_keys=True`, `separators=(',', ':')`), not an artifact-file hash.
+If the gate is absent/non-JSON, `complete!=true`, or the compact counts do not add to `control_count`, do no research, web search, or storage; finish `error`. `control_contract_sha256` means canonical JSON of parsed `control_contract` (UTF-8, `ensure_ascii=False`, `sort_keys=True`, `separators=(',', ':')`), not an artifact-file hash. `compaction_required=true` is an invariant: do not request raw markup unless the explicit debug fallback is available after a compaction failure.
 
 Start only with `python -m kr_stock_autotrader.cli scheduler-start "$run_key" research`. Page the bounded deterministic queue:
 
 `python -m kr_stock_autotrader.cli giraffe-review-queue "$run_key" "$control_contract_sha256" --offset 0 --limit 25`
 
-Continue until `remaining=0`; keep returned `position`/`rcp_no` order exactly. The queue is the only LLM-visible control list. A malformed queue response, identity/hash/count/order mismatch, duplicate receipt, or a missing item is whole-run fail-closed. For `source_state=source_error`, terminalize that exact receipt as `source_error`; never invent an economic decision. Open full immutable source text only when semantic review is needed:
+Continue until `remaining=0`; keep returned `position`/`rcp_no` order exactly. Or run `python -m kr_stock_autotrader.cli giraffe-review-manifest "$run_key" "$control_contract_sha256" --page-size 25` once: it materializes the complete path-free queue with deterministic page hashes and page-chain hash. The queue is the only LLM-visible control list. A malformed queue response, identity/hash/count/order mismatch, duplicate receipt, or a missing item is whole-run fail-closed. For `source_state=source_error`, terminalize that exact receipt as `source_error`; never invent an economic decision. Open compact visible source text only when semantic review is needed:
 
 `python -m kr_stock_autotrader.cli giraffe-review-packet "$run_key" "$control_contract_sha256" "$rcp_no"`
 
-That command validates packet provenance and returns the full packet and text on demand. Never treat a title-only summary as an automatic rejection: `report_class=other` needs an explicit non-supply audit, so positive buyback, clinical approval, merger, policy, or capital filings remain eligible for semantic review.
+That command binds `source.packet_sha256` to the exact packet bytes before opening it, revalidates immutable packet metadata/raw/text hashes, rejects symlinks/path escapes, and returns only loss-aware compact visible text plus provenance hashes and `compaction_completed=true`. It fails closed for malformed HTML/encoding/mojibake/empty text; raw markup is not returned by the default command. Never treat a title-only summary as an automatic rejection: `report_class=other` needs an explicit non-supply audit, so positive buyback, clinical approval, merger, policy, or capital filings remain eligible for semantic review.
 
 The prehook's `control_contract.run_key` is authoritative; `GIRAFFE_RESEARCH_RERUN_VERSION` remains prehook-only authority. 단일 `web_search` backend 오류로 lane을 즉시 닫지 않는다: use up to 최대 3회 distinct concrete queries and direct-domain follow-up.
 
@@ -26,7 +26,7 @@ Each source packet is reviewed exactly once. DART `rcept_dt`는 date-only; do no
 
 Qualifying supply evidence needs official, binding facts and source-specific publication time. In particular, a binding supply contract with contract amount, prior revenue, a 전년도 매출 대비 50% 이상 ratio, and term is not title-only-rejectable. Preserve verified facts, conditionality, economic mechanism, unknowns, counter-evidence, and packet provenance. Do not fill in values, symbols, URLs, dates, assumptions, or timing. Store only A+/A/A- events with verified original evidence, timing, symbol, and economics. Evidence add/update and detail readback remain mandatory; a successful POST alone is not success.
 
-Use the existing `dart-terminal-batch` once for the exact ordered complete source set. The application/CLI owns its closed wire shape and validates exact set, provenance, economic facts, timing, evidence IDs, and terminal semantics. Use `scheduler-finish done` only with the validated completion receipt, then exact-run `scheduler-readback`; never weaken or bypass finish/readback validation.
+Use `dart-terminal-batch-handle "$run_key" "$control_contract_sha256" "$audits_json"` once, where `audits_json` is the exact receipt→audit map (each `source_error` receipt maps to `{}`). It loads the immutable ordered control set locally, validates the exact audit map and produces terminal/evidence requirements without asking the agent to reconstruct or send sources. The compatibility `dart-terminal-batch` command remains final-API compatible but is not the operator path. Use `scheduler-finish done` only with the validated completion receipt, then exact-run `scheduler-readback`; never weaken or bypass finish/readback validation.
 
 ## Independent coverage lanes
 

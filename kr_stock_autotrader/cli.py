@@ -27,14 +27,22 @@ def main(argv=None):
     a=s.add_parser('dart-terminal-plan');a.add_argument('json')
     a=s.add_parser('dart-terminal-batch');a.add_argument('json')
     a=s.add_parser('giraffe-review-queue');a.add_argument('run_key');a.add_argument('control_contract_sha256');a.add_argument('--offset',type=int,default=0);a.add_argument('--limit',type=int,default=25)
+    a=s.add_parser('giraffe-review-manifest');a.add_argument('run_key');a.add_argument('control_contract_sha256');a.add_argument('--page-size',type=int,default=25)
     a=s.add_parser('giraffe-review-packet');a.add_argument('run_key');a.add_argument('control_contract_sha256');a.add_argument('rcp_no')
+    a=s.add_parser('dart-terminal-batch-handle');a.add_argument('run_key');a.add_argument('control_contract_sha256');a.add_argument('audits_json')
     x=p.parse_args(argv)
     if x.cmd=='giraffe-review-queue':
         from kr_stock_autotrader.giraffe_review_queue import compact_review_queue
         out=compact_review_queue(x.run_key,x.control_contract_sha256,offset=x.offset,limit=x.limit)
+    elif x.cmd=='giraffe-review-manifest':
+        from kr_stock_autotrader.giraffe_review_queue import compact_review_manifest
+        out=compact_review_manifest(x.run_key,x.control_contract_sha256,page_size=x.page_size)
     elif x.cmd=='giraffe-review-packet':
         from kr_stock_autotrader.giraffe_review_queue import open_review_packet
         out=open_review_packet(x.run_key,x.control_contract_sha256,x.rcp_no)
+    elif x.cmd=='dart-terminal-batch-handle':
+        from kr_stock_autotrader.giraffe_review_queue import terminal_batch_handle
+        out=terminal_batch_handle(x.run_key,x.control_contract_sha256,json.loads(x.audits_json))
     elif x.cmd=='dart-terminal-plan':
         from kr_stock_autotrader.giraffe_terminal_audit import terminal_audit_plan
         payload=json.loads(x.json); out=terminal_audit_plan(payload.get('source'),payload.get('audit'))
