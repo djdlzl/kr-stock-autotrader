@@ -5,6 +5,11 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import os
+import shutil
+import stat
+import tempfile
+import uuid
 import re
 import time
 import urllib.error
@@ -23,8 +28,11 @@ except ModuleNotFoundError:  # Direct script execution from the scripts director
 USER_AGENT = "Mozilla/5.0 (compatible; Giraffe-DART-Source/1.0)"
 DART_HOST = "dart.fss.or.kr"
 VIEWER_PATH = "/report/viewer.do"
-TREE_NODE_RE = re.compile(r"var\s+node1\s*=\s*\{\s*\};(?P<body>.*?)treeData\.push\(node1\)\s*;", re.I | re.S)
-TREE_FIELD_RE = re.compile(r"node1\[\s*['\"](?P<name>[A-Za-z0-9_]+)['\"]\s*\]\s*=\s*['\"](?P<value>[^'\"]*)['\"]", re.I)
+TREE_AUTHORITY_RE = re.compile(r"\btreeData\b|\.jstree\s*\(|(?:\.\s*rcpNo|\[\s*['\"]rcpNo['\"]\s*\])\s*=", re.I)
+TREE_EVENT_RE = re.compile(
+    r"(?:var|let|const)\s+(?P<declare>[A-Za-z_$][\w$]*)\s*=\s*\{\s*\}\s*;"
+    r"|(?P<variable>[A-Za-z_$][\w$]*)(?:\[\s*['\"](?P<bracket>\w+)['\"]\s*\]|\.(?P<dot>\w+))\s*=\s*(?P<value>[^;]*);"
+    r"|treeData\s*\.\s*push\s*\(\s*(?P<push>[A-Za-z_$][\w$]*)\s*\)\s*;", re.S)
 VIEWDOC_RE = re.compile(r"viewDoc\(\s*['\"](?P<rcp>\d{14})['\"]\s*,\s*['\"](?P<dcm>\d+)['\"]\s*,\s*['\"](?P<ele>[^'\"]*)['\"]\s*,\s*['\"](?P<offset>[^'\"]*)['\"]\s*,\s*['\"](?P<length>[^'\"]*)['\"]\s*,\s*['\"](?P<dtd>[^'\"]+)['\"]", re.I)
 META_CHARSET_RE = re.compile(r"<meta[^>]+charset\s*=\s*['\"]?\s*([\w.-]+)", re.I)
 META_HTTP_EQUIV_RE = re.compile(r"<meta[^>]+content\s*=\s*['\"][^'\"]*charset\s*=\s*([\w.-]+)", re.I)
@@ -125,16 +133,36 @@ def strict_decode(raw: bytes, content_type: str | None) -> tuple[str, str]:
 def declared_viewer_sections(main_html: str, rcp_no: str) -> list[dict[str, str]]:
     """Use the declared jsTree order, not eleId arithmetic or a 404 sentinel."""
     tree_nodes = []
-    for node in TREE_NODE_RE.finditer(main_html):
-        fields = {item.group("name"): item.group("value") for item in TREE_FIELD_RE.finditer(node.group("body"))}
-        if fields.get("rcpNo") == rcp_no:
-            required = ("rcpNo", "dcmNo", "eleId", "offset", "length", "dtd", "tocNo", "atocId")
-            if any(not fields.get(key) for key in required):
-                raise SourceError("SOURCE_EXTRACT_ERROR", "malformed declared tree section")
-            tree_nodes.append(fields)
-    # Fixtures and older main pages without a declared tree retain the direct
-    # viewDoc extraction path; production tree declarations are authoritative.
-    if tree_nodes:
+    if TREE_AUTHORITY_RE.search(main_html):
+        for initializer in re.finditer(r"\btreeData\s*=\s*([^;]*);", main_html):
+            if not re.fullmatch(r"\s*(?:\[\s*\]|new\s+Array\s*\(\s*\))\s*", initializer.group(1)):
+                raise SourceError("SOURCE_EXTRACT_ERROR", "unparseable authoritative tree initializer")
+        variables = {}
+        pending_nodes = set()
+        required = ("rcpNo", "dcmNo", "eleId", "offset", "length", "dtd", "tocNo", "atocId")
+        pushes = 0
+        for event in TREE_EVENT_RE.finditer(main_html):
+            if event.group("declare"):
+                if event.group("declare") in pending_nodes:
+                    raise SourceError("SOURCE_EXTRACT_ERROR", "overwritten unpushed tree section")
+                variables[event.group("declare")] = {}
+            elif event.group("push"):
+                pushes += 1
+                fields = variables.get(event.group("push"), {})
+                if any(not fields.get(key) for key in required) or fields["rcpNo"] != rcp_no:
+                    raise SourceError("SOURCE_EXTRACT_ERROR", "malformed declared tree section")
+                tree_nodes.append(dict(fields))
+                pending_nodes.discard(event.group("push"))
+            elif event.group("variable") in variables:
+                key = event.group("bracket") or event.group("dot")
+                value = event.group("value").strip()
+                if key in required:
+                    if len(value) < 2 or value[0] not in "\"'" or value[-1] != value[0] or "\\" in value[1:-1] or value[0] in value[1:-1]:
+                        raise SourceError("SOURCE_EXTRACT_ERROR", "unparseable declared tree field")
+                    variables[event.group("variable")][key] = html.unescape(value[1:-1])
+                    pending_nodes.add(event.group("variable"))
+        if pending_nodes or not tree_nodes or pushes != len(re.findall(r"treeData\s*\.\s*push\s*\(", main_html)):
+            raise SourceError("SOURCE_EXTRACT_ERROR", "unparseable authoritative tree")
         candidates = tree_nodes
     else:
         candidates = [{"rcpNo": m.group("rcp"), "dcmNo": m.group("dcm"), "eleId": m.group("ele"), "offset": m.group("offset"), "length": m.group("length"), "dtd": m.group("dtd"), "tocNo": "", "atocId": ""} for m in VIEWDOC_RE.finditer(main_html) if m.group("rcp") == rcp_no]
@@ -280,11 +308,26 @@ def _source_packet(rcp_no: str, fetch: Callable[[str], tuple]) -> dict:
 
 def write_packet(packet: dict, directory: Path) -> Path:
     """Publish v3 packet only after every section has been captured in staging."""
+    missing_directories = []
+    ancestor = directory
+    while not ancestor.exists():
+        missing_directories.append(ancestor)
+        ancestor = ancestor.parent
     directory.mkdir(parents=True, exist_ok=True)
-    directory = directory.resolve()
+    for created in reversed(missing_directories):
+        _fsync_directory(created.parent)
     if directory.is_symlink() or packet.get("schema_version") != "giraffe-dart-source-packet-v3":
         raise SourceError("SOURCE_FETCH_ERROR", "invalid v3 packet publication")
+    directory = directory.resolve()
+    if not re.fullmatch(r"\d{8}", directory.name):
+        raise SourceError("SOURCE_FETCH_ERROR", "invalid control date directory")
+    control_directory = directory
+    directory = control_directory / ("v3-" + uuid.uuid4().hex)
+    if directory.exists():
+        raise FileExistsError(str(directory))
     rcp_no = packet["rcp_no"]
+    if not re.fullmatch(r"\d{14}", rcp_no):
+        raise SourceError("SOURCE_FETCH_ERROR", "invalid rcpNo")
     main_raw_path = directory / f"{rcp_no}.main.raw"
     text_path = directory / f"{rcp_no}.viewer.txt"
     meta_path = directory / f"{rcp_no}.json"
@@ -300,12 +343,109 @@ def write_packet(packet: dict, directory: Path) -> Path:
             raise SourceError("SOURCE_FETCH_ERROR", "incomplete section capture")
         staged.extend(((raw_path, section["_raw"]), (section_text_path, section["_text"].encode("utf-8"))))
         public_sections.append({k:v for k,v in section.items() if not k.startswith("_")} | {"raw_path": str(raw_path), "text_path": str(section_text_path)})
-    for path, content in staged:
-        if not isinstance(content, bytes): raise SourceError("SOURCE_FETCH_ERROR", "missing raw response bytes")
-        temp = path.with_suffix(path.suffix + ".tmp"); temp.write_bytes(content); temp.replace(path)
     metadata = {k:v for k,v in packet.items() if k not in {"text", "_main_raw", "_sections", "sections"}} | {"sections": public_sections, "text_path":str(text_path), "main_raw_path":str(main_raw_path)}
-    temp = meta_path.with_suffix(".json.tmp"); temp.write_text(json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8"); temp.replace(meta_path)
+    staged.append((meta_path, (json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")))
+    staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=control_directory))
+    try:
+        for path, content in staged:
+            if not isinstance(content, bytes):
+                raise SourceError("SOURCE_FETCH_ERROR", "missing raw response bytes")
+            with (staging / path.name).open("xb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        _fsync_directory(staging)
+        # Published generations are nonempty, so rename cannot replace one even
+        # when another publisher wins the same generation id concurrently.
+        if directory.exists():
+            raise FileExistsError(str(directory))
+        os.rename(staging, directory)
+        _fsync_directory(control_directory)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    if completed_packet(meta_path, rcp_no, expected_control_date=control_directory.name) is None:
+        raise SourceError("SOURCE_FETCH_ERROR", "published generation failed readback")
     return meta_path
+
+
+def _fsync_directory(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def packet_control_directory(path: Path) -> Path:
+    parent = path.parent
+    return parent.parent if re.fullmatch(r"v3-[0-9a-f]{32}", parent.name) else parent
+
+
+class RetainedPacketSnapshot:
+    """Pin directory descriptors and retain each regular file exactly once."""
+    def __init__(self, path: Path, *, trusted_root: Path | None = None):
+        self.path = Path(os.path.abspath(path))
+        self.root = Path(trusted_root).resolve(strict=True) if trusted_root is not None else Path(self.path.anchor)
+        self._fds = []
+        self._files = {}
+        self._directories = []
+
+    @staticmethod
+    def _identity(info):
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def __enter__(self):
+        try:
+            relative = self.path.relative_to(self.root)
+            fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            self._fds.append(fd)
+            for part in relative.parts[:-1]:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                self._fds.append(child)
+                self._directories.append((fd, part, child, self._identity(os.fstat(child))))
+                fd = child
+            self._directory_fd = fd
+            self.packet_bytes = self.read_sibling(self.path)
+            return self
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+
+    def read_sibling(self, path: Path) -> bytes:
+        path = Path(path)
+        if path.parent != self.path.parent or path.name in {".", ".."}:
+            raise ValueError("packet sibling outside retained generation")
+        if path.name in self._files:
+            return self._files[path.name][2]
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self._directory_fd)
+        self._fds.append(fd)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("packet sibling is not regular")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk: break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        identity = self._identity(before)
+        if identity != self._identity(os.fstat(fd)):
+            raise ValueError("packet sibling drift")
+        self._files[path.name] = (fd, identity, data)
+        return data
+
+    def verify(self):
+        for parent, name, fd, identity in self._directories:
+            if identity != self._identity(os.fstat(fd)) or identity != self._identity(os.stat(name, dir_fd=parent, follow_symlinks=False)):
+                raise ValueError("packet generation drift")
+        for name, (fd, identity, _) in self._files.items():
+            if identity != self._identity(os.fstat(fd)) or identity != self._identity(os.stat(name, dir_fd=self._directory_fd, follow_symlinks=False)):
+                raise ValueError("packet sibling drift")
+
+    def __exit__(self, *_):
+        for fd in reversed(self._fds): os.close(fd)
+        self._fds.clear()
 
 
 def _capture_time_is_fresh(value: object, now: datetime) -> bool:
@@ -323,13 +463,18 @@ def _capture_time_is_fresh(value: object, now: datetime) -> bool:
     return -MAX_FUTURE_CAPTURE_SKEW <= age <= MAX_CAPTURE_AGE
 
 
-def completed_packet(path: Path, rcp_no: str, *, expected_control_date: str | None = None, now: datetime | None = None) -> dict | None:
+def completed_packet_snapshot(path: Path, rcp_no: str, packet_bytes: bytes, read_sibling: Callable[[Path], bytes], *, expected_control_date: str | None = None, now: datetime | None = None) -> dict | None:
     """Resume only a fully revalidated v3 packet; every declared section is bound."""
     try:
-        if (not re.fullmatch(r"\d{14}", rcp_no) or path.is_symlink() or path.name != f"{rcp_no}.json"
-                or path.parent.is_symlink() or not re.fullmatch(r"\d{8}", path.parent.name)
-                or (expected_control_date is not None and (not re.fullmatch(r"\d{8}", expected_control_date) or path.parent.name != expected_control_date))): return None
-        directory = path.parent.resolve(strict=True); metadata = json.loads(path.read_text(encoding="utf-8"))
+        control = packet_control_directory(path)
+        if (not re.fullmatch(r"\d{14}", rcp_no) or path.name != f"{rcp_no}.json"
+                or not re.fullmatch(r"\d{8}", control.name)
+                or (expected_control_date is not None and control.name != expected_control_date)): return None
+        directory = path.parent
+        metadata = json.loads(packet_bytes)
+        if isinstance(metadata, dict) and metadata.get("schema_version") == "giraffe-dart-source-packet-v2":
+            return _completed_v2(path, rcp_no, packet_bytes, read_sibling, expected_control_date=expected_control_date, now=now)
+        if not re.fullmatch(r"v3-[0-9a-f]{32}", directory.name): return None
         required = {"schema_version", "rcp_no", "source_date", "main_url", "main_final_url", "main_content_type", "main_charset", "main_response_headers", "main_response_status", "main_raw_sha256", "main_raw_bytes", "sections", "retrieved_at_kst", "text_sha256", "text_chars", "visible_chars", "source_valid", "text_path", "main_raw_path"}
         legacy = {"canonical_viewer_url", "final_url", "content_type", "response_headers", "response_status", "charset", "raw_sha256", "raw_bytes"}
         if (not isinstance(metadata, dict) or set(metadata) != required and set(metadata) != required | legacy
@@ -339,8 +484,7 @@ def completed_packet(path: Path, rcp_no: str, *, expected_control_date: str | No
                 or metadata.get("main_final_url") != metadata.get("main_url") or not _capture_time_is_fresh(metadata.get("retrieved_at_kst"), now or datetime.now(KST))): return None
         main_raw_path, text_path = directory / f"{rcp_no}.main.raw", directory / f"{rcp_no}.viewer.txt"
         if metadata.get("main_raw_path") != str(main_raw_path) or metadata.get("text_path") != str(text_path): return None
-        main_raw, text_bytes = main_raw_path.read_bytes(), text_path.read_bytes()
-        if any(item.is_symlink() or item.resolve(strict=True).parent != directory for item in (main_raw_path, text_path)): return None
+        main_raw, text_bytes = read_sibling(main_raw_path), read_sibling(text_path)
         if hashlib.sha256(main_raw).hexdigest() != metadata["main_raw_sha256"] or len(main_raw) != metadata["main_raw_bytes"] or hashlib.sha256(text_bytes).hexdigest() != metadata["text_sha256"]: return None
         main_text, main_charset = strict_decode(main_raw, metadata.get("main_content_type"))
         declared = declared_viewer_sections(main_text, rcp_no); sections = metadata.get("sections")
@@ -353,10 +497,10 @@ def completed_packet(path: Path, rcp_no: str, *, expected_control_date: str | No
             if (set(section) != required_section or any(section.get(key) != value for key, value in decl.items()) or section.get("position") != position
                     or section.get("raw_path") != str(raw_path) or section.get("text_path") != str(section_text_path)
                     ): return None
-            if any(item.is_symlink() or item.resolve(strict=True).parent != directory for item in (raw_path, section_text_path)): return None
-            raw, section_text_bytes = raw_path.read_bytes(), section_text_path.read_bytes(); document = section_text_bytes.decode("utf-8")
+            raw, section_text_bytes = read_sibling(raw_path), read_sibling(section_text_path); document = section_text_bytes.decode("utf-8")
             if (hashlib.sha256(raw).hexdigest() != section["raw_sha256"] or len(raw) != section["raw_bytes"] or hashlib.sha256(section_text_bytes).hexdigest() != section["text_sha256"]): return None
-            charset = strict_decode(raw, section.get("content_type"))[1]
+            decoded, charset = strict_decode(raw, section.get("content_type"))
+            if decoded != document: return None
             visible = validate_viewer(document, decl["canonical_viewer_url"], section.get("final_url"), rcp_no)
             if (charset != section["charset"] or len(document) != section["text_chars"] or len(visible) != section["visible_chars"] or section.get("response_status") != 200 or not _valid_provenance_headers(section.get("response_headers"), section.get("content_type"), len(raw))): return None
             documents.append(document); visibles.append(visible)
@@ -365,6 +509,55 @@ def completed_packet(path: Path, rcp_no: str, *, expected_control_date: str | No
         if text != combined or len(text) != metadata["text_chars"] or len(" ".join(visibles)) != metadata["visible_chars"] or main_charset != metadata["main_charset"] or metadata.get("main_response_status") != 200 or not _valid_provenance_headers(metadata.get("main_response_headers"), metadata.get("main_content_type"), len(main_raw)): return None
         return metadata
     except (OSError, KeyError, TypeError, ValueError, UnicodeDecodeError, SourceError, json.JSONDecodeError): return None
+
+
+def _completed_v2(path: Path, rcp_no: str, packet_bytes: bytes, read_sibling: Callable[[Path], bytes], *, expected_control_date: str | None = None, now: datetime | None = None) -> dict | None:
+    """Resume only a raw-revalidated packet in its declared control-date directory."""
+    try:
+        if not re.fullmatch(r"\d{8}", path.parent.name): return None
+        directory = path.parent
+        metadata = json.loads(packet_bytes)
+        raw_path, text_path, main_raw_path = (directory / f"{rcp_no}.viewer.raw", directory / f"{rcp_no}.viewer.txt", directory / f"{rcp_no}.main.raw")
+        required = {"schema_version", "rcp_no", "source_date", "main_url", "main_final_url", "main_content_type", "main_charset", "main_response_headers", "main_response_status", "main_raw_sha256", "main_raw_bytes", "canonical_viewer_url", "final_url", "content_type", "response_headers", "response_status", "retrieved_at_kst", "charset", "raw_sha256", "raw_bytes", "text_sha256", "text_chars", "visible_chars", "source_valid", "raw_path", "text_path", "main_raw_path"}
+        if (not isinstance(metadata, dict) or set(metadata) != required or metadata.get("schema_version") != "giraffe-dart-source-packet-v2" or metadata.get("rcp_no") != rcp_no
+                or metadata.get("source_date") != rcp_no[:8] or metadata.get("source_valid") is not True
+                or metadata.get("raw_path") != str(raw_path) or metadata.get("text_path") != str(text_path) or metadata.get("main_raw_path") != str(main_raw_path)
+                or metadata.get("main_url") != "https://dart.fss.or.kr/dsaf001/main.do?" + urllib.parse.urlencode({"rcpNo": rcp_no})
+                or metadata.get("main_final_url") != metadata.get("main_url")
+                or not _capture_time_is_fresh(metadata.get("retrieved_at_kst"), now or datetime.now(KST))): return None
+        # Preserve the exact decoded representation. Path.read_text() enables
+        # universal-newline translation, which changes authoritative CRLF
+        # source text and makes every valid Windows-newline checkpoint miss.
+        raw = read_sibling(raw_path); text = read_sibling(text_path).decode("utf-8"); main_raw = read_sibling(main_raw_path)
+        if (hashlib.sha256(raw).hexdigest() != metadata["raw_sha256"] or len(raw) != metadata["raw_bytes"] or hashlib.sha256(text.encode("utf-8")).hexdigest() != metadata["text_sha256"]
+                or hashlib.sha256(main_raw).hexdigest() != metadata["main_raw_sha256"] or len(main_raw) != metadata["main_raw_bytes"]): return None
+        main_type = metadata.get("main_content_type")
+        viewer_type = metadata.get("content_type")
+        if (not isinstance(main_type, (str, type(None))) or not isinstance(viewer_type, (str, type(None)))
+                or not _valid_provenance_headers(metadata.get("main_response_headers"), main_type, len(main_raw))
+                or not _valid_provenance_headers(metadata.get("response_headers"), viewer_type, len(raw))): return None
+        main_text, main_charset = strict_decode(main_raw, main_type)
+        document, charset = strict_decode(raw, viewer_type)
+        match = next((m for m in VIEWDOC_RE.finditer(main_text) if m.group("rcp") == rcp_no), None)
+        if match is None: return None
+        canonical = "https://" + DART_HOST + VIEWER_PATH + "?" + urllib.parse.urlencode({"rcpNo": rcp_no, "dcmNo": match.group("dcm"), "eleId": match.group("ele"), "offset": match.group("offset"), "length": match.group("length"), "dtd": match.group("dtd")})
+        visible = validate_viewer(document, canonical, metadata["final_url"], rcp_no)
+        if (metadata.get("main_charset") != main_charset or metadata.get("charset") != charset or metadata.get("canonical_viewer_url") != canonical
+                or document != text or len(document) != metadata["text_chars"] or len(visible) != metadata["visible_chars"]
+                or metadata.get("main_response_status") != 200 or metadata.get("response_status") != 200): return None
+        return metadata
+    except (OSError, KeyError, TypeError, ValueError, SourceError, json.JSONDecodeError):
+        return None
+
+
+def completed_packet(path: Path, rcp_no: str, *, expected_control_date: str | None = None, now: datetime | None = None, trusted_root: Path | None = None) -> dict | None:
+    try:
+        with RetainedPacketSnapshot(path, trusted_root=trusted_root) as snapshot:
+            metadata = completed_packet_snapshot(snapshot.path, rcp_no, snapshot.packet_bytes, snapshot.read_sibling, expected_control_date=expected_control_date, now=now)
+            snapshot.verify()
+            return metadata
+    except (OSError, ValueError):
+        return None
 
 
 def fetch_with_retry(rcp_no: str, retries: int = 4, fetch: Callable[[str], tuple] = _fetch, *,

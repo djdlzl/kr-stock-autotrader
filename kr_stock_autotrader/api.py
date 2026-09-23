@@ -495,6 +495,20 @@ def _research_packet_root() -> Path:
     return Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets"
 
 
+def _valid_research_packet_path(value: object, control_date: object, rcp_no: object) -> bool:
+    """Admit immutable historical packets and closed v3 generation identities."""
+    if not isinstance(value, str) or not isinstance(control_date, str) or not isinstance(rcp_no, str):
+        return False
+    if not re.fullmatch(r"\d{8}", control_date) or not re.fullmatch(r"\d{14}", rcp_no):
+        return False
+    base = _research_packet_root() / control_date
+    if value == str(base / (rcp_no + ".json")):
+        return True
+    path = Path(value)
+    return (re.fullmatch(r"v3-[0-9a-f]{32}", path.parent.name) is not None
+            and value == str(base / path.parent.name / (rcp_no + ".json")))
+
+
 def _backlog_identity(kind: str, identity: str) -> str:
     return f"{kind}:{identity}"
 
@@ -617,6 +631,26 @@ def _terminal_dart_matches_source(terminal: object, source: object) -> bool:
     return terminal_fields == _DART_CORE_PROVENANCE_FIELDS | {'report_class', 'report_name'} and terminal == source
 
 
+def _correction_dart_matches_source(prior: object, source: object) -> bool:
+    """New correction generations keep receipt identity and immutable prior lineage."""
+    if _terminal_dart_matches_source(prior, source):
+        return True
+    if not isinstance(prior, dict) or not isinstance(source, dict):
+        return False
+    classified = _DART_CORE_PROVENANCE_FIELDS | {'report_class', 'report_name'}
+    if set(prior) not in (_DART_CORE_PROVENANCE_FIELDS, classified) or set(source) != classified:
+        return False
+    if any(prior.get(field) != source.get(field) for field in ('rcp_no', 'date', 'receipt_source_date')):
+        return False
+    if set(prior) == classified and any(prior[field] != source[field] for field in ('report_class', 'report_name')):
+        return False
+    if (not _valid_research_packet_path(source.get('packet_path'), source.get('date'), source.get('rcp_no'))
+            or not _valid_research_packet_path(prior.get('packet_path'), prior.get('date'), prior.get('rcp_no'))):
+        return False
+    return (source['packet_path'] != prior['packet_path']
+            and re.fullmatch(r'v3-[0-9a-f]{32}', Path(source['packet_path']).parent.name) is not None)
+
+
 def _research_commitment(run_key: str, contract: object) -> dict:
     """Validate the deterministic prehook contract before it becomes immutable state."""
     if not isinstance(contract, dict): raise HTTPException(422, "research control commitment required")
@@ -703,7 +737,7 @@ def _research_commitment(run_key: str, contract: object) -> dict:
                             or source.get('report_class') not in {'dart_single_sale_supply_contract', 'other'}
                             or source['report_class'] != _authoritative_report_class(source['report_name'])
                         ))): raise
-                if source['packet_path'] != str(_research_packet_root() / source['date'] / (source['rcp_no'] + '.json')):
+                if not _valid_research_packet_path(source['packet_path'], source['date'], source['rcp_no']):
                     raise HTTPException(422, 'invalid research packet path')
                 if source["date"] not in contract["dates"] and source["rcp_no"] not in carried_dart: raise
                 if source['rcp_no'] in carried_dart and not (_carried_dart_matches_source(carried_dart[source['rcp_no']], source, v3=v3)
@@ -717,7 +751,6 @@ def _research_commitment(run_key: str, contract: object) -> dict:
     from .krx_calendar import CalendarError, admitted_backlog_dates
     try: expected_dates = admitted_backlog_dates(run_date)
     except CalendarError as exc: raise HTTPException(422, "KRX calendar admission failed") from exc
-    packet_root = _research_packet_root()
     if (not isinstance(expected, list) or expected != sorted(expected) or len(expected) != len(set(expected))
             or any(not isinstance(rcp, str) or not re.fullmatch(r"\d{14}", rcp) for rcp in expected)
             or contract["control_count"] != len(expected) or contract["source_valid"] is not True
@@ -728,11 +761,10 @@ def _research_commitment(run_key: str, contract: object) -> dict:
         rcp_no = source.get("rcp_no") if isinstance(source, dict) else None
         control_date = source.get("date") if isinstance(source, dict) else None
         receipt_source_date = source.get("receipt_source_date") if isinstance(source, dict) else None
-        expected_packet_path = str(packet_root / control_date / f"{rcp_no}.json") if (isinstance(rcp_no, str) and re.fullmatch(r"\d{14}", rcp_no) and isinstance(control_date, str)) else None
         if (not isinstance(source, dict) or set(source) != {"rcp_no", "date", "receipt_source_date", "packet_path", "packet_sha256"}
                 or rcp_no not in expected or not isinstance(control_date, str) or control_date not in expected_dates
                 or receipt_source_date != rcp_no[:8]
-                or source.get("packet_path") != expected_packet_path or not isinstance(source.get("packet_sha256"), str)
+                or not _valid_research_packet_path(source.get("packet_path"), control_date, rcp_no) or not isinstance(source.get("packet_sha256"), str)
                 or not re.fullmatch(r"[0-9a-f]{64}", source["packet_sha256"])):
             raise HTTPException(422, "invalid research source commitment")
         source_ids.append(rcp_no)
@@ -896,7 +928,7 @@ def _terminal_dart_history(db, contract: dict) -> dict[str, dict]:
         raise HTTPException(422, 'terminal DART history is not canonical')
     sources = {source['rcp_no']: source for source in contract['sources']}
     if (any(rcp in sources for rcp in excluded)
-            or any(rcp not in sources or not _terminal_dart_matches_source(history[rcp]['payload'], sources[rcp]) for rcp in corrected)):
+            or any(rcp not in sources or not _correction_dart_matches_source(history[rcp]['payload'], sources[rcp]) for rcp in corrected)):
         raise HTTPException(422, 'terminal DART history does not match control sources')
     for rcp in corrected:
         prior = history[rcp]

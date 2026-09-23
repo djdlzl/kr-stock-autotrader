@@ -576,6 +576,26 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         with self.assertRaisesRegex(self.gate.ManifestError, "durable research backlog item invalid"):
             self.gate.control_contract("research-2026-09-16-0700-kst", [], [row, dict(row)])
 
+    def test_contract_binds_generation_without_reopening_validated_packet(self):
+        receipt, date = "20260923000258", "20260923"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            historical = root / date / (receipt + ".json")
+            historical.parent.mkdir()
+            historical.write_bytes(b"immutable historical v2")
+            shared = historical.with_suffix(".viewer.txt")
+            shared.write_bytes(b"historical body")
+            packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), root / date)
+            self.assertRegex(packet.parent.name, r"^v3-[0-9a-f]{32}$")
+            raw = packet.read_bytes()
+            summary = [{"date": date, "material_candidate_records": [{"rcp_no": receipt, "rcept_dt": date}], "source_packet_paths": [str(packet)]}]
+            with patch.object(pathlib.Path, "read_bytes", side_effect=AssertionError("must use retained bytes")):
+                contract = self.gate.control_contract("research-2026-09-23-0700-kst", summary)
+            self.assertEqual(contract["sources"][0]["packet_path"], str(packet))
+            self.assertEqual(contract["sources"][0]["packet_sha256"], hashlib.sha256(raw).hexdigest())
+            self.assertEqual(historical.read_bytes(), b"immutable historical v2")
+            self.assertEqual(shared.read_bytes(), b"historical body")
+
     def test_gate_reuses_correction_checkpoint_in_control_directory_without_refetch(self):
         receipt, control_date = "20260914000432", "20260915"
         def fake_collect(date):
@@ -590,6 +610,59 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(result["control_count"], 1)
         self.assertEqual(result["source_valid_count"], 1)
         self.assertNotIn("control_contract", result)
+
+    def test_selected_correction_upgrades_v2_and_pending_retry_keeps_generation(self):
+        receipt, date = "20260916900230", "20260917"
+        manifest = {"declared_total": 1, "declared_pages": 1, "pages_collected": 1, "page_counts": [1],
+                    "unique_receipts": 1, "material_candidate_count": 1, "complete": True,
+                    "material_candidate_records": [{"rcp_no": receipt, "rcept_dt": date, "report_nm": "단일판매ㆍ공급계약체결"}]}
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp).resolve(); directory = root / "sources" / date; directory.mkdir(parents=True)
+            packet = valid_source_packet(self.gate, receipt)
+            metadata = {key: value for key, value in packet.items() if not key.startswith('_') and key not in {'text', 'sections'}}
+            metadata['schema_version'] = 'giraffe-dart-source-packet-v2'
+            for field, suffix, content in [('raw_path', 'viewer.raw', packet['_sections'][0]['_raw']), ('text_path', 'viewer.txt', packet['text'].encode()), ('main_raw_path', 'main.raw', packet['_main_raw'])]:
+                path = directory / (receipt + '.' + suffix); path.write_bytes(content); metadata[field] = str(path)
+            historical = directory / (receipt + '.json'); historical.write_text(json.dumps(metadata))
+            before = {path: path.read_bytes() for path in directory.iterdir()}
+            prior = {"rcp_no": receipt, "date": date, "receipt_source_date": receipt[:8],
+                     "packet_path": str(historical), "packet_sha256": hashlib.sha256(historical.read_bytes()).hexdigest()}
+            history = [{"identity": "dart:" + receipt, "kind": "dart", "payload": prior,
+                        "terminal_disposition": "rejected", "terminal_run_key": "research-2026-09-16-0700-kst-r2",
+                        "terminal_evidence_id": None, "terminal_at": "2026-09-16T07:00:00+09:00"}]
+            with patch.object(self.gate, "OUTPUT_ROOT", root / "manifests"), patch.object(self.gate, "SOURCE_ROOT", root / "sources"), patch.object(self.gate, "CONTROL_ROOT", root / "controls"), patch.object(self.gate, "target_dates", return_value=[date]), patch.object(self.gate, "check_card_prompt"), patch.object(self.gate, "collect_manifest", return_value=manifest), patch.object(self.gate, "fetch_with_retry", return_value=valid_source_packet(self.gate, receipt)) as fetch, patch.object(self.gate, "fetch_research_backlog", return_value=([], [])) as backlog, patch.object(self.gate, "fetch_terminal_history", return_value=history), patch.object(self.gate, "register_research_run") as register, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.gate.main(['--rerun-version', '3', '--correction-rcp-no', receipt]), 0)
+                fetch.assert_called_once_with(receipt)
+                contract = register.call_args.args[1]; current = contract['sources'][0]
+                self.assertRegex(pathlib.Path(current['packet_path']).parent.name, r'^v3-[0-9a-f]{32}$')
+                self.assertNotEqual(current['packet_path'], prior['packet_path'])
+                self.assertEqual(contract['correction_of'], history)
+                identity = 'dart:correction:' + hashlib.sha256(self.gate.canonical_bytes({'source': current, 'prior': history[0]})).hexdigest()
+                backlog.return_value = ([{'identity': identity, 'kind': 'dart', 'payload': current}], [])
+                fetch.reset_mock(); fetch.side_effect = AssertionError('pending correction must preserve exact generation')
+                self.assertEqual(self.gate.main(['--rerun-version', '4']), 0)
+                self.assertEqual(register.call_args.args[1]['sources'][0], current)
+                fetch.assert_not_called()
+            self.assertTrue(all(path.read_bytes() == content for path, content in before.items()))
+
+    def test_gate_preserves_bound_carried_generation_over_other_valid_generations(self):
+        receipt, date = "20260915000001", "20260915"
+        manifest = {"declared_total": 1, "declared_pages": 1, "pages_collected": 1, "page_counts": [1],
+                    "unique_receipts": 1, "material_candidate_count": 1, "complete": True,
+                    "material_candidate_records": [{"rcp_no": receipt, "rcept_dt": date}]}
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            first = self.gate.write_packet(valid_source_packet(self.gate, receipt), root / "sources" / date)
+            second = self.gate.write_packet(valid_source_packet(self.gate, receipt), root / "sources" / date)
+            bound = max(first, second)
+            payload = {"rcp_no": receipt, "date": date, "receipt_source_date": date,
+                       "packet_path": str(bound), "packet_sha256": hashlib.sha256(bound.read_bytes()).hexdigest()}
+            backlog = [{"identity": "dart:" + receipt, "kind": "dart", "payload": payload}]
+            with patch.object(self.gate, "OUTPUT_ROOT", root / "manifests"), patch.object(self.gate, "SOURCE_ROOT", root / "sources"), patch.object(self.gate, "CONTROL_ROOT", root / "controls"), patch.object(self.gate, "target_dates", return_value=[date]), patch.object(self.gate, "check_card_prompt"), patch.object(self.gate, "collect_manifest", return_value=manifest), patch.object(self.gate, "fetch_with_retry", side_effect=AssertionError("preserve carried packet")), patch.object(self.gate, "fetch_research_backlog", return_value=backlog), patch.object(self.gate, "register_research_run") as register, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.gate.main(), 0)
+            contract = register.call_args.args[1]
+            self.assertEqual(contract["sources"][0], payload)
+            self.assertEqual(contract["carry_forward"], backlog)
 
     def test_gate_emits_giraffe_contract_for_previous_and_current_dates(self):
         def fake_collect(date):
@@ -666,9 +739,20 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                 result = json.loads((root / 'controls' / 'research-2026-09-18-0700-kst-r2.json').read_text(encoding='utf-8'))
                 self.assertEqual(result['expected_rcp_nos'], [rcp])
                 self.assertEqual(result['sources'][0]['date'], '20260915')
-                self.assertEqual(result['sources'][0]['packet_path'], str(root / 'sources' / '20260915' / (rcp + '.json')))
+                self.assertEqual(pathlib.Path(result['sources'][0]['packet_path']).parent.parent, (root / 'sources' / '20260915').resolve())
+                self.assertRegex(pathlib.Path(result['sources'][0]['packet_path']).parent.name, r'^v3-[0-9a-f]{32}$')
                 self.assertNotIn('source_error_code', result['sources'][0])
                 self.assertEqual(result['carry_forward'][0]['payload'], failed)
+
+    def test_carried_packet_digest_drift_fails_closed(self):
+        receipt, date = "20260915000002", "20260915"
+        with tempfile.TemporaryDirectory() as temp:
+            packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), pathlib.Path(temp) / date)
+            source = {"rcp_no": receipt, "date": date, "receipt_source_date": date,
+                      "packet_path": str(packet), "packet_sha256": "0" * 64}
+            with self.assertRaisesRegex(self.gate.ManifestError, "backlog packet unavailable"):
+                self.gate.control_contract("research-2026-09-18-0700-kst", [],
+                    [{"identity": "dart:" + receipt, "kind": "dart", "payload": source}])
 
     def test_carried_packet_outside_current_window_preserves_classification(self):
         rcp = '20260915000002'

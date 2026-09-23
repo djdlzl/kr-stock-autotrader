@@ -6,21 +6,16 @@ import json
 import os
 import re
 import stat
-from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
 from scripts.giraffe_dart_source import (
-    KST,
     SourceError,
-    _capture_time_is_fresh,
-    _valid_provenance_headers,
-    canonical_viewer_url,
-    completed_packet,
-    strict_decode,
-    validate_viewer,
+    RetainedPacketSnapshot,
+    completed_packet_snapshot,
 )
+
 
 CONTROL_ROOT = Path(os.environ.get("GIRAFFE_DART_CONTROL_ROOT", str(Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-control-contracts")))
 SOURCE_ROOT = Path(os.environ.get("GIRAFFE_DART_SOURCE_ROOT", str(Path.home() / ".hermes" / "runs" / "giraffe-7923" / "dart-source-packets")))
@@ -236,24 +231,6 @@ def _packet_artifacts(source: dict[str, Any], source_root: Path) -> tuple[Path, 
     return packet, source_root
 
 
-def _completed_packet_snapshot(packet_bytes: bytes, rcp_no: str, expected_control_date: str, packet: Path, root: Path) -> tuple[dict[str, Any], bytes]:
-    """Revalidate the retained v3 aggregate and every source-bound section."""
-    try:
-        if json.loads(packet_bytes.decode("utf-8", "strict")).get("schema_version") != "giraffe-dart-source-packet-v3":
-            raise ReviewQueueError("immutable source packet failed provenance validation")
-        metadata = completed_packet(packet, rcp_no, expected_control_date=expected_control_date)
-        if metadata is None:
-            raise ReviewQueueError("immutable source packet failed provenance validation")
-        text_path = packet.parent / f"{rcp_no}.viewer.txt"
-        text_bytes = _read_regular(text_path, root)
-        if hashlib.sha256(text_bytes).hexdigest() != metadata["text_sha256"]:
-            raise ReviewQueueError("immutable source packet failed provenance validation")
-        return metadata, text_bytes
-    except (OSError, KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError, SourceError) as exc:
-        if isinstance(exc, ReviewQueueError): raise
-        raise ReviewQueueError("immutable source packet failed provenance validation") from exc
-
-
 def open_review_packet(run_key: str, digest: str, rcp_no: str, *, control_root: Path = CONTROL_ROOT, source_root: Path = SOURCE_ROOT) -> dict[str, object]:
     if not isinstance(rcp_no, str) or not _RECEIPT.fullmatch(rcp_no):
         raise ReviewQueueError("invalid review receipt")
@@ -263,10 +240,23 @@ def open_review_packet(run_key: str, digest: str, rcp_no: str, *, control_root: 
     position, source = matches[0]
     if "packet_path" not in source: raise ReviewQueueError("source-error receipt has no readable packet")
     root = _root(source_root); packet, _ = _packet_artifacts(source, root)
-    packet_bytes = _read_regular(packet, root)
-    if hashlib.sha256(packet_bytes).hexdigest() != source["packet_sha256"]:
-        raise ReviewQueueError("source packet artifact hash mismatch")
-    metadata, text_bytes = _completed_packet_snapshot(packet_bytes, rcp_no, source["date"], packet, root)
+    try:
+        with RetainedPacketSnapshot(packet, trusted_root=root) as snapshot:
+            packet_bytes = snapshot.packet_bytes
+            if hashlib.sha256(packet_bytes).hexdigest() != source["packet_sha256"]:
+                raise ReviewQueueError("source packet artifact hash mismatch")
+            metadata = completed_packet_snapshot(
+                packet, rcp_no, packet_bytes, snapshot.read_sibling,
+                expected_control_date=source["date"],
+            )
+            if metadata is None:
+                raise ReviewQueueError("immutable source packet failed provenance validation")
+            text_bytes = snapshot.read_sibling(Path(metadata["text_path"]))
+            snapshot.verify()
+    except (OSError, SourceError, ValueError) as exc:
+        if isinstance(exc, ReviewQueueError):
+            raise
+        raise ReviewQueueError("immutable source packet failed provenance validation") from exc
     compact = compact_visible_text(text_bytes.decode("utf-8", "strict"))
     return {"schema_version": "giraffe-compact-review-packet-v2", "run_key": run_key, "control_contract_sha256": digest,
             "position": position, "source": _queue_item(source, position), "packet_sha256": source["packet_sha256"],

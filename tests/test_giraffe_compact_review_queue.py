@@ -61,7 +61,7 @@ def test_packet_and_text_symlink_and_escape_are_rejected(tmp_path):
     with pytest.raises(queue.ReviewQueueError): queue.open_review_packet(value["run_key"], digest, source["rcp_no"], control_root=root, source_root=source_root)
     # Restore a trusted packet, then attack a sibling opened from its snapshot.
     Path(source["packet_path"]).unlink(); Path(source["packet_path"]).write_bytes(outside.read_bytes())
-    text = source_root / "20260923" / "20260923000001.viewer.txt"
+    text = Path(source["packet_path"]).with_name("20260923000001.viewer.txt")
     text.unlink(); text.symlink_to(outside)
     with pytest.raises(queue.ReviewQueueError): queue.open_review_packet(value["run_key"], digest, source["rcp_no"], control_root=root, source_root=source_root)
 
@@ -82,22 +82,60 @@ def test_full_packet_returns_compact_text_with_hashes_and_completion(tmp_path):
     assert result["compact_text_sha256"] == hashlib.sha256(result["text"].encode()).hexdigest() and "packet_path" not in json.dumps(result)
 
 
-def test_packet_replacement_race_cannot_mix_old_packet_with_replacement_artifacts(tmp_path, monkeypatch):
-    root, value, digest, source_root = contract(tmp_path); source = value["sources"][0]
-    original = queue._read_regular
+def test_whole_generation_replacement_after_packet_read_rejects_or_returns_only_a(tmp_path, monkeypatch):
+    root, value, digest, source_root = contract(tmp_path)
+    bound = value["sources"][0]
+    packet_a = Path(bound["packet_path"])
+    original = valid_packet(bound["rcp_no"])
+    replacement = source_packet(bound["rcp_no"], lambda url: (
+        original["_main_raw"] if "main.do" in url else
+        b"<html><meta charset='utf-8'><body>generation B replacement disclosure with different economics</body></html>",
+        "text/html; charset=utf-8", url))
+    packet_b = write_packet(replacement, tmp_path / "replacement" / "20260923")
+    # Make B internally valid at A's location before the controlled directory swap.
+    packet_b.write_text(packet_b.read_text().replace(str(packet_b.parent), str(packet_a.parent)))
+    inode = os.stat(packet_a).st_ino
+    read = os.read
     swapped = False
-    def racing_read(path, trusted_root):
+
+    def racing_read(fd, size):
         nonlocal swapped
-        data = original(path, trusted_root)
-        if path == Path(source["packet_path"]) and not swapped:
+        data = read(fd, size)
+        if data and os.fstat(fd).st_ino == inode and not swapped:
             swapped = True
-            replacement = valid_packet(source["rcp_no"])
-            replacement["text"] = "<html><meta charset='utf-8'><body>replacement attacker text</body></html>"
-            write_packet(replacement, path.parent)
+            packet_a.parent.rename(tmp_path / "displaced-generation-a")
+            packet_b.parent.rename(packet_a.parent)
         return data
-    monkeypatch.setattr(queue, "_read_regular", racing_read)
-    with pytest.raises(queue.ReviewQueueError, match="provenance"):
-        queue.open_review_packet(value["run_key"], digest, source["rcp_no"], control_root=root, source_root=source_root)
+
+    monkeypatch.setattr(os, "read", racing_read)
+    try:
+        result = queue.open_review_packet(value["run_key"], digest, bound["rcp_no"], control_root=root, source_root=source_root)
+    except queue.ReviewQueueError:
+        pass
+    else:
+        assert result["text"] == "valid DART disclosure source body for control test\n"
+        assert result["packet_sha256"] == bound["packet_sha256"]
+    assert swapped
+
+
+def test_review_opens_each_generation_artifact_exactly_once(tmp_path, monkeypatch):
+    root, value, digest, source_root = contract(tmp_path)
+    bound = value["sources"][0]
+    directory = Path(bound["packet_path"]).parent
+    artifact_inodes = {os.stat(p).st_ino for p in directory.iterdir() if p.is_file()}
+    counts = {}
+    original = os.open
+
+    def counted_open(*args, **kwargs):
+        fd = original(*args, **kwargs)
+        inode = os.fstat(fd).st_ino
+        if inode in artifact_inodes:
+            counts[inode] = counts.get(inode, 0) + 1
+        return fd
+
+    monkeypatch.setattr(os, "open", counted_open)
+    queue.open_review_packet(value["run_key"], digest, bound["rcp_no"], control_root=root, source_root=source_root)
+    assert counts == dict.fromkeys(artifact_inodes, 1)
 
 
 def test_handle_batch_loads_exact_contract_and_does_not_accept_source_reconstruction(tmp_path):
@@ -159,3 +197,20 @@ def test_cli_manifest_represents_complete_path_free_control(tmp_path):
     completed = subprocess.run([sys.executable, "-m", "kr_stock_autotrader.cli", "giraffe-review-manifest", value["run_key"], digest, "--page-size", "1"], env=env, text=True, capture_output=True, check=True)
     result = json.loads(completed.stdout)
     assert result["page_count"] == 2 and "packet_path" not in completed.stdout
+
+
+def test_measurement_handles_generations_across_control_dates(tmp_path):
+    root, value, _, source_root = contract(tmp_path)
+    receipt = "20260922000001"
+    packet = write_packet(valid_packet(receipt), source_root / "20260922")
+    value["dates"].insert(0, "20260922")
+    value["sources"].insert(0, {**value["sources"][0], "rcp_no": receipt,
+        "date": "20260922", "receipt_source_date": "20260922", "packet_path": str(packet),
+        "packet_sha256": hashlib.sha256(packet.read_bytes()).hexdigest()})
+    value["expected_rcp_nos"].insert(0, receipt)
+    value["control_count"] += 1
+    path = root / (value["run_key"] + ".json")
+    path.write_bytes(queue.canonical_bytes(value) + b"\n")
+    output = subprocess.run([sys.executable, "scripts/giraffe_token_surface_measure.py", str(path)],
+        cwd=Path(__file__).parents[1], text=True, capture_output=True, check=True)
+    assert json.loads(output.stdout)["packet_count"] == 2

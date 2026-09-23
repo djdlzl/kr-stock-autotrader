@@ -162,6 +162,7 @@ def test_checkpoint_rejects_cross_directory_symlink_and_corrupt_siblings(tmp_pat
     packet = source.source_packet(rcp, fetch_from({"main.do": (main_page(rcp), "text/html; charset=utf-8", "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + rcp), "viewer.do": (b"<html><meta charset='utf-8'><body>valid document body with enough content</body></html>", "text/html; charset=utf-8", "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML")}))
     packet_dir = tmp_path / rcp[:8]
     checkpoint = source.write_packet(packet, packet_dir)
+    packet_dir = checkpoint.parent
     assert source.completed_packet(checkpoint, rcp) is not None
     copied = tmp_path / "other" / f"{rcp}.json"; copied.parent.mkdir(); copied.write_bytes(checkpoint.read_bytes())
     assert source.completed_packet(copied, rcp) is None
@@ -193,6 +194,7 @@ def test_checkpoint_rederives_semantics_and_rejects_resealed_tampering(tmp_path)
         "viewer.do": (b"<html><meta charset='utf-8'><body>valid document body with enough content</body></html>", "text/html; charset=utf-8", "https://dart.fss.or.kr/report/viewer.do?rcpNo=" + rcp + "&dcmNo=11577485&eleId=0&offset=0&length=0&dtd=HTML", {"content-type": "text/html; charset=utf-8"}, 200),
     }))
     packet_dir = tmp_path / rcp[:8]; checkpoint = source.write_packet(packet, packet_dir)
+    packet_dir = checkpoint.parent
     def reseal(change):
         metadata = json.loads(checkpoint.read_text()); change(metadata)
         checkpoint.write_text(json.dumps(metadata), encoding="utf-8")
@@ -233,7 +235,7 @@ def test_checkpoint_resume_preserves_authoritative_crlf_text(tmp_path):
     resumed = source.completed_packet(checkpoint, rcp)
 
     assert resumed is not None
-    assert (tmp_path / rcp[:8] / f"{rcp}.viewer.txt").read_bytes().decode("utf-8") == packet["text"]
+    assert (checkpoint.parent / f"{rcp}.viewer.txt").read_bytes().decode("utf-8") == packet["text"]
 
 
 def test_checkpoint_freshness_has_deterministic_kst_bounds(tmp_path):
@@ -380,3 +382,169 @@ def test_default_pacing_is_shared_between_packet_calls(monkeypatch):
     source.fetch_with_retry("20260911800823", fetch=fetch, pacer=pacing)
     assert requests == [0.0, 1.0, 2.0, 3.0]
     assert clock.sleeps == [1.0, 1.0, 1.0]
+
+
+def synthetic_packet():
+    def fetch(url):
+        return (main_page() if 'main.do' in url else b'<body>complete substantive disclosure source body</body>'), 'text/html; charset=utf-8', url
+    return source.source_packet('20260911800823', fetch)
+
+
+def test_v3_generations_preserve_history_and_retry(tmp_path):
+    directory = tmp_path / '20260911'; directory.mkdir()
+    history = {name: b'historical immutable receipt' for name in ('20260911800823.json', '20260911800823.viewer.txt', '20260911800823.main.raw')}
+    for name, content in history.items(): (directory / name).write_bytes(content)
+    first = source.write_packet(synthetic_packet(), directory)
+    before = {p: p.read_bytes() for p in first.parent.iterdir()}
+    second = source.write_packet(synthetic_packet(), directory)
+    assert first.parent != second.parent and first.parent.name.startswith('v3-')
+    assert all(p.read_bytes() == content for p, content in before.items())
+    assert all((directory / name).read_bytes() == content for name, content in history.items())
+
+
+def test_interrupted_publish_leaves_no_visible_partial_generation(tmp_path, monkeypatch):
+    directory = tmp_path / '20260911'
+    def interrupt(*args): raise OSError('interrupted publish')
+    with monkeypatch.context() as patch:
+        patch.setattr(source.os, 'rename', interrupt)
+        with pytest.raises(OSError, match='interrupted'): source.write_packet(synthetic_packet(), directory)
+    assert not list(directory.glob('v3-*'))
+    assert source.completed_packet(source.write_packet(synthetic_packet(), directory), '20260911800823')
+
+
+def test_generation_collision_never_overwrites_published_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(source.uuid, 'uuid4', lambda: type('Id', (), {'hex': 'a' * 32})())
+    first = source.write_packet(synthetic_packet(), tmp_path / '20260911')
+    before = {p: p.read_bytes() for p in first.parent.iterdir()}
+    with pytest.raises((FileExistsError, source.SourceError)):
+        source.write_packet(synthetic_packet(), tmp_path / '20260911')
+    assert all(p.read_bytes() == content for p, content in before.items())
+
+
+def test_arbitrary_tree_variable_names_and_push_order():
+    fields = {'rcpNo': '20260911800823', 'dcmNo': '123', 'offset': '0', 'length': '10', 'dtd': 'HTML', 'tocNo': '1', 'atocId': '1'}
+    chunks = []
+    for name, ele in [('node2', '8'), ('section17', '2')]:
+        chunks.append(f'var {name} = {{}};' + ''.join(f'{name}.{key} = "{value}";' for key, value in (fields | {'eleId': ele}).items()))
+    sections = source.declared_viewer_sections(''.join(chunks) + 'treeData.push(section17); treeData.push(node2);', fields['rcpNo'])
+    assert [s['ele_id'] for s in sections] == ['2', '8']
+
+
+@pytest.mark.parametrize('tree', ['var treeData = [BROKEN];', 'var node2 = {}; node2["rcpNo"] = "20260911800823"; treeData.push(node2);', 'treeData.push(unknown);', '$().jstree({data: BROKEN});'])
+def test_malformed_authoritative_tree_never_uses_decoy(tree):
+    with pytest.raises(source.SourceError, match='tree'):
+        source.declared_viewer_sections(tree + main_page().decode(), '20260911800823')
+
+
+def test_snapshot_retains_each_file_once_and_rejects_symlinks_and_drift(tmp_path, monkeypatch):
+    path = source.write_packet(synthetic_packet(), tmp_path / '20260911')
+    opened = []
+    original = source.os.open
+    def record(name, flags, *args, **kwargs):
+        opened.append(str(name))
+        return original(name, flags, *args, **kwargs)
+    monkeypatch.setattr(source.os, 'open', record)
+    with source.RetainedPacketSnapshot(path, trusted_root=tmp_path) as snapshot:
+        metadata = source.completed_packet_snapshot(path, '20260911800823', snapshot.packet_bytes, snapshot.read_sibling)
+        assert metadata
+        text_path = pathlib.Path(metadata['text_path'])
+        assert snapshot.read_sibling(text_path) == synthetic_packet()['text'].encode()
+        assert opened.count(text_path.name) == 1
+        text_path.write_bytes(b'replaced')
+        with pytest.raises(ValueError, match='drift'): snapshot.verify()
+    text_path.unlink(); text_path.symlink_to(path)
+    assert source.completed_packet(path, '20260911800823', trusted_root=tmp_path) is None
+
+
+def test_v2_historical_first_section_stays_readable(tmp_path):
+    packet = synthetic_packet()
+    rcp = packet['rcp_no']; directory = tmp_path / rcp[:8]; directory.mkdir()
+    metadata = {k:v for k,v in packet.items() if not k.startswith('_') and k not in {'text', 'sections'}}
+    metadata['schema_version'] = 'giraffe-dart-source-packet-v2'
+    for field, suffix, content in [('raw_path', 'viewer.raw', packet['_sections'][0]['_raw']), ('text_path', 'viewer.txt', packet['text'].encode()), ('main_raw_path', 'main.raw', packet['_main_raw'])]:
+        target = directory / f'{rcp}.{suffix}'; target.write_bytes(content); metadata[field] = str(target)
+    path = directory / f'{rcp}.json'; path.write_text(json.dumps(metadata))
+    before = {p: p.read_bytes() for p in directory.iterdir()}
+    assert source.completed_packet(path, rcp)
+    source.write_packet(synthetic_packet(), directory)
+    assert source.completed_packet(path, rcp)
+    assert all(p.read_bytes() == data for p, data in before.items())
+
+
+def test_interruption_during_stage_file_fsync_never_publishes(tmp_path, monkeypatch):
+    directory = tmp_path / '20260911'
+    def fail(_fd): raise OSError('fsync interrupted')
+    with monkeypatch.context() as patch:
+        patch.setattr(source.os, 'fsync', fail)
+        with pytest.raises(OSError, match='fsync interrupted'):
+            source.write_packet(synthetic_packet(), directory)
+    assert list(directory.iterdir()) == []
+    assert source.completed_packet(source.write_packet(synthetic_packet(), directory), '20260911800823')
+
+
+def test_malformed_tree_initializer_rejected_even_with_valid_push():
+    rcp = '20260911800823'
+    fields = {'rcpNo': rcp, 'dcmNo': '123', 'eleId': '1', 'offset': '0', 'length': '10', 'dtd': 'HTML', 'tocNo': '1', 'atocId': '1'}
+    tree = 'var treeData = [BROKEN]; var node2 = {};' + ''.join(f'node2.{key} = "{value}";' for key, value in fields.items()) + 'treeData.push(node2);'
+    with pytest.raises(source.SourceError, match='tree'):
+        source.declared_viewer_sections(tree, rcp)
+
+
+def test_snapshot_rederives_section_text_from_retained_raw(tmp_path):
+    path = source.write_packet(synthetic_packet(), tmp_path / '20260911')
+    metadata = json.loads(path.read_bytes())
+    section = metadata['sections'][0]
+    forged = '<body>forged substituted text with sufficient body</body>'
+    forged_bytes = forged.encode()
+    digest = source.hashlib.sha256(forged_bytes).hexdigest()
+    pathlib.Path(section['text_path']).write_bytes(forged_bytes)
+    pathlib.Path(metadata['text_path']).write_bytes(forged_bytes)
+    for target in (metadata, section):
+        target.update(text_sha256=digest, text_chars=len(forged), visible_chars=len('forged substituted text with sufficient body'))
+    path.write_text(json.dumps(metadata))
+    assert source.completed_packet(path, '20260911800823') is None
+
+
+def test_truncated_node_declaration_without_push_never_falls_back():
+    tree = 'var node2 = {}; node2["rcpNo"] = "20260911800823";'
+    with pytest.raises(source.SourceError, match='tree'):
+        source.declared_viewer_sections(tree + main_page().decode(), '20260911800823')
+
+
+@pytest.mark.parametrize('truncated', ['var node2 = {}; node2.rcpNo = "20260911800823";', 'var node1 = {}; node1.rcpNo = "20260911800823"; var node1 = {};'])
+def test_valid_tree_prefix_cannot_hide_unpushed_receipt_node(truncated):
+    fields = {'rcpNo': '20260911800823', 'dcmNo': '123', 'eleId': '1', 'offset': '0', 'length': '10', 'dtd': 'HTML', 'tocNo': '1', 'atocId': '1'}
+    valid = 'var node1 = {};' + ''.join(f'node1.{key} = "{value}";' for key, value in fields.items()) + 'treeData.push(node1);'
+    with pytest.raises(source.SourceError, match='tree'):
+        source.declared_viewer_sections(valid + truncated + main_page().decode(), fields['rcpNo'])
+
+
+def test_new_control_directory_is_fsynced_in_parent(tmp_path, monkeypatch):
+    synced = []
+    original = source._fsync_directory
+    def record(path):
+        synced.append(path)
+        original(path)
+    monkeypatch.setattr(source, '_fsync_directory', record)
+    source.write_packet(synthetic_packet(), tmp_path / '20260911')
+    assert tmp_path in synced
+
+
+def test_interruption_after_rename_retains_complete_generation_on_retry(tmp_path, monkeypatch):
+    directory = tmp_path / '20260911'; directory.mkdir()
+    original = source._fsync_directory
+    def interrupt_after_rename(path):
+        if path == directory:
+            raise OSError('post rename interrupted')
+        original(path)
+    with monkeypatch.context() as patch:
+        patch.setattr(source, '_fsync_directory', interrupt_after_rename)
+        with pytest.raises(OSError, match='post rename interrupted'):
+            source.write_packet(synthetic_packet(), directory)
+    first, = directory.glob('v3-*/20260911800823.json')
+    assert source.completed_packet(first, '20260911800823')
+    before = {p: p.read_bytes() for p in first.parent.iterdir()}
+    second = source.write_packet(synthetic_packet(), directory)
+    assert second.parent != first.parent
+    assert all(p.read_bytes() == data for p, data in before.items())
+    assert source.completed_packet(second, '20260911800823')

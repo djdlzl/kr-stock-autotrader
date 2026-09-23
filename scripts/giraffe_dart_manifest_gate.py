@@ -20,7 +20,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(SCRIPT_DIR.parent))
 from giraffe_dart_manifest import ManifestError, collect_manifest  # noqa: E402
-from giraffe_dart_source import SourceError, completed_packet, fetch_with_retry, write_packet  # noqa: E402
+from giraffe_dart_source import SourceError, RetainedPacketSnapshot, completed_packet_snapshot, fetch_with_retry, write_packet  # noqa: E402
 from kr_stock_autotrader.dart_report_classification import authoritative_report_class  # noqa: E402
 from kr_stock_autotrader.giraffe_review_queue import compact_gate_payload  # noqa: E402
 from kr_stock_autotrader.krx_calendar import CalendarError, admitted_backlog_dates  # noqa: E402
@@ -40,6 +40,31 @@ def check_card_prompt() -> None:
         raise ManifestError("08 prompt unavailable") from exc
     if actual != CARD_PROMPT_SHA256:
         raise ManifestError("08 prompt integrity mismatch")
+
+
+def validated_packet(path: Path, rcp_no: str, control_date: str):
+    """Return metadata and digest of one retained, verified generation."""
+    try:
+        root = path.parent.parent if re.fullmatch(r"v3-[0-9a-f]{32}", path.parent.name) else path.parent
+        if root.name != control_date:
+            return None
+        with RetainedPacketSnapshot(path, trusted_root=root) as snapshot:
+            metadata = completed_packet_snapshot(path, rcp_no, snapshot.packet_bytes,
+                                                 snapshot.read_sibling, expected_control_date=control_date)
+            if metadata is None:
+                return None
+            snapshot.verify()
+            return metadata, hashlib.sha256(snapshot.packet_bytes).hexdigest()
+    except (OSError, ValueError, SourceError):
+        return None
+
+
+def generation_checkpoint(directory: Path, rcp_no: str) -> Path | None:
+    """Reuse a complete published generation; never rewrite canonical v2 history."""
+    for path in sorted(directory.resolve().glob("v3-*/" + rcp_no + ".json")):
+        if re.fullmatch(r"v3-[0-9a-f]{32}", path.parent.name) and validated_packet(path, rcp_no, directory.name):
+            return path
+    return None
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -230,6 +255,30 @@ def terminal_dart_matches_current(terminal: object, current: object) -> bool:
             and same_dart_core_provenance(terminal, current))
 
 
+def correction_dart_matches_current(prior: object, current: object) -> bool:
+    """Allow an explicit correction to bind a new generation of the same receipt."""
+    if terminal_dart_matches_current(prior, current):
+        return True
+    if not isinstance(prior, dict) or not isinstance(current, dict):
+        return False
+    classified = _DART_CORE_PROVENANCE_FIELDS | {'report_class', 'report_name'}
+    if set(prior) not in (_DART_CORE_PROVENANCE_FIELDS, classified) or set(current) != classified:
+        return False
+    if any(prior.get(field) != current.get(field) for field in ('rcp_no', 'date', 'receipt_source_date')):
+        return False
+    if set(prior) == classified and any(prior[field] != current[field] for field in ('report_class', 'report_name')):
+        return False
+    if not isinstance(current.get('packet_path'), str) or not isinstance(prior.get('packet_path'), str):
+        return False
+    path, prior_path = Path(current['packet_path']), Path(prior['packet_path'])
+    if (not re.fullmatch(r'v3-[0-9a-f]{32}', path.parent.name)
+            or path.parent.parent.name != current['date'] or path.name != current['rcp_no'] + '.json'
+            or path == prior_path or '..' in path.parts):
+        return False
+    validated = validated_packet(prior_path, prior['rcp_no'], prior['date'])
+    return validated is not None and validated[1] == prior['packet_sha256']
+
+
 def normalize_durable_dart_backlog_payload(payload: object, current: object) -> dict | None:
     """Read legacy classified rows only when their immutable metadata matches current authority."""
     if not isinstance(payload, dict):
@@ -279,24 +328,24 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
             if path_identity in packet_paths:
                 raise ManifestError("duplicate DART source packet path")
             packet_paths.add(path_identity)
-            if path.parent.name != control_date:
+            if path.parent.name != control_date and not (re.fullmatch(r"v3-[0-9a-f]{32}", path.parent.name) and path.parent.parent.name == control_date):
                 raise ManifestError("DART source packet path does not bind to the control date")
             rcp_no = path.stem
             if rcp_no in packet_receipts:
                 raise ManifestError("duplicate DART source packet receipt")
             packet_receipts.add(rcp_no)
-            metadata = completed_packet(path, rcp_no, expected_control_date=control_date)
-            if metadata is None:
+            validated = validated_packet(path, rcp_no, control_date)
+            if validated is None:
                 raise ManifestError("DART source packet is incomplete or invalid")
+            metadata, packet_hash = validated
             source_date = metadata.get("source_date")
             if source_date != rcp_no[:8]:
                 raise ManifestError("DART source packet date does not match the control window")
             if rcp_no not in candidate_metadata:
                 raise ManifestError("DART candidate/packet receipt sets do not match")
-            raw = path.read_bytes()
             report_class, report_name = candidate_metadata[rcp_no]
             source = {"rcp_no": rcp_no, "date": control_date, "packet_path": packet_path,
-                      "packet_sha256": hashlib.sha256(raw).hexdigest(), "receipt_source_date": source_date}
+                      "packet_sha256": packet_hash, "receipt_source_date": source_date}
             if report_class != 'legacy_unclassified':
                 source.update({"report_class": report_class, "report_name": report_name})
             sources.append(source)
@@ -335,10 +384,11 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
                 if identity != 'dart:' + payload['rcp_no'] or (current is not None and not same_failed_dart_identity(payload, current)):
                     raise ManifestError('conflicting current and carried DART provenance')
                 if current is None:
-                    checkpoint = SOURCE_ROOT / payload['date'] / (payload['rcp_no'] + '.json')
-                    if completed_packet(checkpoint, payload['rcp_no'], expected_control_date=payload['date']) is not None:
+                    checkpoint = generation_checkpoint(SOURCE_ROOT / payload['date'], payload['rcp_no'])
+                    validated = validated_packet(checkpoint, payload['rcp_no'], payload['date']) if checkpoint else None
+                    if validated is not None:
                         current = {key: value for key, value in payload.items() if key != 'source_error_code'}
-                        current.update(packet_path=str(checkpoint), packet_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest())
+                        current.update(packet_path=str(checkpoint), packet_sha256=validated[1])
                     else:
                         current = dict(payload)
                         if payload['rcp_no'] in retry_failures:
@@ -352,14 +402,14 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
             normalized_payload = normalize_durable_dart_backlog_payload(payload, current)
             if normalized_payload is None:
                 raise ManifestError("durable DART backlog source invalid")
-            metadata = completed_packet(Path(normalized_payload["packet_path"]), normalized_payload["rcp_no"], expected_control_date=normalized_payload["date"])
+            if current is not None and not same_dart_core_provenance(current, normalized_payload):
+                raise ManifestError("conflicting current and carried DART provenance")
+            validated = validated_packet(Path(normalized_payload["packet_path"]), normalized_payload["rcp_no"], normalized_payload["date"])
             is_correction = re.fullmatch(r'dart:correction:[0-9a-f]{64}', identity) is not None
-            if metadata is None or (identity != "dart:" + normalized_payload["rcp_no"] and not is_correction):
+            if validated is None or validated[1] != normalized_payload["packet_sha256"] or (identity != "dart:" + normalized_payload["rcp_no"] and not is_correction):
                 raise ManifestError("durable DART backlog packet unavailable")
             if is_correction:
                 carried_corrections[normalized_payload['rcp_no']] = identity
-            if current is not None and not same_dart_core_provenance(current, normalized_payload):
-                raise ManifestError("conflicting current and carried DART provenance")
             if current is None:
                 sources_by_receipt[normalized_payload["rcp_no"]] = dict(payload)
             carry_items.append({"identity": identity, "kind": "dart", "payload": normalized_payload})
@@ -418,9 +468,10 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
         expected_identity = 'dart:correction:' + hashlib.sha256(canonical_bytes({'source': sources_by_receipt[rcp], 'prior': terminal_by_receipt[rcp]})).hexdigest()
         if identity != expected_identity:
             raise ManifestError('carried correction identity conflicts with original lineage')
-    for item in [*exclusions, *corrections]:
-        if not terminal_dart_matches_current(item["payload"], sources_by_receipt[item["payload"]["rcp_no"]]):
-            raise ManifestError("terminal research history conflicts with current DART provenance")
+    for items, matches in ((exclusions, terminal_dart_matches_current), (corrections, correction_dart_matches_current)):
+        for item in items:
+            if not matches(item["payload"], sources_by_receipt[item["payload"]["rcp_no"]]):
+                raise ManifestError("terminal research history conflicts with current DART provenance")
     for item in exclusions:
         del sources_by_receipt[item["payload"]["rcp_no"]]
     sources = list(sources_by_receipt.values())
@@ -537,9 +588,26 @@ def main(argv: list[str] | None = None) -> int:
         dates = target_dates()
         record_recovery_invocation(dates)
         check_card_prompt()
+        backlog = fetch_research_backlog()
+        carry_forward = backlog[0] if isinstance(backlog, tuple) else backlog
+        carried_sources = {item['payload']['rcp_no']: item['payload'] for item in carry_forward
+                           if item.get('kind') == 'dart' and isinstance(item.get('payload'), dict)
+                           and 'packet_path' in item['payload']}
+        terminal_history = []
+        terminal_lookups = set()
         summaries = []
         for date in dates:
             manifest = collect_manifest(date)
+            receipts = sorted(record['rcp_no'] for record in manifest['material_candidate_records'])
+            if isinstance(backlog, tuple) and receipts:
+                history = fetch_terminal_history(receipts)
+                terminal_history.extend(history)
+                terminal_lookups.update(receipts)
+                for item in history:
+                    payload = item.get('payload', {})
+                    if (item.get('identity') == 'dart:' + payload.get('rcp_no', '') and 'packet_path' in payload
+                            and payload['rcp_no'] not in selected_corrections):
+                        carried_sources.setdefault(payload['rcp_no'], payload)
             output = OUTPUT_ROOT / f"{date}.json"
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -549,9 +617,16 @@ def main(argv: list[str] | None = None) -> int:
             for candidate in manifest["material_candidate_records"]:
                 rcp_no = candidate["rcp_no"]
                 try:
-                    checkpoint = packet_dir / f"{rcp_no}.json"
-                    if completed_packet(checkpoint, rcp_no, expected_control_date=date) is None:
-                        write_packet(fetch_with_retry(rcp_no), packet_dir)
+                    carried = carried_sources.get(rcp_no)
+                    if carried:
+                        checkpoint = Path(carried['packet_path'])
+                        validated = validated_packet(checkpoint, rcp_no, date)
+                        if validated is None or validated[1] != carried['packet_sha256']:
+                            raise ManifestError("durable DART backlog packet unavailable")
+                    else:
+                        checkpoint = generation_checkpoint(packet_dir, rcp_no)
+                        if checkpoint is None:
+                            checkpoint = write_packet(fetch_with_retry(rcp_no), packet_dir)
                     source_packets.append(str(checkpoint))
                 except SourceError as exc:
                     source_errors.append({"rcp_no": rcp_no, "code": exc.code if exc.code in _SOURCE_ERROR_CODES else 'SOURCE_FETCH_ERROR'})
@@ -582,18 +657,16 @@ def main(argv: list[str] | None = None) -> int:
     today = summaries[-1]["date"]
     run_key = research_run_key(today, rerun)
     try:
-        backlog = fetch_research_backlog()
-        carry_forward = backlog[0] if isinstance(backlog, tuple) else backlog
         retry_failures = {}
         current_receipts = sorted(record['rcp_no'] for summary in summaries for record in summary['material_candidate_records'])
         for item in carry_forward:
             payload = item.get('payload') if isinstance(item, dict) else None
             if item.get('kind') != 'dart' or not failed_dart_source(payload) or payload['rcp_no'] in current_receipts:
                 continue
-            checkpoint = SOURCE_ROOT / payload['date'] / (payload['rcp_no'] + '.json')
-            if completed_packet(checkpoint, payload['rcp_no'], expected_control_date=payload['date']) is None:
+            packet_dir = SOURCE_ROOT / payload['date']
+            if generation_checkpoint(packet_dir, payload['rcp_no']) is None:
                 try:
-                    write_packet(fetch_with_retry(payload['rcp_no']), checkpoint.parent)
+                    write_packet(fetch_with_retry(payload['rcp_no']), packet_dir)
                 except SourceError as exc:
                     # The carried immutable failure remains pending; this run
                     # must still report source_error for the exact receipt.
@@ -601,7 +674,9 @@ def main(argv: list[str] | None = None) -> int:
         history_receipts = sorted(set(current_receipts) | {item['payload']['rcp_no'] for item in carry_forward
                                   if isinstance(item, dict) and str(item.get('identity', '')).startswith('dart:correction:')
                                   and isinstance(item.get('payload'), dict) and isinstance(item['payload'].get('rcp_no'), str)})
-        terminal_history = fetch_terminal_history(history_receipts) if isinstance(backlog, tuple) and history_receipts else []
+        remaining_history = sorted(set(history_receipts) - terminal_lookups)
+        if isinstance(backlog, tuple) and remaining_history:
+            terminal_history.extend(fetch_terminal_history(remaining_history))
     except ManifestError as exc:
         print(json.dumps({"gate": "GIRAFFE_DART_GATE_V1", "complete": False, "error": str(exc)}, ensure_ascii=False))
         return 2

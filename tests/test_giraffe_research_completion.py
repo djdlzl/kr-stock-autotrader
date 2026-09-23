@@ -936,7 +936,8 @@ def test_backlog_seed_requires_a_real_calendar_date_and_preserves_valid_reruns(m
 
 
 @__import__('pytest').mark.parametrize('retry_failure', [None, 'source_error', 'store_error'])
-def test_v3_terminal_exclusion_and_beautyskin_append_only_correction(monkeypatch, tmp_path, retry_failure):
+@__import__('pytest').mark.parametrize('new_generation', [False, True])
+def test_v3_terminal_exclusion_and_beautyskin_append_only_correction(monkeypatch, tmp_path, retry_failure, new_generation):
     """A prior rejected terminal row is excluded normally and recoverable only by a new correction cursor."""
     import kr_stock_autotrader.db as db_module
     from kr_stock_autotrader.db import connect
@@ -968,6 +969,18 @@ def test_v3_terminal_exclusion_and_beautyskin_append_only_correction(monkeypatch
     correction_key = "research-2026-09-17-0700-kst-r9"; contract, _ = commitment(correction_key, [rcp])
     contract['sources'][0].update({'report_class': 'dart_single_sale_supply_contract', 'report_name': '단일판매ㆍ공급계약체결'})
     contract.update({"schema_version": "giraffe-research-control-v3", "carry_forward": [], "terminal_exclusions": [], "correction_of": [original]})
+    if new_generation:
+        current = contract['sources'][0]
+        current['packet_path'] = str(Path(current['packet_path']).parent / ('v3-' + 'b' * 32) / (rcp + '.json'))
+        current['packet_sha256'] = 'c' * 64
+        for field, value in (('date', '20260917'), ('receipt_source_date', '20260917'),
+                             ('rcp_no', '20260916900231'), ('report_name', '주요사항보고서(유상증자결정)'),
+                             ('packet_path', current['packet_path'].replace('/v3-', '/../v3-'))):
+            bad = json.loads(json.dumps(contract)); bad['sources'][0][field] = value
+            assert client.post(f"/api/internal/research-runs/{correction_key}/register", json={"control_contract": bad}, headers=CONTROL_HEADERS).status_code == 422
+        bad = json.loads(json.dumps(contract)); bad['correction_of'][0]['payload']['packet_sha256'] = 'd' * 64
+        assert client.post(f"/api/internal/research-runs/{correction_key}/register", json={"control_contract": bad}, headers=CONTROL_HEADERS).status_code == 422
+        source = dict(current)
     assert client.post(f"/api/internal/research-runs/{correction_key}/register", json={"control_contract": contract}, headers=CONTROL_HEADERS).status_code == 200
     if retry_failure:
         failure = receipt(correction_key, hashlib.sha256(canonical(contract)).hexdigest(), [rcp],
@@ -1758,3 +1771,42 @@ def test_v3_direct_api_rejects_subthreshold_storage_and_unrouted_other():
     assert client.post(f"/api/internal/research-runs/{key}/register", headers=CONTROL_HEADERS, json={"control_contract": contract}).status_code == 200
     payload = {"status": "done", "count": 0, "detail": {"completion_receipt": receipt(key, hashlib.sha256(canonical(contract)).hexdigest(), [rcp]), "control_terminal_dispositions": [{"rcp_no": rcp, "disposition": "rejected", "evidence_id": None, "economic_disposition": "negative_risk", "economic_reason": "direct payload omits required source audit", "economic_facts": None}]}}
     assert client.post(f"/api/internal/scheduler-runs/{key}/finish", headers=HEADERS, json=payload).status_code == 422
+
+
+def test_packet_contract_accepts_generation_and_rejects_untrusted_layouts():
+    key = "research-2026-09-17-0700-kst"
+    rcp = "20260917000001"
+    contract, _ = commitment(key, [rcp])
+    historical = contract["sources"][0]["packet_path"]
+    generation = str(Path(historical).parent / ("v3-" + "a" * 32) / (rcp + ".json"))
+    contract["sources"][0]["packet_path"] = generation
+    assert api_module._research_commitment(key, contract)["control_contract"] == contract
+    classified = json.loads(json.dumps(contract))
+    classified.update(schema_version="giraffe-research-control-v3", carry_forward=[], terminal_exclusions=[], correction_of=[])
+    classified["sources"][0].update(report_class="dart_single_sale_supply_contract", report_name="단일판매ㆍ공급계약체결")
+    assert api_module._research_commitment(key, classified)["control_contract"] == classified
+    from fastapi import HTTPException
+    import pytest
+    for bad in (generation.replace("v3-", "v2-"), generation.replace("a" * 32, "a" * 31),
+                generation.replace("20260917/v3-", "20260916/v3-"),
+                generation.replace("/v3-", "/../v3-"), "/untrusted/" + Path(generation).name):
+        contract["sources"][0]["packet_path"] = bad
+        with pytest.raises(HTTPException):
+            api_module._research_commitment(key, contract)
+    contract["sources"][0]["packet_path"] = historical
+    assert api_module._research_commitment(key, contract)["control_contract"] == contract
+
+
+def test_new_correction_generation_preserves_classified_receipt_identity():
+    key, rcp = "research-2026-09-17-0700-kst", "20260917000001"
+    prior = commitment(key, [rcp])[0]['sources'][0]
+    prior.update(report_class='dart_single_sale_supply_contract', report_name='단일판매ㆍ공급계약체결')
+    current = dict(prior, packet_path=str(Path(prior['packet_path']).parent / ('v3-' + 'a' * 32) / (rcp + '.json')), packet_sha256='b' * 64)
+    assert api_module._correction_dart_matches_source(prior, current)
+    assert not api_module._terminal_dart_matches_source(prior, current)
+    assert not api_module._carried_dart_matches_source(prior, current, v3=True)
+    for change in ({'date': '20260916'}, {'receipt_source_date': '20260916'}, {'rcp_no': '20260917000002'},
+                   {'report_class': 'other', 'report_name': '주요사항보고서(유상증자결정)'},
+                   {'packet_path': current['packet_path'].replace('/v3-', '/../v3-')},
+                   {'packet_path': prior['packet_path']}):
+        assert not api_module._correction_dart_matches_source(prior, {**current, **change})

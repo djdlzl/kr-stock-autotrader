@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from scripts.giraffe_dart_source import packet_control_directory, RetainedPacketSnapshot
 from kr_stock_autotrader.giraffe_review_queue import (canonical_bytes, compact_gate_payload, compact_review_manifest, open_review_packet)
 
 
@@ -28,7 +29,8 @@ def main(argv: list[str] | None = None) -> int:
     contract = json.loads(raw_contract.decode("utf-8"))
     digest = hashlib.sha256(canonical_bytes(contract)).hexdigest()
     control_root = args.contract.parent
-    source_root = Path(contract["sources"][0]["packet_path"]).parents[1] if contract["sources"] else Path.home()
+    first_packet = next((Path(source["packet_path"]) for source in contract["sources"] if "packet_path" in source), None)
+    source_root = packet_control_directory(first_packet).parent if first_packet else Path.home()
     base_prompt = git_bytes(f"{args.base}:prompts/giraffe-material-discovery-v1.md")
     base_cron = git_bytes(f"{args.base}:ops/giraffe-cron-07-prompt.txt")
     current_prompt = (ROOT / "prompts/giraffe-material-discovery-v1.md").read_bytes()
@@ -38,8 +40,16 @@ def main(argv: list[str] | None = None) -> int:
         if "packet_path" not in source:
             continue
         packet = open_review_packet(contract["run_key"], digest, source["rcp_no"], control_root=control_root, source_root=source_root)
-        # completed packet validation inside open_review_packet has already bound this text artifact.
-        raw_texts.append(Path(source["packet_path"]).with_name(source["rcp_no"] + ".viewer.txt").read_bytes())
+        # Measurement must retain the same hash-bound generation too.
+        path = Path(source["packet_path"])
+        with RetainedPacketSnapshot(path, trusted_root=source_root) as snapshot:
+            if hashlib.sha256(snapshot.packet_bytes).hexdigest() != source["packet_sha256"]:
+                raise ValueError("measurement packet hash mismatch")
+            raw_text = snapshot.read_sibling(path.with_name(source["rcp_no"] + ".viewer.txt"))
+            if hashlib.sha256(raw_text).hexdigest() != packet["raw_text_sha256"]:
+                raise ValueError("measurement text hash mismatch")
+            snapshot.verify()
+            raw_texts.append(raw_text)
         compact_texts.append(packet["text"].encode("utf-8")); receipts.append(source["rcp_no"])
     manifest = compact_review_manifest(contract["run_key"], digest, control_root=control_root, page_size=args.page_size)
     gate = canonical_bytes(compact_gate_payload(contract["run_key"], digest, contract["control_count"], len(receipts), contract["control_count"] - len(receipts)))
