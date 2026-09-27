@@ -20,7 +20,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(SCRIPT_DIR.parent))
 from giraffe_dart_manifest import ManifestError, collect_manifest  # noqa: E402
-from giraffe_dart_source import MAX_CAPTURE_AGE, KST, SourceError, RetainedPacketSnapshot, completed_packet_snapshot, fetch_with_retry, write_packet  # noqa: E402
+from giraffe_dart_source import MAX_CAPTURE_AGE, MAX_FUTURE_CAPTURE_SKEW, KST, SourceError, RetainedPacketSnapshot, completed_packet_snapshot, fetch_with_retry, write_packet  # noqa: E402
 from kr_stock_autotrader.dart_report_classification import authoritative_report_class  # noqa: E402
 from kr_stock_autotrader.giraffe_review_queue import compact_gate_payload  # noqa: E402
 from kr_stock_autotrader.krx_calendar import CalendarError, admitted_backlog_dates  # noqa: E402
@@ -42,13 +42,48 @@ def check_card_prompt() -> None:
         raise ManifestError("08 prompt integrity mismatch")
 
 
-def validated_packet(path: Path, rcp_no: str, control_date: str):
-    """Return metadata and digest of one retained, verified generation."""
+def _trusted_source_packet_path(path: Path, rcp_no: str, control_date: str) -> tuple[Path, Path] | None:
+    """Accept only a direct v2 child or v3 generation below configured source root."""
     try:
-        path = path.resolve(strict=True)
-        root = path.parent.parent if re.fullmatch(r"v3-[0-9a-f]{32}", path.parent.name) else path.parent
-        if root.name != control_date:
+        configured_root = (SOURCE_ROOT / control_date).resolve(strict=True)
+        trusted_root = configured_root
+        candidate = Path(path).absolute()
+        relative = candidate.relative_to(configured_root)
+        resolved = candidate.resolve(strict=True)
+        resolved_relative = resolved.relative_to(trusted_root)
+    except (OSError, ValueError):
+        return None
+
+    def expected(parts: tuple[str, ...]) -> bool:
+        return (parts == (f"{rcp_no}.json",)
+                or len(parts) == 2 and re.fullmatch(r"v3-[0-9a-f]{32}", parts[0]) is not None
+                and parts[1] == f"{rcp_no}.json")
+    if not expected(relative.parts) or not expected(resolved_relative.parts):
+        return None
+    return candidate, trusted_root
+
+
+def _captured_packet_time(packet_bytes: bytes) -> datetime | None:
+    try:
+        raw = json.loads(packet_bytes)
+        captured = datetime.fromisoformat(raw.get('retrieved_at_kst', '')) if isinstance(raw, dict) else None
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if captured is None or captured.tzinfo is None or captured.utcoffset() != KST.utcoffset(captured):
+        return None
+    captured = captured.astimezone(KST)
+    if captured > datetime.now(KST) + MAX_FUTURE_CAPTURE_SKEW:
+        return None
+    return captured
+
+
+def validated_packet(path: Path, rcp_no: str, control_date: str):
+    """Return metadata and digest of a current packet rooted in SOURCE_ROOT."""
+    try:
+        trusted = _trusted_source_packet_path(path, rcp_no, control_date)
+        if trusted is None:
             return None
+        path, root = trusted
         with RetainedPacketSnapshot(path, trusted_root=root) as snapshot:
             metadata = completed_packet_snapshot(path, rcp_no, snapshot.packet_bytes,
                                                  snapshot.read_sibling, expected_control_date=control_date)
@@ -199,21 +234,20 @@ def fetch_research_backlog() -> tuple[list[dict], list[dict]]:
 def _packet_capture_time(path: Path, rcp_no: str, control_date: str):
     """Validate old retained bytes at their capture instant, then expose age."""
     try:
-        path = path.resolve(strict=True)
-        root = path.parent.parent if re.fullmatch(r"v3-[0-9a-f]{32}", path.parent.name) else path.parent
-        if root.name != control_date:
+        trusted = _trusted_source_packet_path(path, rcp_no, control_date)
+        if trusted is None:
             return None
+        path, root = trusted
         with RetainedPacketSnapshot(path, trusted_root=root) as snapshot:
-            raw = json.loads(snapshot.packet_bytes)
-            captured = datetime.fromisoformat(raw.get('retrieved_at_kst', '')) if isinstance(raw, dict) else None
-            if captured is None or captured.tzinfo is None or captured.utcoffset() != KST.utcoffset(captured):
+            captured = _captured_packet_time(snapshot.packet_bytes)
+            if captured is None:
                 return None
             metadata = completed_packet_snapshot(path, rcp_no, snapshot.packet_bytes, snapshot.read_sibling,
                                                  expected_control_date=control_date, now=captured)
             snapshot.verify()
             if metadata is None:
                 return None
-            return captured.astimezone(KST), hashlib.sha256(snapshot.packet_bytes).hexdigest()
+            return captured, hashlib.sha256(snapshot.packet_bytes).hexdigest()
     except (OSError, ValueError, SourceError, json.JSONDecodeError):
         return None
 
@@ -221,14 +255,13 @@ def _packet_capture_time(path: Path, rcp_no: str, control_date: str):
 def historical_packet(path: Path, rcp_no: str, control_date: str):
     """Verify an expired generation at its own recorded capture instant."""
     try:
-        path = path.resolve(strict=True)
-        root = path.parent.parent if re.fullmatch(r"v3-[0-9a-f]{32}", path.parent.name) else path.parent
-        if root.name != control_date:
+        trusted = _trusted_source_packet_path(path, rcp_no, control_date)
+        if trusted is None:
             return None
+        path, root = trusted
         with RetainedPacketSnapshot(path, trusted_root=root) as snapshot:
-            raw = json.loads(snapshot.packet_bytes)
-            captured = datetime.fromisoformat(raw.get('retrieved_at_kst', '')) if isinstance(raw, dict) else None
-            if captured is None or captured.tzinfo is None or captured.utcoffset() != KST.utcoffset(captured):
+            captured = _captured_packet_time(snapshot.packet_bytes)
+            if captured is None:
                 return None
             metadata = completed_packet_snapshot(path, rcp_no, snapshot.packet_bytes, snapshot.read_sibling,
                                                  expected_control_date=control_date, now=captured)
@@ -408,7 +441,7 @@ def terminal_generation_continuity_matches_current(prior: object, current: objec
     if not isinstance(prior, dict) or not isinstance(current, dict):
         return False
     classified = _DART_CORE_PROVENANCE_FIELDS | {'report_class', 'report_name'}
-    if set(prior) not in (_DART_CORE_PROVENANCE_FIELDS, classified) or set(current) != classified:
+    if set(prior) != classified or set(current) != classified:
         return False
     if any(prior.get(field) != current.get(field) for field in ('rcp_no', 'date', 'receipt_source_date')):
         return False

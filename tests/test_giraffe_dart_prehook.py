@@ -47,6 +47,18 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         cls.manifest = load_module("giraffe_dart_manifest_test", "giraffe_dart_manifest.py")
         sys.path.insert(0, str(SCRIPTS))
         cls.gate = load_module("giraffe_dart_manifest_gate_test", "giraffe_dart_manifest_gate.py")
+        cls._default_source_root = cls.gate.SOURCE_ROOT
+        cls._write_packet = cls.gate.write_packet
+
+        def write_fixture_packet(packet, directory):
+            # Legacy fixture calls construct isolated configured source roots.
+            if cls.gate.SOURCE_ROOT == cls._default_source_root:
+                cls.gate.SOURCE_ROOT = pathlib.Path(directory).parent
+            return cls._write_packet(packet, directory)
+        cls.gate.write_packet = write_fixture_packet
+
+    def setUp(self):
+        self.gate.SOURCE_ROOT = self._default_source_root
 
     def test_api_replay_collects_all_366_records(self):
         receipts = ["20260901%06d" % n for n in range(1, 367)]
@@ -701,7 +713,7 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(result["source_valid_count"], 1)
         self.assertNotIn("control_contract", result)
 
-    def test_selected_correction_upgrades_v2_and_pending_retry_keeps_generation(self):
+    def test_selected_correction_core_only_history_requires_explicit_migration(self):
         receipt, date = "20260916900230", "20260917"
         manifest = {"declared_total": 1, "declared_pages": 1, "pages_collected": 1, "page_counts": [1],
                     "unique_receipts": 1, "material_candidate_count": 1, "complete": True,
@@ -720,19 +732,10 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             history = [{"identity": "dart:" + receipt, "kind": "dart", "payload": prior,
                         "terminal_disposition": "rejected", "terminal_run_key": "research-2026-09-16-0700-kst-r2",
                         "terminal_evidence_id": None, "terminal_at": "2026-09-16T07:00:00+09:00"}]
-            with patch.object(self.gate, "OUTPUT_ROOT", root / "manifests"), patch.object(self.gate, "SOURCE_ROOT", root / "sources"), patch.object(self.gate, "CONTROL_ROOT", root / "controls"), patch.object(self.gate, "target_dates", return_value=[date]), patch.object(self.gate, "check_card_prompt"), patch.object(self.gate, "collect_manifest", return_value=manifest), patch.object(self.gate, "fetch_with_retry", return_value=valid_source_packet(self.gate, receipt)) as fetch, patch.object(self.gate, "fetch_research_backlog", return_value=([], [])) as backlog, patch.object(self.gate, "fetch_terminal_history", return_value=history), patch.object(self.gate, "register_research_run") as register, contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(self.gate.main(['--rerun-version', '3', '--correction-rcp-no', receipt]), 0)
-                fetch.assert_called_once_with(receipt)
-                contract = register.call_args.args[1]; current = contract['sources'][0]
-                self.assertRegex(pathlib.Path(current['packet_path']).parent.name, r'^v3-[0-9a-f]{32}$')
-                self.assertNotEqual(current['packet_path'], prior['packet_path'])
-                self.assertEqual(contract['correction_of'], history)
-                identity = 'dart:correction:' + hashlib.sha256(self.gate.canonical_bytes({'source': current, 'prior': history[0]})).hexdigest()
-                backlog.return_value = ([{'identity': identity, 'kind': 'dart', 'payload': current}], [])
-                fetch.reset_mock(); fetch.side_effect = AssertionError('pending correction must preserve exact generation')
-                self.assertEqual(self.gate.main(['--rerun-version', '4']), 0)
-                self.assertEqual(register.call_args.args[1]['sources'][0], current)
-                fetch.assert_not_called()
+            with patch.object(self.gate, "OUTPUT_ROOT", root / "manifests"), patch.object(self.gate, "SOURCE_ROOT", root / "sources"), patch.object(self.gate, "CONTROL_ROOT", root / "controls"), patch.object(self.gate, "target_dates", return_value=[date]), patch.object(self.gate, "check_card_prompt"), patch.object(self.gate, "collect_manifest", return_value=manifest), patch.object(self.gate, "fetch_with_retry", return_value=valid_source_packet(self.gate, receipt)) as fetch, patch.object(self.gate, "fetch_research_backlog", return_value=([], [])), patch.object(self.gate, "fetch_terminal_history", return_value=history), patch.object(self.gate, "register_research_run") as register, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.gate.main(['--rerun-version', '3', '--correction-rcp-no', receipt]), 2)
+            fetch.assert_called_once_with(receipt)
+            register.assert_not_called()
             self.assertTrue(all(path.read_bytes() == content for path, content in before.items()))
 
     def test_gate_preserves_bound_carried_generation_over_other_valid_generations(self):
@@ -843,6 +846,35 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             with self.assertRaisesRegex(self.gate.ManifestError, "backlog packet unavailable"):
                 self.gate.control_contract("research-2026-09-18-0700-kst", [],
                     [{"identity": "dart:" + receipt, "kind": "dart", "payload": source}])
+            actual = hashlib.sha256(packet.read_bytes()).hexdigest()
+            for digest in (actual.upper(), 1):
+                with self.subTest(digest=digest), self.assertRaisesRegex(self.gate.ManifestError, "backlog packet unavailable"):
+                    self.gate.control_contract("research-2026-09-18-0700-kst", [], [{"identity": "dart:" + receipt, "kind": "dart", "payload": {**source, "packet_sha256": digest}}])
+
+    def test_retained_packet_requires_configured_source_root_and_safe_layout(self):
+        receipt, date = "20260923000258", "20260923"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            source_root = root / "sources"
+            packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), source_root / date)
+            external = self.gate.write_packet(valid_source_packet(self.gate, receipt), root / "external" / date)
+            with patch.object(self.gate, "SOURCE_ROOT", source_root):
+                self.assertIsNotNone(self.gate.validated_packet(packet, receipt, date))
+                self.assertIsNone(self.gate.validated_packet(external, receipt, date))
+                link = source_root / date / ("v3-" + "f" * 32)
+                link.symlink_to(external.parent, target_is_directory=True)
+                self.assertIsNone(self.gate.validated_packet(link / packet.name, receipt, date))
+
+    def test_historical_packet_rejects_future_capture_timestamp(self):
+        receipt, date = "20260923000258", "20260923"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp); source_root = root / "sources"
+            packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), source_root / date)
+            metadata = json.loads(packet.read_text())
+            metadata["retrieved_at_kst"] = (self.gate.datetime.now(self.gate.KST) + self.gate.MAX_FUTURE_CAPTURE_SKEW + timedelta(seconds=1)).isoformat()
+            packet.write_text(json.dumps(metadata))
+            with patch.object(self.gate, "SOURCE_ROOT", source_root):
+                self.assertIsNone(self.gate.historical_packet(packet, receipt, date))
 
     def test_stale_terminal_history_is_recaptured_without_rewriting_history(self):
         receipt, date = '20260923000258', '20260923'
