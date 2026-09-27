@@ -755,6 +755,69 @@ class GiraffeDartPrehookTests(unittest.TestCase):
                 self.gate.control_contract("research-2026-09-18-0700-kst", [],
                     [{"identity": "dart:" + receipt, "kind": "dart", "payload": source}])
 
+    def test_stale_terminal_history_is_recaptured_without_rewriting_history(self):
+        receipt, date = '20260923000258', '20260923'
+        manifest = {'declared_total': 1, 'declared_pages': 1, 'pages_collected': 1, 'page_counts': [1],
+                    'unique_receipts': 1, 'material_candidate_count': 1, 'complete': True,
+                    'material_candidate_records': [{'rcp_no': receipt, 'rcept_dt': date,
+                                                    'report_nm': '단일판매ㆍ공급계약체결'}]}
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp); old = self.gate.write_packet(valid_source_packet(self.gate, receipt), root / 'sources' / date)
+            metadata = json.loads(old.read_text()); metadata['retrieved_at_kst'] = (self.gate.datetime.now(self.gate.KST) - self.gate.MAX_CAPTURE_AGE - timedelta(seconds=1)).isoformat(); old.write_text(json.dumps(metadata))
+            old_bytes = old.read_bytes()
+            prior = {'rcp_no': receipt, 'date': date, 'receipt_source_date': date, 'packet_path': str(old),
+                     'packet_sha256': hashlib.sha256(old_bytes).hexdigest(),
+                     'report_class': 'dart_single_sale_supply_contract', 'report_name': '단일판매ㆍ공급계약체결'}
+            history = [{'identity': 'dart:' + receipt, 'kind': 'dart', 'payload': prior,
+                        'terminal_disposition': 'source_error', 'terminal_run_key': 'research-2026-09-23-0700-kst',
+                        'terminal_evidence_id': None, 'terminal_at': '2026-09-23T07:00:00+09:00'}]
+            with patch.object(self.gate, 'OUTPUT_ROOT', root / 'manifests'), patch.object(self.gate, 'SOURCE_ROOT', root / 'sources'), patch.object(self.gate, 'CONTROL_ROOT', root / 'controls'), patch.object(self.gate, 'target_dates', return_value=[date]), patch.object(self.gate, 'check_card_prompt'), patch.object(self.gate, 'collect_manifest', return_value=manifest), patch.object(self.gate, 'fetch_research_backlog', return_value=([], [])), patch.object(self.gate, 'fetch_terminal_history', return_value=history), patch.object(self.gate, 'fetch_with_retry', return_value=valid_source_packet(self.gate, receipt)) as fetch, patch.object(self.gate, 'register_research_run') as register, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.gate.main(), 0)
+            fetch.assert_called_once_with(receipt)
+            current = register.call_args.args[1]['sources'][0]
+            self.assertNotEqual(current['packet_path'], str(old))
+            self.assertRegex(pathlib.Path(current['packet_path']).parent.name, r'^v3-[0-9a-f]{32}$')
+            self.assertEqual(old.read_bytes(), old_bytes)
+            self.assertEqual(history[0]['payload'], prior)
+
+    def test_fresh_terminal_history_packet_is_reused_without_fetch(self):
+        receipt, date = '20260923000258', '20260923'
+        manifest = {'declared_total': 1, 'declared_pages': 1, 'pages_collected': 1, 'page_counts': [1],
+                    'unique_receipts': 1, 'material_candidate_count': 1, 'complete': True,
+                    'material_candidate_records': [{'rcp_no': receipt, 'rcept_dt': date,
+                                                    'report_nm': '단일판매ㆍ공급계약체결'}]}
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp); packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), root / 'sources' / date)
+            prior = {'rcp_no': receipt, 'date': date, 'receipt_source_date': date, 'packet_path': str(packet),
+                     'packet_sha256': hashlib.sha256(packet.read_bytes()).hexdigest(),
+                     'report_class': 'dart_single_sale_supply_contract', 'report_name': '단일판매ㆍ공급계약체결'}
+            history = [{'identity': 'dart:' + receipt, 'kind': 'dart', 'payload': prior,
+                        'terminal_disposition': 'source_error', 'terminal_run_key': 'research-2026-09-23-0700-kst',
+                        'terminal_evidence_id': None, 'terminal_at': '2026-09-23T07:00:00+09:00'}]
+            with patch.object(self.gate, 'OUTPUT_ROOT', root / 'manifests'), patch.object(self.gate, 'SOURCE_ROOT', root / 'sources'), patch.object(self.gate, 'CONTROL_ROOT', root / 'controls'), patch.object(self.gate, 'target_dates', return_value=[date]), patch.object(self.gate, 'check_card_prompt'), patch.object(self.gate, 'collect_manifest', return_value=manifest), patch.object(self.gate, 'fetch_research_backlog', return_value=([], [])), patch.object(self.gate, 'fetch_terminal_history', return_value=history), patch.object(self.gate, 'fetch_with_retry', side_effect=AssertionError('fresh history must be reused')) as fetch, patch.object(self.gate, 'register_research_run') as register, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.gate.main(), 0)
+            fetch.assert_not_called()
+            self.assertEqual(register.call_args.args[1]['sources'][0]['packet_path'], str(packet))
+
+    def test_tampered_terminal_history_packet_fails_closed_not_as_stale(self):
+        receipt, date = '20260923000258', '20260923'
+        manifest = {'declared_total': 1, 'declared_pages': 1, 'pages_collected': 1, 'page_counts': [1],
+                    'unique_receipts': 1, 'material_candidate_count': 1, 'complete': True,
+                    'material_candidate_records': [{'rcp_no': receipt, 'rcept_dt': date,
+                                                    'report_nm': '단일판매ㆍ공급계약체결'}]}
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp); packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), root / 'sources' / date)
+            metadata = json.loads(packet.read_text()); metadata['retrieved_at_kst'] = (self.gate.datetime.now(self.gate.KST) - self.gate.MAX_CAPTURE_AGE - timedelta(seconds=1)).isoformat(); packet.write_text(json.dumps(metadata))
+            prior = {'rcp_no': receipt, 'date': date, 'receipt_source_date': date, 'packet_path': str(packet),
+                     'packet_sha256': '0' * 64, 'report_class': 'dart_single_sale_supply_contract', 'report_name': '단일판매ㆍ공급계약체결'}
+            history = [{'identity': 'dart:' + receipt, 'kind': 'dart', 'payload': prior,
+                        'terminal_disposition': 'rejected', 'terminal_run_key': 'research-2026-09-23-0700-kst',
+                        'terminal_evidence_id': None, 'terminal_at': '2026-09-23T07:00:00+09:00'}]
+            with patch.object(self.gate, 'OUTPUT_ROOT', root / 'manifests'), patch.object(self.gate, 'SOURCE_ROOT', root / 'sources'), patch.object(self.gate, 'CONTROL_ROOT', root / 'controls'), patch.object(self.gate, 'target_dates', return_value=[date]), patch.object(self.gate, 'check_card_prompt'), patch.object(self.gate, 'collect_manifest', return_value=manifest), patch.object(self.gate, 'fetch_research_backlog', return_value=([], [])), patch.object(self.gate, 'fetch_terminal_history', return_value=history), patch.object(self.gate, 'fetch_with_retry') as fetch, contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(self.gate.main(), 2)
+            fetch.assert_not_called()
+            self.assertEqual(json.loads(output.getvalue())['error'], 'durable DART backlog packet unavailable')
+
     def test_stale_packet_backlog_refreshes_contract_r6_core_and_correction_as_one_set(self):
         date = '20260923'; receipts = ['20260923000269', '20260923000258']
         correction = 'dart:correction:6890b6fcc82b596c1f8711b369ea270cecde35ed4fcf9e02a8a8490cb98171ec'

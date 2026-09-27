@@ -218,6 +218,30 @@ def _packet_capture_time(path: Path, rcp_no: str, control_date: str):
         return None
 
 
+def reusable_terminal_history_packet(payload: object, rcp_no: str, control_date: str) -> bool:
+    """Reuse terminal provenance only while its exact packet remains current.
+
+    Historical bytes may prove an expired packet was valid when captured, but
+    they never authorize that packet as a current control source.
+    """
+    normalized = normalize_durable_dart_backlog_payload(payload, None)
+    if (normalized is None or normalized['rcp_no'] != rcp_no or normalized['date'] != control_date
+            or normalized['receipt_source_date'] != rcp_no[:8]):
+        raise ManifestError('durable DART backlog packet unavailable')
+    path = Path(normalized['packet_path'])
+    validated = validated_packet(path, rcp_no, control_date)
+    if validated is not None:
+        if validated[1] != normalized['packet_sha256']:
+            raise ManifestError('durable DART backlog packet unavailable')
+        return True
+    retained = _packet_capture_time(path, rcp_no, control_date)
+    if retained is None or retained[1] != normalized['packet_sha256']:
+        raise ManifestError('durable DART backlog packet unavailable')
+    if datetime.now(KST) - retained[0] > MAX_CAPTURE_AGE:
+        return False
+    raise ManifestError('durable DART backlog packet unavailable')
+
+
 def refresh_dart_backlog_packets(items: list[dict]) -> list[dict]:
     """Ask the control API to atomically advance one verified stale set."""
     base, key = os.environ.get("GIRAFFE_URL", "").strip().rstrip("/"), os.environ.get("RESEARCH_CONTROL_KEY", "")
@@ -690,7 +714,8 @@ def main(argv: list[str] | None = None) -> int:
                     payload = item.get('payload', {})
                     if (item.get('identity') == 'dart:' + payload.get('rcp_no', '') and 'packet_path' in payload
                             and payload['rcp_no'] not in selected_corrections):
-                        carried_sources.setdefault(payload['rcp_no'], payload)
+                        if reusable_terminal_history_packet(payload, payload['rcp_no'], date):
+                            carried_sources.setdefault(payload['rcp_no'], payload)
             output = OUTPUT_ROOT / f"{date}.json"
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
