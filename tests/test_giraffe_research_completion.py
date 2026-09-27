@@ -1626,38 +1626,41 @@ def test_missing_packet_partial_done_retries_exact_receipt_and_upgrades_provenan
     assert original["detail"]["detail"]["control_terminal_dispositions"] == [audit]
 
 
-def test_pending_dart_packet_refresh_is_atomic_and_append_only(monkeypatch, tmp_path):
+def test_pending_dart_packet_refresh_set_is_atomic_and_preserves_correction_lineage(monkeypatch, tmp_path):
     import kr_stock_autotrader.db as db_module
     from kr_stock_autotrader.db import connect
     monkeypatch.setattr(db_module, 'DATABASE_PATH', str(tmp_path / 'refresh.db'))
     packet_root = tmp_path / 'packets'; monkeypatch.setenv('GIRAFFE_RESEARCH_PACKET_ROOT', str(packet_root))
-    rcp, date = '20260923000269', '20260923'
-    def source(generation, digest):
-        return {'rcp_no': rcp, 'date': date, 'receipt_source_date': date,
-                'packet_path': str(packet_root / date / generation / (rcp + '.json')), 'packet_sha256': digest,
-                'report_class': 'dart_single_sale_supply_contract', 'report_name': '단일판매ㆍ공급계약체결'}
-    old, new = source('v3-' + 'a' * 32, 'a' * 64), source('v3-' + 'b' * 32, 'b' * 64)
+    receipts = ['20260923000269', '20260923000258']
+    identities = ['dart:' + receipts[0], 'dart:correction:6890b6fcc82b596c1f8711b369ea270cecde35ed4fcf9e02a8a8490cb98171ec']
+    def source(rcp, generation, digest):
+        return {'rcp_no': rcp, 'date': '20260923', 'receipt_source_date': '20260923', 'packet_path': str(packet_root / '20260923' / generation / (rcp + '.json')), 'packet_sha256': digest}
+    olds = [source(rcp, 'v3-' + char * 32, char * 64) for rcp, char in zip(receipts, 'ab')]
+    news = [source(rcp, 'v3-' + char * 32, char * 64) for rcp, char in zip(receipts, 'cd')]
+    items = [{'identity': identity, 'old_payload': old, 'new_payload': new, 'first_run_key': 'research-2026-09-23-0700-kst-r6'} for identity, old, new in zip(identities, olds, news)]
     db = connect()
     try:
-        db.execute("INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,created_at) VALUES(?,?,?,?,?)", ('dart:' + rcp, 'dart', json.dumps(old, sort_keys=True), 'research-2026-09-23-0700-kst-r6', '2026-09-23T07:00:00+09:00'))
+        for identity, old in zip(identities, olds):
+            db.execute("INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,created_at) VALUES(?,?,?,?,?)", (identity, 'dart', json.dumps(old, sort_keys=True), 'research-2026-09-23-0700-kst-r6', '2026-09-23T07:00:00+09:00'))
+        db.execute("CREATE TRIGGER fail_second_refresh BEFORE INSERT ON giraffe_research_backlog_packet_refreshes WHEN NEW.backlog_identity='dart:correction:6890b6fcc82b596c1f8711b369ea270cecde35ed4fcf9e02a8a8490cb98171ec' BEGIN SELECT RAISE(ABORT, 'fail item N'); END")
         db.commit()
-    finally:
-        db.close()
-    client = TestClient(app)
-    response = client.post('/api/internal/research-backlog/refresh-dart-packet', headers=CONTROL_HEADERS,
-                           json={'identity': 'dart:' + rcp, 'old_payload': old, 'new_payload': new})
-    assert response.status_code == 200, response.text
-    assert response.json()['first_run_key'] == 'research-2026-09-23-0700-kst-r6'
+    finally: db.close()
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post('/api/internal/research-backlog/refresh-dart-packets', headers=CONTROL_HEADERS, json={'items': items})
+    assert response.status_code == 500
     db = connect()
     try:
-        row = db.execute("SELECT payload,first_run_key,status FROM giraffe_research_backlog WHERE identity=?", ('dart:' + rcp,)).fetchone()
-        audit = db.execute("SELECT old_payload,new_payload FROM giraffe_research_backlog_packet_refreshes WHERE backlog_identity=?", ('dart:' + rcp,)).fetchone()
-        assert dict(row, payload=json.loads(row['payload'])) == {'payload': new, 'first_run_key': 'research-2026-09-23-0700-kst-r6', 'status': 'pending'}
-        assert dict(audit, old_payload=json.loads(audit['old_payload']), new_payload=json.loads(audit['new_payload'])) == {'old_payload': old, 'new_payload': new}
-    finally:
-        db.close()
-    assert client.post('/api/internal/research-backlog/refresh-dart-packet', headers=CONTROL_HEADERS,
-                       json={'identity': 'dart:' + rcp, 'old_payload': old, 'new_payload': new}).status_code == 409
+        assert [json.loads(row['payload']) for row in db.execute("SELECT payload FROM giraffe_research_backlog ORDER BY identity").fetchall()] == olds
+        assert db.execute("SELECT count(*) FROM giraffe_research_backlog_packet_refreshes").fetchone()[0] == 0
+        db.execute('DROP TRIGGER fail_second_refresh'); db.commit()
+    finally: db.close()
+    response = client.post('/api/internal/research-backlog/refresh-dart-packets', headers=CONTROL_HEADERS, json={'items': items})
+    assert response.status_code == 200, response.text
+    assert response.json() == {'schema_version': 'giraffe-research-backlog-packet-refresh-v2', 'items': [{'identity': item['identity'], 'payload': item['new_payload'], 'first_run_key': item['first_run_key']} for item in items]}
+    assert client.post('/api/internal/research-backlog/refresh-dart-packets', headers=CONTROL_HEADERS, json={'items': items}).status_code == 409
+    source_error = {**olds[0], 'source_error_code': 'SOURCE_FETCH_ERROR'}
+    assert client.post('/api/internal/research-backlog/refresh-dart-packets', headers=CONTROL_HEADERS, json={'items': [{**items[0], 'old_payload': source_error}]}).status_code == 422
+    assert client.post('/api/internal/research-backlog/refresh-dart-packets', headers=CONTROL_HEADERS, json={'items': [{**items[1], 'identity': identities[1].upper()}]}).status_code == 422
 
 
 def test_store_error_without_completed_economics_is_not_reviewed_and_stays_pending():

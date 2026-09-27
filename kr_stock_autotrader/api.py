@@ -605,16 +605,19 @@ def _failed_dart_matches_source(failed: object, source: object) -> bool:
 
 
 def _valid_refresh_dart_source(source: object) -> bool:
-    """Validate one classified packet binding without reading packet bytes."""
-    return (isinstance(source, dict) and set(source) == _DART_CORE_PROVENANCE_FIELDS | {'report_class', 'report_name'}
+    """Validate the exact packet-backed legacy cursor shape, never a source error."""
+    return (isinstance(source, dict) and set(source) == _DART_CORE_PROVENANCE_FIELDS
             and isinstance(source.get('rcp_no'), str) and re.fullmatch(r'\d{14}', source['rcp_no']) is not None
             and isinstance(source.get('date'), str) and re.fullmatch(r'\d{8}', source['date']) is not None
             and source.get('receipt_source_date') == source['rcp_no'][:8]
             and _valid_research_packet_path(source.get('packet_path'), source['date'], source['rcp_no'])
-            and isinstance(source.get('packet_sha256'), str) and re.fullmatch(r'[0-9a-f]{64}', source['packet_sha256']) is not None
-            and isinstance(source.get('report_name'), str) and 0 < len(source['report_name']) <= 500
-            and source.get('report_class') in {'dart_single_sale_supply_contract', 'other'}
-            and source['report_class'] == _authoritative_report_class(source['report_name']))
+            and isinstance(source.get('packet_sha256'), str) and re.fullmatch(r'[0-9a-f]{64}', source['packet_sha256']) is not None)
+
+
+def _valid_refresh_dart_identity(identity: object, rcp_no: str) -> bool:
+    """Permit the canonical receipt identity or immutable correction lineage."""
+    return (identity == 'dart:' + rcp_no
+            or isinstance(identity, str) and re.fullmatch(r'dart:correction:[0-9a-f]{64}', identity) is not None)
 
 
 def _same_dart_core_provenance(left: object, right: object) -> bool:
@@ -2295,37 +2298,49 @@ async def research_terminal_items(request: Request, _: None = Depends(require_re
         db.close()
 
 
-@app.post('/api/internal/research-backlog/refresh-dart-packet')
-async def refresh_dart_backlog_packet(request: Request, _: None = Depends(require_research_control_key)):
-    """Atomically advance one pending DART cursor to a validated new generation.
-
-    Packet bytes are deliberately prehook-owned.  This API validates only the
-    bounded identity/provenance transition and records the replaced binding.
-    """
+@app.post('/api/internal/research-backlog/refresh-dart-packets')
+async def refresh_dart_backlog_packets(request: Request, _: None = Depends(require_research_control_key)):
+    """Advance one bounded stale set, with no durable partial refreshes."""
     data = await request.json()
-    if not isinstance(data, dict) or set(data) != {'identity', 'old_payload', 'new_payload'}:
-        raise HTTPException(422, 'invalid DART packet refresh')
-    identity, old, new = data['identity'], data['old_payload'], data['new_payload']
-    if (not isinstance(identity, str) or not identity.startswith('dart:')
-            or not isinstance(old, dict) or not isinstance(new, dict)
-            or not _valid_refresh_dart_source(old) or not _valid_refresh_dart_source(new)
-            or identity != 'dart:' + old.get('rcp_no', '')
-            or any(old.get(field) != new.get(field) for field in ('rcp_no', 'date', 'receipt_source_date', 'report_class', 'report_name'))
-            or old.get('packet_path') == new.get('packet_path')
-            or old.get('packet_sha256') == new.get('packet_sha256')):
-        raise HTTPException(422, 'invalid DART packet refresh')
+    items = data.get('items') if isinstance(data, dict) and set(data) == {'items'} else None
+    if not isinstance(items, list) or not 0 < len(items) <= 200:
+        raise HTTPException(422, 'invalid DART packet refresh set')
+    identities = []
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {'identity', 'old_payload', 'new_payload', 'first_run_key'}:
+            raise HTTPException(422, 'invalid DART packet refresh')
+        identity, old, new, first_run_key = item['identity'], item['old_payload'], item['new_payload'], item['first_run_key']
+        if (not isinstance(old, dict) or not isinstance(new, dict) or not isinstance(first_run_key, str)
+                or not _valid_refresh_dart_source(old) or not _valid_refresh_dart_source(new)
+                or not _valid_refresh_dart_identity(identity, old['rcp_no'])
+                or any(old[field] != new[field] for field in ('rcp_no', 'date', 'receipt_source_date'))
+                or old['packet_path'] == new['packet_path'] or old['packet_sha256'] == new['packet_sha256']):
+            raise HTTPException(422, 'invalid DART packet refresh')
+        identities.append(identity)
+    if len(identities) != len(set(identities)):
+        raise HTTPException(422, 'duplicate DART packet refresh identity')
     db = connect()
     try:
-        row = db.execute("SELECT payload,first_run_key FROM giraffe_research_backlog WHERE identity=? AND kind='dart' AND status='pending'", (identity,)).fetchone()
-        if row is None or json.loads(row['payload']) != old:
-            raise HTTPException(409, 'DART backlog refresh conflict')
+        # Validate the complete old binding and first-run ownership before writing any audit/live row.
+        for item in items:
+            row = db.execute("SELECT payload,first_run_key FROM giraffe_research_backlog WHERE identity=? AND kind='dart' AND status='pending'", (item['identity'],)).fetchone()
+            if row is None or json.loads(row['payload']) != item['old_payload'] or row['first_run_key'] != item['first_run_key']:
+                raise HTTPException(409, 'DART backlog refresh conflict')
         refreshed_at = __import__('kr_stock_autotrader.decision_cards', fromlist=['now']).now()
-        db.execute("INSERT OR IGNORE INTO giraffe_research_backlog_packet_refreshes(backlog_identity,old_payload,new_payload,refreshed_at) VALUES(?,?,?,?)", (identity, json.dumps(old, sort_keys=True), json.dumps(new, sort_keys=True), refreshed_at))
-        db.execute("UPDATE giraffe_research_backlog SET payload=? WHERE identity=? AND kind='dart' AND status='pending' AND payload=?", (json.dumps(new, sort_keys=True), identity, json.dumps(old, sort_keys=True)))
-        if db.execute("SELECT payload,first_run_key FROM giraffe_research_backlog WHERE identity=?", (identity,)).fetchone()['payload'] != json.dumps(new, sort_keys=True):
-            raise HTTPException(409, 'DART backlog refresh conflict')
+        for item in items:
+            old_json, new_json = json.dumps(item['old_payload'], sort_keys=True), json.dumps(item['new_payload'], sort_keys=True)
+            db.execute("INSERT INTO giraffe_research_backlog_packet_refreshes(backlog_identity,old_payload,new_payload,refreshed_at) VALUES(?,?,?,?)", (item['identity'], old_json, new_json, refreshed_at))
+            result = db.execute("UPDATE giraffe_research_backlog SET payload=? WHERE identity=? AND kind='dart' AND status='pending' AND payload=? AND first_run_key=?", (new_json, item['identity'], old_json, item['first_run_key']))
+            if result.rowcount != 1:
+                raise HTTPException(409, 'DART backlog refresh conflict')
+        readback = []
+        for item in items:
+            row = db.execute("SELECT payload,first_run_key FROM giraffe_research_backlog WHERE identity=? AND kind='dart' AND status='pending'", (item['identity'],)).fetchone()
+            if row is None or json.loads(row['payload']) != item['new_payload'] or row['first_run_key'] != item['first_run_key']:
+                raise HTTPException(409, 'DART backlog refresh conflict')
+            readback.append({'identity': item['identity'], 'payload': item['new_payload'], 'first_run_key': row['first_run_key']})
         db.commit()
-        return {'schema_version': 'giraffe-research-backlog-packet-refresh-v1', 'identity': identity, 'payload': new, 'first_run_key': row['first_run_key']}
+        return {'schema_version': 'giraffe-research-backlog-packet-refresh-v2', 'items': readback}
     except Exception:
         db.rollback()
         raise

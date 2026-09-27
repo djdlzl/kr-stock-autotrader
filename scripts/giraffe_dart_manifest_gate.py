@@ -218,52 +218,61 @@ def _packet_capture_time(path: Path, rcp_no: str, control_date: str):
         return None
 
 
-def refresh_dart_backlog_packet(identity: str, old_payload: dict, new_payload: dict) -> dict:
-    """Ask the control API to atomically advance one already-verified cursor."""
+def refresh_dart_backlog_packets(items: list[dict]) -> list[dict]:
+    """Ask the control API to atomically advance one verified stale set."""
     base, key = os.environ.get("GIRAFFE_URL", "").strip().rstrip("/"), os.environ.get("RESEARCH_CONTROL_KEY", "")
     if not base or not key:
         raise ManifestError("GIRAFFE_URL and RESEARCH_CONTROL_KEY are required for durable backlog")
-    request = urllib.request.Request(base + '/api/internal/research-backlog/refresh-dart-packet',
-        data=canonical_bytes({'identity': identity, 'old_payload': old_payload, 'new_payload': new_payload}), method='POST',
+    request = urllib.request.Request(base + '/api/internal/research-backlog/refresh-dart-packets',
+        data=canonical_bytes({'items': items}), method='POST',
         headers={'Content-Type': 'application/json', 'X-Research-Control-Key': key})
     try:
         with urllib.request.urlopen(request, timeout=10) as response: value = json.load(response)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as exc:
         raise ManifestError('durable DART backlog packet refresh failed') from exc
-    if (not isinstance(value, dict) or value.get('schema_version') != 'giraffe-research-backlog-packet-refresh-v1'
-            or value.get('identity') != identity or value.get('payload') != new_payload):
+    readback = value.get('items') if isinstance(value, dict) and value.get('schema_version') == 'giraffe-research-backlog-packet-refresh-v2' else None
+    expected = [{'identity': item['identity'], 'payload': item['new_payload'], 'first_run_key': item['first_run_key']} for item in items]
+    if not isinstance(readback, list) or readback != expected:
         raise ManifestError('durable DART backlog packet refresh response invalid')
-    return value
+    return readback
+
+
+def _refresh_identity(identity: object, rcp_no: str) -> bool:
+    return identity == 'dart:' + rcp_no or isinstance(identity, str) and re.fullmatch(r'dart:correction:[0-9a-f]{64}', identity) is not None
 
 
 def refresh_stale_dart_backlog(carry_forward: list[dict]) -> list[dict]:
-    """Refresh only expired, pending, same-identity packet cursors append-only."""
-    refreshed = []
-    for item in carry_forward:
+    """Fetch/validate every fresh packet before one all-set durable transition."""
+    refreshed, updates = list(carry_forward), []
+    for index, item in enumerate(carry_forward):
         payload = item.get('payload') if isinstance(item, dict) else None
         identity = item.get('identity') if isinstance(item, dict) else None
         normalized = normalize_durable_dart_backlog_payload(payload, None)
-        if (item.get('kind') != 'dart' or normalized is None or identity != 'dart:' + normalized['rcp_no']
+        if (item.get('kind') != 'dart' or not isinstance(payload, dict) or set(payload) != _DART_CORE_PROVENANCE_FIELDS
+                or normalized is None or not _refresh_identity(identity, normalized['rcp_no'])
                 or set(item) != {'identity', 'kind', 'payload', 'original_announcement_at', 'first_run_key'}):
-            refreshed.append(item); continue
+            continue
         retained = _packet_capture_time(Path(normalized['packet_path']), normalized['rcp_no'], normalized['date'])
         if retained is None or retained[1] != normalized['packet_sha256']:
             raise ManifestError('durable DART backlog packet unavailable')
         if datetime.now(KST) - retained[0] <= MAX_CAPTURE_AGE:
-            refreshed.append(item); continue
+            continue
         try:
             packet_path = write_packet(fetch_with_retry(normalized['rcp_no']), SOURCE_ROOT / normalized['date'])
         except SourceError as exc:
-            # A packet-backed pending row is not converted to a source error.
             raise ManifestError('durable DART backlog packet refresh failed') from exc
         validated = validated_packet(packet_path, normalized['rcp_no'], normalized['date'])
         if validated is None:
             raise ManifestError('durable DART backlog packet refresh failed')
-        new_payload = dict(payload); new_payload.update(packet_path=str(packet_path), packet_sha256=validated[1])
-        readback = refresh_dart_backlog_packet(identity, payload, new_payload)
-        if readback.get('first_run_key') != item['first_run_key']:
-            raise ManifestError('durable DART backlog packet refresh response invalid')
-        refreshed.append({**item, 'payload': new_payload})
+        new_payload = dict(normalized, packet_path=str(packet_path), packet_sha256=validated[1])
+        updates.append({'identity': identity, 'old_payload': normalized, 'new_payload': new_payload,
+                        'first_run_key': item['first_run_key'], '_index': index})
+    if not updates:
+        return refreshed
+    request_items = [{key: value for key, value in item.items() if key != '_index'} for item in updates]
+    refresh_dart_backlog_packets(request_items)
+    for update in updates:
+        refreshed[update['_index']] = {**refreshed[update['_index']], 'payload': update['new_payload']}
     return refreshed
 
 
