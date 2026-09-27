@@ -331,6 +331,95 @@ class GiraffeDartPrehookTests(unittest.TestCase):
         self.assertEqual(contract["expected_rcp_nos"], [])
         self.assertEqual(contract["terminal_exclusions"], history)
 
+    def test_stale_terminal_exclusion_links_only_verified_same_main_raw_generation(self):
+        """A recapture may change envelope/viewer bytes, never the verified main raw."""
+        receipt, control_date, report_name = "20260916900232", "20260917", "단일판매ㆍ공급계약체결"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp) / control_date
+            old_packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), root)
+            old_meta = json.loads(old_packet.read_text(encoding="utf-8"))
+            old_meta["retrieved_at_kst"] = "2026-09-17T07:00:00+09:00"
+            old_packet.write_text(json.dumps(old_meta, ensure_ascii=False, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+            old = {"rcp_no": receipt, "date": control_date, "receipt_source_date": "20260916",
+                   "packet_path": str(old_packet), "packet_sha256": hashlib.sha256(old_packet.read_bytes()).hexdigest(),
+                   "report_class": "dart_single_sale_supply_contract", "report_name": report_name}
+            fresh_packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), root)
+            self.assertNotEqual(old_packet, fresh_packet)
+            history = [{"identity": "dart:" + receipt, "kind": "dart", "payload": old,
+                        "terminal_disposition": "rejected", "terminal_run_key": "research-2026-09-17-0700-kst",
+                        "terminal_evidence_id": None, "terminal_at": "2026-09-17T07:00:00+09:00"}]
+            summary = [{"date": control_date, "material_candidate_records": [{"rcp_no": receipt, "rcept_dt": control_date,
+                        "report_nm": report_name}], "source_packet_paths": [str(fresh_packet)]}]
+            contract = self.gate.control_contract("research-2026-09-28-0700-kst", summary, terminal_history=history)
+            self.assertEqual(contract["expected_rcp_nos"], [])
+            self.assertEqual(contract["terminal_exclusions"], history)
+
+            changed = valid_source_packet(self.gate, receipt)
+            changed_main = b"<!-- main raw changed -->" + changed["_main_raw"]
+            changed_packet = self.gate.write_packet(sys.modules["giraffe_dart_source"].source_packet(
+                receipt, lambda url: (changed_main, changed["main_content_type"], changed["main_url"])
+                if "main.do" in url else (changed["_sections"][0]["_raw"], changed["_sections"][0]["content_type"],
+                                             changed["_sections"][0]["final_url"])), root)
+            changed_summary = [{**summary[0], "source_packet_paths": [str(changed_packet)]}]
+            with self.assertRaisesRegex(self.gate.ManifestError, "terminal research history conflicts"):
+                self.gate.control_contract("research-2026-09-28-0700-kst-r2", changed_summary, terminal_history=history)
+
+            old_raw = old_packet.with_name(receipt + ".main.raw")
+            old_raw.write_bytes(old_raw.read_bytes() + b" drift")
+            with self.assertRaisesRegex(self.gate.ManifestError, "terminal research history conflicts"):
+                self.gate.control_contract("research-2026-09-28-0700-kst-r2", summary, terminal_history=history)
+
+    def test_stale_terminal_correction_links_only_verified_same_main_raw_generation(self):
+        receipt, control_date, report_name = "20260916900233", "20260917", "단일판매ㆍ공급계약체결"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp) / control_date
+            old_packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), root)
+            old_meta = json.loads(old_packet.read_text(encoding="utf-8"))
+            old_meta["retrieved_at_kst"] = "2026-09-17T07:00:00+09:00"
+            old_packet.write_text(json.dumps(old_meta, ensure_ascii=False, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+            old = {"rcp_no": receipt, "date": control_date, "receipt_source_date": "20260916",
+                   "packet_path": str(old_packet), "packet_sha256": hashlib.sha256(old_packet.read_bytes()).hexdigest(),
+                   "report_class": "dart_single_sale_supply_contract", "report_name": report_name}
+            fresh_packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), root)
+            history = [{"identity": "dart:" + receipt, "kind": "dart", "payload": old,
+                        "terminal_disposition": "hold", "terminal_run_key": "research-2026-09-17-0700-kst",
+                        "terminal_evidence_id": None, "terminal_at": "2026-09-17T07:00:00+09:00"}]
+            summary = [{"date": control_date, "material_candidate_records": [{"rcp_no": receipt, "rcept_dt": control_date,
+                        "report_nm": report_name}], "source_packet_paths": [str(fresh_packet)]}]
+            contract = self.gate.control_contract("research-2026-09-28-0700-kst", summary,
+                                                  terminal_history=history, correction_receipts=[receipt])
+            self.assertEqual(contract["correction_of"], history)
+            self.assertEqual(contract["expected_rcp_nos"], [receipt])
+
+    def test_terminal_history_recapture_workflow_keeps_35_exclusions_and_one_correction(self):
+        """EDD fixture: stale terminal history is linked without rewriting it."""
+        control_date, report_name = "20260917", "단일판매ㆍ공급계약체결"
+        receipts = [f"20260916{number:06d}" for number in range(1, 37)]
+        correction = receipts[-1]
+        with tempfile.TemporaryDirectory() as temp:
+            root, history, fresh_paths = pathlib.Path(temp) / control_date, [], {}
+            for receipt in receipts:
+                old_packet = self.gate.write_packet(valid_source_packet(self.gate, receipt), root)
+                old_meta = json.loads(old_packet.read_text(encoding="utf-8"))
+                old_meta["retrieved_at_kst"] = "2026-09-17T07:00:00+09:00"
+                old_packet.write_text(json.dumps(old_meta, ensure_ascii=False, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+                prior = {"rcp_no": receipt, "date": control_date, "receipt_source_date": "20260916",
+                         "packet_path": str(old_packet), "packet_sha256": hashlib.sha256(old_packet.read_bytes()).hexdigest(),
+                         "report_class": "dart_single_sale_supply_contract", "report_name": report_name}
+                fresh_paths[receipt] = self.gate.write_packet(valid_source_packet(self.gate, receipt), root)
+                history.append({"identity": "dart:" + receipt, "kind": "dart", "payload": prior,
+                                "terminal_disposition": "hold" if receipt == correction else "rejected",
+                                "terminal_run_key": "research-2026-09-17-0700-kst", "terminal_evidence_id": None,
+                                "terminal_at": "2026-09-17T07:00:00+09:00"})
+            summary = [{"date": control_date, "material_candidate_records": [
+                {"rcp_no": receipt, "rcept_dt": control_date, "report_nm": report_name} for receipt in receipts],
+                "source_packet_paths": [str(fresh_paths[receipt]) for receipt in receipts]}]
+            contract = self.gate.control_contract("research-2026-09-28-0700-kst", summary,
+                                                  terminal_history=history, correction_receipts=[correction])
+        self.assertEqual(len(contract["terminal_exclusions"]), 35)
+        self.assertEqual(contract["correction_of"], [history[-1]])
+        self.assertEqual(contract["expected_rcp_nos"], [correction])
+
     def test_legacy_terminal_dart_failures_retry_but_cannot_be_selected_as_corrections(self):
         receipt, control_date = "20260916900231", "20260917"
         with tempfile.TemporaryDirectory() as temp:

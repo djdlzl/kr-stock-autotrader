@@ -218,6 +218,28 @@ def _packet_capture_time(path: Path, rcp_no: str, control_date: str):
         return None
 
 
+def historical_packet(path: Path, rcp_no: str, control_date: str):
+    """Verify an expired generation at its own recorded capture instant."""
+    try:
+        path = path.resolve(strict=True)
+        root = path.parent.parent if re.fullmatch(r"v3-[0-9a-f]{32}", path.parent.name) else path.parent
+        if root.name != control_date:
+            return None
+        with RetainedPacketSnapshot(path, trusted_root=root) as snapshot:
+            raw = json.loads(snapshot.packet_bytes)
+            captured = datetime.fromisoformat(raw.get('retrieved_at_kst', '')) if isinstance(raw, dict) else None
+            if captured is None or captured.tzinfo is None or captured.utcoffset() != KST.utcoffset(captured):
+                return None
+            metadata = completed_packet_snapshot(path, rcp_no, snapshot.packet_bytes, snapshot.read_sibling,
+                                                 expected_control_date=control_date, now=captured)
+            snapshot.verify()
+            if metadata is None:
+                return None
+            return metadata, hashlib.sha256(snapshot.packet_bytes).hexdigest()
+    except (OSError, ValueError, SourceError, json.JSONDecodeError):
+        return None
+
+
 def reusable_terminal_history_packet(payload: object, rcp_no: str, control_date: str) -> bool:
     """Reuse terminal provenance only while its exact packet remains current.
 
@@ -361,7 +383,7 @@ def terminal_dart_matches_current(terminal: object, current: object) -> bool:
 
 
 def correction_dart_matches_current(prior: object, current: object) -> bool:
-    """Allow an explicit correction to bind a new generation of the same receipt."""
+    """Match exact correction provenance; generation continuity is validated separately."""
     if terminal_dart_matches_current(prior, current):
         return True
     if not isinstance(prior, dict) or not isinstance(current, dict):
@@ -373,15 +395,46 @@ def correction_dart_matches_current(prior: object, current: object) -> bool:
         return False
     if set(prior) == classified and any(prior[field] != current[field] for field in ('report_class', 'report_name')):
         return False
-    if not isinstance(current.get('packet_path'), str) or not isinstance(prior.get('packet_path'), str):
+    return False
+
+
+def terminal_generation_continuity_matches_current(prior: object, current: object) -> bool:
+    """Link terminal history to a recapture only through verified main raw bytes.
+
+    Packet envelopes and viewer representations are generation-specific.  The
+    main raw response is the stable document fingerprint, but only after both
+    generations independently pass their appropriate retained-packet checks.
+    """
+    if not isinstance(prior, dict) or not isinstance(current, dict):
         return False
-    path, prior_path = Path(current['packet_path']), Path(prior['packet_path'])
-    if (not re.fullmatch(r'v3-[0-9a-f]{32}', path.parent.name)
-            or path.parent.parent.name != current['date'] or path.name != current['rcp_no'] + '.json'
-            or path == prior_path or '..' in path.parts):
+    classified = _DART_CORE_PROVENANCE_FIELDS | {'report_class', 'report_name'}
+    if set(prior) not in (_DART_CORE_PROVENANCE_FIELDS, classified) or set(current) != classified:
         return False
-    validated = validated_packet(prior_path, prior['rcp_no'], prior['date'])
-    return validated is not None and validated[1] == prior['packet_sha256']
+    if any(prior.get(field) != current.get(field) for field in ('rcp_no', 'date', 'receipt_source_date')):
+        return False
+    current_class, report_name = current.get('report_class'), current.get('report_name')
+    if current_class != authoritative_report_class(report_name):
+        return False
+    # v2 terminal payloads predate classification.  Their receipt/date tuple is
+    # immutable and their document identity is still bound below by main raw.
+    # Classified payloads additionally bind the exact listing name/class.
+    if set(prior) == classified and (prior.get('report_name') != report_name or not (
+            prior.get('report_class') == current_class
+            or prior.get('report_class') == 'other' and current_class != 'other')):
+        return False
+    prior_path, current_path = Path(prior['packet_path']), Path(current['packet_path'])
+    if prior_path == current_path:
+        return False
+    historical = historical_packet(prior_path, prior['rcp_no'], prior['date'])
+    validated = validated_packet(current_path, current['rcp_no'], current['date'])
+    if (historical is None or validated is None
+            or historical[1] != prior.get('packet_sha256')
+            or validated[1] != current.get('packet_sha256')):
+        return False
+    prior_metadata, current_metadata = historical[0], validated[0]
+    return (prior_metadata.get('main_raw_sha256') == current_metadata.get('main_raw_sha256')
+            and isinstance(prior_metadata.get('main_raw_sha256'), str)
+            and re.fullmatch(r'[0-9a-f]{64}', prior_metadata['main_raw_sha256']) is not None)
 
 
 def normalize_durable_dart_backlog_payload(payload: object, current: object) -> dict | None:
@@ -575,8 +628,10 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
             raise ManifestError('carried correction identity conflicts with original lineage')
     for items, matches in ((exclusions, terminal_dart_matches_current), (corrections, correction_dart_matches_current)):
         for item in items:
-            if not matches(item["payload"], sources_by_receipt[item["payload"]["rcp_no"]]):
-                raise ManifestError("terminal research history conflicts with current DART provenance")
+            current = sources_by_receipt[item["payload"]["rcp_no"]]
+            if not (matches(item["payload"], current)
+                    or terminal_generation_continuity_matches_current(item["payload"], current)):
+                raise ManifestError("terminal research history conflicts with current DART provenance for receipt " + item["payload"]["rcp_no"])
     for item in exclusions:
         del sources_by_receipt[item["payload"]["rcp_no"]]
     sources = list(sources_by_receipt.values())
