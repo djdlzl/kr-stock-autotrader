@@ -176,7 +176,18 @@ def connect() -> sqlite3.Connection:
       created_at TEXT NOT NULL,
       terminal_at TEXT
     );
+    -- Packet refreshes replace only a pending cursor's live generation. The
+    -- prior packet binding is append-only audit lineage, never overwritten.
+    CREATE TABLE IF NOT EXISTS giraffe_research_backlog_packet_refreshes (
+      id INTEGER PRIMARY KEY,
+      backlog_identity TEXT NOT NULL REFERENCES giraffe_research_backlog(identity),
+      old_payload TEXT NOT NULL,
+      new_payload TEXT NOT NULL,
+      refreshed_at TEXT NOT NULL,
+      UNIQUE(backlog_identity, old_payload, new_payload)
+    );
     CREATE INDEX IF NOT EXISTS idx_giraffe_research_backlog_pending ON giraffe_research_backlog(status, kind, id);
+    CREATE INDEX IF NOT EXISTS idx_giraffe_research_backlog_packet_refreshes_backlog ON giraffe_research_backlog_packet_refreshes(backlog_identity, id);
     -- One opaque KIS OAuth token per non-secret application-key digest.  The
     -- row is deliberately not exposed through any API or audit projection.
     CREATE TABLE IF NOT EXISTS kis_oauth_token_cache (

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import timedelta
 from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).parents[1]
@@ -753,6 +754,35 @@ class GiraffeDartPrehookTests(unittest.TestCase):
             with self.assertRaisesRegex(self.gate.ManifestError, "backlog packet unavailable"):
                 self.gate.control_contract("research-2026-09-18-0700-kst", [],
                     [{"identity": "dart:" + receipt, "kind": "dart", "payload": source}])
+
+    def test_stale_packet_backlog_refreshes_all_twelve_without_rewriting_old_generations(self):
+        date = '20260923'; receipts = [f'20260923{number:06d}' for number in range(269, 281)]
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp); old_paths = {}
+            for receipt in receipts:
+                path = self.gate.write_packet(valid_source_packet(self.gate, receipt), root / 'sources' / date)
+                metadata = json.loads(path.read_text(encoding='utf-8')); metadata['retrieved_at_kst'] = (self.gate.datetime.now(self.gate.KST) - self.gate.MAX_CAPTURE_AGE - timedelta(seconds=1)).isoformat()
+                path.write_text(json.dumps(metadata), encoding='utf-8'); old_paths[receipt] = path.read_bytes()
+            backlog = []
+            for receipt in receipts:
+                path = next((root / 'sources' / date).glob('v3-*/' + receipt + '.json')).resolve()
+                payload = {'rcp_no': receipt, 'date': date, 'receipt_source_date': date, 'packet_path': str(path),
+                           'packet_sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'report_class': 'dart_single_sale_supply_contract', 'report_name': '단일판매ㆍ공급계약체결'}
+                backlog.append({'identity': 'dart:' + receipt, 'kind': 'dart', 'payload': payload,
+                                'original_announcement_at': None, 'first_run_key': 'research-2026-09-23-0700-kst-r6'})
+            def readback(identity, old, new):
+                return {'schema_version': 'giraffe-research-backlog-packet-refresh-v1', 'identity': identity,
+                        'payload': new, 'first_run_key': 'research-2026-09-23-0700-kst-r6'}
+            with patch.object(self.gate, 'SOURCE_ROOT', root / 'sources'), \
+                 patch.object(self.gate, 'fetch_with_retry', side_effect=lambda rcp: valid_source_packet(self.gate, rcp)) as fetch, \
+                 patch.object(self.gate, 'refresh_dart_backlog_packet', side_effect=readback) as refresh:
+                updated = self.gate.refresh_stale_dart_backlog(backlog)
+            self.assertEqual(fetch.call_args_list, [((receipt,),) for receipt in receipts])
+            self.assertEqual(refresh.call_count, 12)
+            self.assertEqual([item['identity'] for item in updated], [item['identity'] for item in backlog])
+            self.assertTrue(all(item['first_run_key'] == 'research-2026-09-23-0700-kst-r6' for item in updated))
+            self.assertTrue(all(item['payload']['packet_path'] != old['payload']['packet_path'] for item, old in zip(updated, backlog)))
+            self.assertTrue(all(path.read_bytes() == old_paths[receipt] for receipt, path in ((receipt, pathlib.Path(backlog[index]['payload']['packet_path'])) for index, receipt in enumerate(receipts))))
 
     def test_carried_packet_outside_current_window_preserves_classification(self):
         rcp = '20260915000002'

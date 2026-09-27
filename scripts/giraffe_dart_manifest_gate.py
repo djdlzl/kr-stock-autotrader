@@ -20,7 +20,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(SCRIPT_DIR.parent))
 from giraffe_dart_manifest import ManifestError, collect_manifest  # noqa: E402
-from giraffe_dart_source import SourceError, RetainedPacketSnapshot, completed_packet_snapshot, fetch_with_retry, write_packet  # noqa: E402
+from giraffe_dart_source import MAX_CAPTURE_AGE, KST, SourceError, RetainedPacketSnapshot, completed_packet_snapshot, fetch_with_retry, write_packet  # noqa: E402
 from kr_stock_autotrader.dart_report_classification import authoritative_report_class  # noqa: E402
 from kr_stock_autotrader.giraffe_review_queue import compact_gate_payload  # noqa: E402
 from kr_stock_autotrader.krx_calendar import CalendarError, admitted_backlog_dates  # noqa: E402
@@ -45,6 +45,7 @@ def check_card_prompt() -> None:
 def validated_packet(path: Path, rcp_no: str, control_date: str):
     """Return metadata and digest of one retained, verified generation."""
     try:
+        path = path.resolve(strict=True)
         root = path.parent.parent if re.fullmatch(r"v3-[0-9a-f]{32}", path.parent.name) else path.parent
         if root.name != control_date:
             return None
@@ -193,6 +194,77 @@ def fetch_terminal_history(receipts: list[str]) -> list[dict]:
 def fetch_research_backlog() -> tuple[list[dict], list[dict]]:
     """Read pending work plus terminal audit history for v3 contract assembly."""
     return fetch_research_backlog_state()
+
+
+def _packet_capture_time(path: Path, rcp_no: str, control_date: str):
+    """Validate old retained bytes at their capture instant, then expose age."""
+    try:
+        path = path.resolve(strict=True)
+        root = path.parent.parent if re.fullmatch(r"v3-[0-9a-f]{32}", path.parent.name) else path.parent
+        if root.name != control_date:
+            return None
+        with RetainedPacketSnapshot(path, trusted_root=root) as snapshot:
+            raw = json.loads(snapshot.packet_bytes)
+            captured = datetime.fromisoformat(raw.get('retrieved_at_kst', '')) if isinstance(raw, dict) else None
+            if captured is None or captured.tzinfo is None or captured.utcoffset() != KST.utcoffset(captured):
+                return None
+            metadata = completed_packet_snapshot(path, rcp_no, snapshot.packet_bytes, snapshot.read_sibling,
+                                                 expected_control_date=control_date, now=captured)
+            snapshot.verify()
+            if metadata is None:
+                return None
+            return captured.astimezone(KST), hashlib.sha256(snapshot.packet_bytes).hexdigest()
+    except (OSError, ValueError, SourceError, json.JSONDecodeError):
+        return None
+
+
+def refresh_dart_backlog_packet(identity: str, old_payload: dict, new_payload: dict) -> dict:
+    """Ask the control API to atomically advance one already-verified cursor."""
+    base, key = os.environ.get("GIRAFFE_URL", "").strip().rstrip("/"), os.environ.get("RESEARCH_CONTROL_KEY", "")
+    if not base or not key:
+        raise ManifestError("GIRAFFE_URL and RESEARCH_CONTROL_KEY are required for durable backlog")
+    request = urllib.request.Request(base + '/api/internal/research-backlog/refresh-dart-packet',
+        data=canonical_bytes({'identity': identity, 'old_payload': old_payload, 'new_payload': new_payload}), method='POST',
+        headers={'Content-Type': 'application/json', 'X-Research-Control-Key': key})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response: value = json.load(response)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as exc:
+        raise ManifestError('durable DART backlog packet refresh failed') from exc
+    if (not isinstance(value, dict) or value.get('schema_version') != 'giraffe-research-backlog-packet-refresh-v1'
+            or value.get('identity') != identity or value.get('payload') != new_payload):
+        raise ManifestError('durable DART backlog packet refresh response invalid')
+    return value
+
+
+def refresh_stale_dart_backlog(carry_forward: list[dict]) -> list[dict]:
+    """Refresh only expired, pending, same-identity packet cursors append-only."""
+    refreshed = []
+    for item in carry_forward:
+        payload = item.get('payload') if isinstance(item, dict) else None
+        identity = item.get('identity') if isinstance(item, dict) else None
+        normalized = normalize_durable_dart_backlog_payload(payload, None)
+        if (item.get('kind') != 'dart' or normalized is None or identity != 'dart:' + normalized['rcp_no']
+                or set(item) != {'identity', 'kind', 'payload', 'original_announcement_at', 'first_run_key'}):
+            refreshed.append(item); continue
+        retained = _packet_capture_time(Path(normalized['packet_path']), normalized['rcp_no'], normalized['date'])
+        if retained is None or retained[1] != normalized['packet_sha256']:
+            raise ManifestError('durable DART backlog packet unavailable')
+        if datetime.now(KST) - retained[0] <= MAX_CAPTURE_AGE:
+            refreshed.append(item); continue
+        try:
+            packet_path = write_packet(fetch_with_retry(normalized['rcp_no']), SOURCE_ROOT / normalized['date'])
+        except SourceError as exc:
+            # A packet-backed pending row is not converted to a source error.
+            raise ManifestError('durable DART backlog packet refresh failed') from exc
+        validated = validated_packet(packet_path, normalized['rcp_no'], normalized['date'])
+        if validated is None:
+            raise ManifestError('durable DART backlog packet refresh failed')
+        new_payload = dict(payload); new_payload.update(packet_path=str(packet_path), packet_sha256=validated[1])
+        readback = refresh_dart_backlog_packet(identity, payload, new_payload)
+        if readback.get('first_run_key') != item['first_run_key']:
+            raise ManifestError('durable DART backlog packet refresh response invalid')
+        refreshed.append({**item, 'payload': new_payload})
+    return refreshed
 
 
 def _report_class(record: dict) -> tuple[str, str]:
@@ -590,6 +662,8 @@ def main(argv: list[str] | None = None) -> int:
         check_card_prompt()
         backlog = fetch_research_backlog()
         carry_forward = backlog[0] if isinstance(backlog, tuple) else backlog
+        if isinstance(backlog, tuple):
+            carry_forward = refresh_stale_dart_backlog(carry_forward)
         carried_sources = {item['payload']['rcp_no']: item['payload'] for item in carry_forward
                            if item.get('kind') == 'dart' and isinstance(item.get('payload'), dict)
                            and 'packet_path' in item['payload']}

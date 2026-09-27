@@ -1626,6 +1626,40 @@ def test_missing_packet_partial_done_retries_exact_receipt_and_upgrades_provenan
     assert original["detail"]["detail"]["control_terminal_dispositions"] == [audit]
 
 
+def test_pending_dart_packet_refresh_is_atomic_and_append_only(monkeypatch, tmp_path):
+    import kr_stock_autotrader.db as db_module
+    from kr_stock_autotrader.db import connect
+    monkeypatch.setattr(db_module, 'DATABASE_PATH', str(tmp_path / 'refresh.db'))
+    packet_root = tmp_path / 'packets'; monkeypatch.setenv('GIRAFFE_RESEARCH_PACKET_ROOT', str(packet_root))
+    rcp, date = '20260923000269', '20260923'
+    def source(generation, digest):
+        return {'rcp_no': rcp, 'date': date, 'receipt_source_date': date,
+                'packet_path': str(packet_root / date / generation / (rcp + '.json')), 'packet_sha256': digest,
+                'report_class': 'dart_single_sale_supply_contract', 'report_name': '단일판매ㆍ공급계약체결'}
+    old, new = source('v3-' + 'a' * 32, 'a' * 64), source('v3-' + 'b' * 32, 'b' * 64)
+    db = connect()
+    try:
+        db.execute("INSERT INTO giraffe_research_backlog(identity,kind,payload,first_run_key,created_at) VALUES(?,?,?,?,?)", ('dart:' + rcp, 'dart', json.dumps(old, sort_keys=True), 'research-2026-09-23-0700-kst-r6', '2026-09-23T07:00:00+09:00'))
+        db.commit()
+    finally:
+        db.close()
+    client = TestClient(app)
+    response = client.post('/api/internal/research-backlog/refresh-dart-packet', headers=CONTROL_HEADERS,
+                           json={'identity': 'dart:' + rcp, 'old_payload': old, 'new_payload': new})
+    assert response.status_code == 200, response.text
+    assert response.json()['first_run_key'] == 'research-2026-09-23-0700-kst-r6'
+    db = connect()
+    try:
+        row = db.execute("SELECT payload,first_run_key,status FROM giraffe_research_backlog WHERE identity=?", ('dart:' + rcp,)).fetchone()
+        audit = db.execute("SELECT old_payload,new_payload FROM giraffe_research_backlog_packet_refreshes WHERE backlog_identity=?", ('dart:' + rcp,)).fetchone()
+        assert dict(row, payload=json.loads(row['payload'])) == {'payload': new, 'first_run_key': 'research-2026-09-23-0700-kst-r6', 'status': 'pending'}
+        assert dict(audit, old_payload=json.loads(audit['old_payload']), new_payload=json.loads(audit['new_payload'])) == {'old_payload': old, 'new_payload': new}
+    finally:
+        db.close()
+    assert client.post('/api/internal/research-backlog/refresh-dart-packet', headers=CONTROL_HEADERS,
+                       json={'identity': 'dart:' + rcp, 'old_payload': old, 'new_payload': new}).status_code == 409
+
+
 def test_store_error_without_completed_economics_is_not_reviewed_and_stays_pending():
     client = TestClient(app); key = 'research-2026-09-17-0700-kst-r802'; rcp = '20260917000802'
     contract, _ = commitment(key, [rcp])
