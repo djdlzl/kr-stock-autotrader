@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from .expected_price import evaluate_persisted_expected_price
+from .expected_price import evaluate_persisted_expected_price, evaluate_persisted_expected_price_sensitivity
 
 EXPECTED_PRICE_SOURCE_TOPIC = "mac:7923"
 
@@ -75,4 +75,18 @@ def expected_price_run_detail(db: sqlite3.Connection, *, run_key: str) -> dict[s
 
 def latest_expected_price_for_card(db: sqlite3.Connection, card_id: int) -> dict[str, Any] | None:
     row = db.execute("SELECT * FROM expected_price_runs WHERE card_id=? ORDER BY id DESC LIMIT 1", (card_id,)).fetchone()
-    return _detail(row) if row else None
+    if row is None:
+        return None
+    detail = _detail(row)
+    evidence = db.execute("SELECT * FROM material_evidence WHERE id=?", (row["evidence_id"],)).fetchone()
+    selected_filter = db.execute("SELECT raw_inputs FROM deterministic_filter_results WHERE id=?", (row["filter_id"],)).fetchone()
+    try:
+        raw_inputs = json.loads(selected_filter["raw_inputs"]) if selected_filter else {}
+    except (TypeError, ValueError):
+        raw_inputs = {}
+    detail["sensitivity"] = evaluate_persisted_expected_price_sensitivity(
+        evidence=evidence, filter_result={"raw_inputs": raw_inputs}, as_of=row["requested_as_of"],
+        expected_result=detail["result"],
+    )
+    detail["sensitivity"]["source_run_key"] = row["run_key"]
+    return detail

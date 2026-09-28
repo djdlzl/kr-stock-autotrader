@@ -548,8 +548,8 @@ def _mapping_value(value: object, key: str, default: object = None) -> object:
         return default
 
 
-def evaluate_persisted_expected_price(*, evidence: object, filter_result: object, as_of: object) -> dict:
-    """Evaluate only the nested 07:00 evidence package plus persisted 08:00 baseline."""
+def _persisted_expected_price_inputs(*, evidence: object, filter_result: object) -> tuple:
+    """Select the exact persisted package and baseline shared by read-only reports."""
     symbol = _mapping_value(evidence, "symbol")
     event_id = _mapping_value(evidence, "dedupe_key")
     if event_id is None:
@@ -561,7 +561,7 @@ def evaluate_persisted_expected_price(*, evidence: object, filter_result: object
         try:
             snapshot = json.loads(snapshot)
         except (TypeError, ValueError):
-            return _base_result(
+            return None, canonical_identity, _base_result(
                 {},
                 status=HOLD_INVALID_INPUT,
                 reason="invalid_persisted_evidence_snapshot",
@@ -569,7 +569,7 @@ def evaluate_persisted_expected_price(*, evidence: object, filter_result: object
                 canonical_identity=canonical_identity,
             )
     if not isinstance(snapshot, Mapping):
-        return _base_result(
+        return None, canonical_identity, _base_result(
             {},
             status=HOLD_INVALID_INPUT,
             reason="invalid_persisted_evidence_snapshot",
@@ -579,7 +579,7 @@ def evaluate_persisted_expected_price(*, evidence: object, filter_result: object
     economic_terms = snapshot.get("economic_terms")
     expected_inputs = economic_terms.get("expected_price_inputs") if isinstance(economic_terms, Mapping) else None
     if expected_inputs is None:
-        return _base_result(
+        return None, canonical_identity, _base_result(
             {},
             status=HOLD_MISSING_INPUT,
             reason="missing_persisted_valuation_inputs",
@@ -587,7 +587,7 @@ def evaluate_persisted_expected_price(*, evidence: object, filter_result: object
             canonical_identity=canonical_identity,
         )
     if not isinstance(expected_inputs, Mapping):
-        return _base_result(
+        return None, canonical_identity, _base_result(
             expected_inputs,
             status=HOLD_INVALID_INPUT,
             reason="invalid_persisted_valuation_inputs",
@@ -599,12 +599,131 @@ def evaluate_persisted_expected_price(*, evidence: object, filter_result: object
     baseline = raw_filter_inputs.get("expected_price_baseline") if isinstance(raw_filter_inputs, Mapping) else None
     if baseline is not None:
         raw_inputs["market_baseline"] = deepcopy(baseline)
+    return raw_inputs, canonical_identity, None
+
+
+def evaluate_persisted_expected_price(*, evidence: object, filter_result: object, as_of: object) -> dict:
+    """Evaluate only the nested 07:00 evidence package plus persisted 08:00 baseline."""
+    raw_inputs, canonical_identity, failure = _persisted_expected_price_inputs(evidence=evidence, filter_result=filter_result)
+    if failure is not None:
+        return failure
     return evaluate_expected_price(
         raw_inputs,
         evaluation_as_of=as_of,
         evidence_known_at=_mapping_value(evidence, "known_at"),
         _canonical_identity=canonical_identity,
     )
+
+
+_SENSITIVITY_CASES = (
+    ("contract_margin_minus_2pp", "계약 마진 −2%p"),
+    ("contract_discount_plus_2pp", "계약 할인율 +2%p"),
+    ("existing_discount_plus_2pp", "기존 사업 DCF 할인율 +2%p"),
+    ("contract_receipt_delay_1y", "계약 순현금흐름 전체 +1년 지연"),
+    ("diluted_shares_plus_10pct", "희석주식수 +10%"),
+)
+
+
+def _sensitivity_report(baseline: dict, evaluation_as_of: object, *, status: str | None = None, reason: str | None = None) -> dict:
+    return {
+        "schema_version": "giraffe-expected-price-sensitivity-v1",
+        "kind": "HYPOTHETICAL_ONE_FACTOR",
+        "status": status or baseline["status"],
+        "reason": reason or baseline["reason"],
+        "evaluation_as_of": evaluation_as_of,
+        "baseline": deepcopy(baseline),
+        "value_unit": "KRW/share",
+        "delta_pct_unit": "percent; (shocked_value - baseline_value) / baseline_value * 100",
+        "rounding": "baseline and shocked values use the existing KRX tick rounding",
+        "most_sensitive_scenario_id": None,
+        "scenarios": [{
+            "id": name, "label": label, "status": status or baseline["status"],
+            "reason": "baseline_not_computed", "shocked_value": None,
+            "delta_krw": None, "delta_pct": None, "changes": [],
+        } for name, label in _SENSITIVITY_CASES],
+    }
+
+
+def evaluate_expected_price_sensitivity(
+    inputs: object, *, evaluation_as_of: object, evidence_known_at: object | None = None,
+    _canonical_identity: Mapping[str, object] | None = None,
+) -> dict:
+    """One-factor what-ifs derived only after validating the unchanged baseline.
+
+    Overrides apply to copied numeric values, never source envelopes or approvals.
+    These results are hypothetical analyses, not approved scenario valuations.
+    The delay shifts every contract net cash flow, including any negative flow;
+    it does not move disclosure timestamps or the existing-business cash flows.
+    """
+    baseline = evaluate_expected_price(inputs, evaluation_as_of=evaluation_as_of,
+                                      evidence_known_at=evidence_known_at, _canonical_identity=_canonical_identity)
+    report = _sensitivity_report(baseline, evaluation_as_of)
+    if baseline["status"] != COMPUTED:
+        return report
+    validator = _Validator(inputs, evaluation_as_of=evaluation_as_of,
+                           evidence_known_at=evidence_known_at, canonical_identity=_canonical_identity)
+    validator.run()
+    report["reason"] = "hypothetical_changes_to_validated_baseline"
+    for row in report["scenarios"]:
+        values = deepcopy(validator.values)
+        name = row["id"]
+        if name == "existing_discount_plus_2pp" and inputs["valuation_branch"] != "DCF_existing":
+            row.update(status="NOT_APPLICABLE", reason="existing_branch_is_peer_multiple")
+            continue
+        changes = []
+        if name == "contract_receipt_delay_1y":
+            for index, cash_flow in enumerate(values["annual_cash_flows"]):
+                original = cash_flow["cash_time"]
+                cash_flow["cash_time"] = original + 1.0
+                changes.append({"field": f"contract.annual_cash_flows[{index}].cash_time",
+                                "base_value": original, "shocked_value": cash_flow["cash_time"], "unit": "years"})
+        else:
+            field, unit, multiplier, increment = {
+                "contract_margin_minus_2pp": ("contract.margin", "ratio", 1.0, -.02),
+                "contract_discount_plus_2pp": ("contract.discount_rate", "ratio", 1.0, .02),
+                "existing_discount_plus_2pp": ("existing.discount_rate", "ratio", 1.0, .02),
+                "diluted_shares_plus_10pct": ("diluted_shares", "shares", 1.1, 0.0),
+            }[name]
+            original = values[field]
+            values[field] = original * multiplier + increment
+            changes.append({"field": field, "base_value": original, "shocked_value": values[field], "unit": unit})
+        if any(not math.isfinite(change["shocked_value"]) for change in changes):
+            row.update(status=HOLD_INVALID_INPUT, reason="nonfinite_shocked_input")
+            continue
+        row["changes"] = changes
+        if values["contract.margin"] < 0:
+            row.update(status=HOLD_INVALID_INPUT, reason="shocked_margin_below_zero")
+            continue
+        try:
+            value, _ = _round_to_krx_tick(_calculate(inputs, values))
+            delta = value - baseline["calculated_value"]
+            percent = delta / baseline["calculated_value"] * 100
+            if not math.isfinite(percent):
+                raise ArithmeticError("nonfinite percentage change")
+        except Exception:
+            row.update(status=CALCULATION_ERROR, reason="hypothetical_calculation_error")
+            continue
+        row.update(status=COMPUTED, reason="hypothetical_one_factor_change", shocked_value=value,
+                   delta_krw=delta, delta_pct=percent)
+    computed = [row for row in report["scenarios"] if row["status"] == COMPUTED]
+    if computed:
+        report["most_sensitive_scenario_id"] = max(computed, key=lambda row: abs(row["delta_krw"]))["id"]
+    return report
+
+
+def evaluate_persisted_expected_price_sensitivity(
+    *, evidence: object, filter_result: object, as_of: object, expected_result: dict,
+) -> dict:
+    """Reproduce an original run before deriving what-ifs; changed lineage fails closed."""
+    inputs, identity, failure = _persisted_expected_price_inputs(evidence=evidence, filter_result=filter_result)
+    report = (_sensitivity_report(failure, as_of) if failure is not None else
+              evaluate_expected_price_sensitivity(inputs, evaluation_as_of=as_of,
+                                                  evidence_known_at=_mapping_value(evidence, "known_at"),
+                                                  _canonical_identity=identity))
+    if report["baseline"] != expected_result:
+        return _sensitivity_report(expected_result, as_of, status=HOLD_INVALID_INPUT,
+                                   reason="persisted_input_or_result_mismatch")
+    return report
 
 
 def evaluate_expected_prices(
