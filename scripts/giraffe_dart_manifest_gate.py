@@ -389,6 +389,24 @@ def same_failed_dart_identity(failed: dict, current: dict) -> bool:
     return all(failed.get(field) == current.get(field) for field in _DART_FAILURE_FIELDS - {'source_error_code'})
 
 
+def capture_validated_terminal_exclusion_matches_failed_source(prior: object, current: object) -> bool:
+    """Permit a normal terminal exclusion after an exact, unrecoverable DART failure.
+
+    This is deliberately not a source replacement: the prior packet is only
+    checked at its recorded capture instant and only permits removal of an
+    already-terminal normal item.  Corrections retain their fresh-generation
+    continuity requirement below.
+    """
+    classified = _DART_CORE_PROVENANCE_FIELDS | {'report_class', 'report_name'}
+    if (not isinstance(prior, dict) or set(prior) != classified
+            or not isinstance(current, dict) or not failed_dart_source(current)
+            or not same_failed_dart_identity(prior, current)
+            or prior.get('report_class') != authoritative_report_class(prior.get('report_name'))):
+        return False
+    historical = historical_packet(Path(prior['packet_path']), prior['rcp_no'], prior['date'])
+    return historical is not None and historical[1] == prior.get('packet_sha256')
+
+
 def same_dart_core_provenance(left: object, right: object) -> bool:
     """Compare immutable packet provenance without treating v3 classification as carry state."""
     return (isinstance(left, dict) and isinstance(right, dict)
@@ -659,12 +677,17 @@ def control_contract(run_key: str, summaries: list[dict], carry_forward: list[di
         expected_identity = 'dart:correction:' + hashlib.sha256(canonical_bytes({'source': sources_by_receipt[rcp], 'prior': terminal_by_receipt[rcp]})).hexdigest()
         if identity != expected_identity:
             raise ManifestError('carried correction identity conflicts with original lineage')
-    for items, matches in ((exclusions, terminal_dart_matches_current), (corrections, correction_dart_matches_current)):
-        for item in items:
-            current = sources_by_receipt[item["payload"]["rcp_no"]]
-            if not (matches(item["payload"], current)
-                    or terminal_generation_continuity_matches_current(item["payload"], current)):
-                raise ManifestError("terminal research history conflicts with current DART provenance for receipt " + item["payload"]["rcp_no"])
+    for item in exclusions:
+        current = sources_by_receipt[item["payload"]["rcp_no"]]
+        if not (terminal_dart_matches_current(item["payload"], current)
+                or terminal_generation_continuity_matches_current(item["payload"], current)
+                or capture_validated_terminal_exclusion_matches_failed_source(item["payload"], current)):
+            raise ManifestError("terminal research history conflicts with current DART provenance for receipt " + item["payload"]["rcp_no"])
+    for item in corrections:
+        current = sources_by_receipt[item["payload"]["rcp_no"]]
+        if not (correction_dart_matches_current(item["payload"], current)
+                or terminal_generation_continuity_matches_current(item["payload"], current)):
+            raise ManifestError("terminal research history conflicts with current DART provenance for receipt " + item["payload"]["rcp_no"])
     for item in exclusions:
         del sources_by_receipt[item["payload"]["rcp_no"]]
     sources = list(sources_by_receipt.values())
